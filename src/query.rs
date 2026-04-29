@@ -12,8 +12,7 @@ use crate::error::CypherError;
 use crate::{EdgeData, NodeData};
 
 /// Strategy to use when matching patterns against the graph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MatchStrategy {
     /// DFS backtracking (Neo4j-accurate semantics). Default strategy.
     #[default]
@@ -22,7 +21,6 @@ pub enum MatchStrategy {
     /// Currently delegates to Backtrack; a distinct optimized implementation is planned.
     Fast,
 }
-
 
 /// A value that can appear in a query result row.
 #[derive(Debug, Clone, PartialEq)]
@@ -450,12 +448,19 @@ impl<'a> ReadQueryExecutor<'a> {
                 .filter(|e| Self::edge_matches_rel(e, rel_pattern))
                 .map(|e| (e, e.source()))
                 .collect(),
-            RelDirection::Both => self
-                .graph
-                .edges(current_node)
-                .filter(|e| Self::edge_matches_rel(e, rel_pattern))
-                .map(|e| (e, e.target()))
-                .collect(),
+            RelDirection::Both => {
+                let out = self
+                    .graph
+                    .edges_directed(current_node, petgraph::Direction::Outgoing)
+                    .filter(|e| Self::edge_matches_rel(e, rel_pattern))
+                    .map(|e| (e, e.target()));
+                let incoming = self
+                    .graph
+                    .edges_directed(current_node, petgraph::Direction::Incoming)
+                    .filter(|e| Self::edge_matches_rel(e, rel_pattern))
+                    .map(|e| (e, e.source()));
+                out.chain(incoming).collect()
+            }
         };
 
         for (edge_ref, actual_target) in candidate_edges {
@@ -463,10 +468,24 @@ impl<'a> ReadQueryExecutor<'a> {
                 let mut new_bindings = bindings.clone();
 
                 if let Some(var) = &rel.variable {
-                    new_bindings.insert(var.clone(), BoundValue::Edge(edge_ref.id()));
+                    let edge_val = BoundValue::Edge(edge_ref.id());
+                    if let Some(existing) = new_bindings.get(var) {
+                        if existing != &edge_val {
+                            continue;
+                        }
+                    } else {
+                        new_bindings.insert(var.clone(), edge_val);
+                    }
                 }
                 if let Some(var) = &target_node.variable {
-                    new_bindings.insert(var.clone(), BoundValue::Node(actual_target));
+                    let node_val = BoundValue::Node(actual_target);
+                    if let Some(existing) = new_bindings.get(var) {
+                        if existing != &node_val {
+                            continue;
+                        }
+                    } else {
+                        new_bindings.insert(var.clone(), node_val);
+                    }
                 }
 
                 self.match_path_hops(
@@ -526,6 +545,11 @@ impl<'a> ReadQueryExecutor<'a> {
         let edge_data = edge_ref.weight();
         if let Some(ref rel_type) = rel.rel_type {
             if edge_data.rel_type.as_ref() != Some(rel_type) {
+                return false;
+            }
+        }
+        for (key, value) in &rel.properties {
+            if edge_data.properties.get(key) != Some(value) {
                 return false;
             }
         }
@@ -615,6 +639,18 @@ impl<'a> MutQueryExecutor<'a> {
                         };
                         if test_results.is_empty() {
                             self.apply_path_pattern_mut(bindings_row, &pattern);
+                        } else {
+                            // Propagate matched bindings into bindings_row
+                            let first = &test_results[0];
+                            for (k, v) in first {
+                                if let Some(existing) = bindings_row.get(k) {
+                                    if existing != v {
+                                        panic!("MERGE binding conflict on '{}'", k);
+                                    }
+                                } else {
+                                    bindings_row.insert(k.clone(), *v);
+                                }
+                            }
                         }
                     }
                 }
@@ -729,12 +765,19 @@ impl<'a> MutQueryExecutor<'a> {
                 .filter(|e| ReadQueryExecutor::edge_matches_rel(e, rel))
                 .map(|e| (e, e.source()))
                 .collect(),
-            RelDirection::Both => self
-                .graph
-                .edges(current_node)
-                .filter(|e| ReadQueryExecutor::edge_matches_rel(e, rel))
-                .map(|e| (e, e.target()))
-                .collect(),
+            RelDirection::Both => {
+                let out = self
+                    .graph
+                    .edges_directed(current_node, petgraph::Direction::Outgoing)
+                    .filter(|e| ReadQueryExecutor::edge_matches_rel(e, rel))
+                    .map(|e| (e, e.target()));
+                let incoming = self
+                    .graph
+                    .edges_directed(current_node, petgraph::Direction::Incoming)
+                    .filter(|e| ReadQueryExecutor::edge_matches_rel(e, rel))
+                    .map(|e| (e, e.source()));
+                out.chain(incoming).collect()
+            }
         };
 
         for (edge_ref, actual_target) in candidate_edges {
@@ -742,10 +785,24 @@ impl<'a> MutQueryExecutor<'a> {
                 let mut new_bindings = bindings.clone();
 
                 if let Some(var) = &rel.variable {
-                    new_bindings.insert(var.clone(), BoundValue::Edge(edge_ref.id()));
+                    let edge_val = BoundValue::Edge(edge_ref.id());
+                    if let Some(existing) = new_bindings.get(var) {
+                        if existing != &edge_val {
+                            continue;
+                        }
+                    } else {
+                        new_bindings.insert(var.clone(), edge_val);
+                    }
                 }
                 if let Some(var) = &target_node.variable {
-                    new_bindings.insert(var.clone(), BoundValue::Node(actual_target));
+                    let node_val = BoundValue::Node(actual_target);
+                    if let Some(existing) = new_bindings.get(var) {
+                        if existing != &node_val {
+                            continue;
+                        }
+                    } else {
+                        new_bindings.insert(var.clone(), node_val);
+                    }
                 }
 
                 self.match_path_hops(
@@ -850,10 +907,8 @@ impl<'a> MutQueryExecutor<'a> {
                 .collect();
 
             if bound_values.is_empty() {
-                return Err(CypherError::InvalidQuery(format!(
-                    "Variable '{}' not bound",
-                    var
-                )));
+                // No matching rows — DELETE is a no-op per Cypher semantics
+                return Ok(());
             }
 
             let (nodes, edges): (Vec<_>, Vec<_>) = bound_values
@@ -868,18 +923,27 @@ impl<'a> MutQueryExecutor<'a> {
 
             for node_idx in nodes {
                 if let BoundValue::Node(idx) = node_idx {
+                    let out_edges: Vec<_> = self
+                        .graph
+                        .edges_directed(idx, petgraph::Direction::Outgoing)
+                        .map(|e| e.id())
+                        .collect();
+                    let in_edges: Vec<_> = self
+                        .graph
+                        .edges_directed(idx, petgraph::Direction::Incoming)
+                        .map(|e| e.id())
+                        .collect();
+                    let has_incident_edges = !out_edges.is_empty() || !in_edges.is_empty();
+
+                    if !detach && has_incident_edges {
+                        return Err(CypherError::InvalidQuery(format!(
+                            "Cannot delete node '{}' because it has incident edges. Use DETACH DELETE.",
+                            var
+                        )));
+                    }
+
                     if detach {
-                        let edges_to_remove: Vec<_> = self
-                            .graph
-                            .edges_directed(idx, petgraph::Direction::Outgoing)
-                            .map(|e| e.id())
-                            .collect();
-                        let edges_to_remove_in: Vec<_> = self
-                            .graph
-                            .edges_directed(idx, petgraph::Direction::Incoming)
-                            .map(|e| e.id())
-                            .collect();
-                        for edge_id in edges_to_remove.into_iter().chain(edges_to_remove_in) {
+                        for edge_id in out_edges.into_iter().chain(in_edges) {
                             self.graph.remove_edge(edge_id);
                         }
                     }

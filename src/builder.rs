@@ -63,9 +63,9 @@ fn apply_path_pattern(
                 graph.add_edge(target_idx, prev_idx, edge_data);
             }
             RelDirection::Both => {
-                // Undirected relationships are stored as a single directed
-                // edge; callers can inspect `RelDirection` on `EdgeData` if
-                // they need to treat it as undirected.
+                // Undirected relationships are stored as a single directed edge
+                // from source to target. Direction semantics must be preserved
+                // at the query/AST level.
                 graph.add_edge(prev_idx, target_idx, edge_data);
             }
         }
