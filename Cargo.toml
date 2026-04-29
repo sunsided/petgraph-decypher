@@ -1,0 +1,15 @@
+[package]
+name = "petgraph-cypher"
+version = "0.1.0"
+edition = "2021"
+description = "Build petgraph graphs from OpenCypher queries"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sunsided/petgraph-cypher"
+readme = "README.md"
+keywords = ["petgraph", "cypher", "opencypher", "graph"]
+categories = ["data-structures"]
+
+[dependencies]
+petgraph = "0.8"
+nom = "7"
+thiserror = "2"
