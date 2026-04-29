@@ -14,9 +14,7 @@ use crate::{EdgeData, NodeData};
 ///
 /// Variables that appear in multiple patterns refer to the same node in the
 /// resulting graph.
-pub(crate) fn build_graph(
-    query: CypherQuery,
-) -> Result<Graph<NodeData, EdgeData>, CypherError> {
+pub(crate) fn build_graph(query: CypherQuery) -> Result<Graph<NodeData, EdgeData>, CypherError> {
     let mut graph: Graph<NodeData, EdgeData> = Graph::new();
     // Tracks variable name → NodeIndex for reuse across patterns.
     let mut var_map: HashMap<String, NodeIndex> = HashMap::new();

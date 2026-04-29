@@ -28,10 +28,8 @@ fn parse_create_single_node() {
 
 #[test]
 fn parse_create_two_nodes_relationship() {
-    let q = parse_cypher(
-        r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,
-    )
-    .unwrap();
+    let q = parse_cypher(r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#)
+        .unwrap();
     assert_eq!(q.clauses.len(), 1);
     let Clause::Create { patterns } = &q.clauses[0] else {
         panic!("expected Create clause");
@@ -193,8 +191,8 @@ fn parse_multiple_clauses() {
 
 #[test]
 fn parse_semicolon_separated_statements() {
-    let q =
-        parse_cypher("CREATE (a:Person {name: \"Alice\"}); CREATE (b:Person {name: \"Bob\"})").unwrap();
+    let q = parse_cypher("CREATE (a:Person {name: \"Alice\"}); CREATE (b:Person {name: \"Bob\"})")
+        .unwrap();
     assert_eq!(q.clauses.len(), 2);
 }
 
@@ -259,10 +257,7 @@ fn build_graph_shared_variable_reuses_node() {
 
 #[test]
 fn build_graph_chain_of_nodes() {
-    let g = build_graph_from_cypher(
-        "CREATE (a:X)-[:E]->(b:Y)-[:E]->(c:Z)",
-    )
-    .unwrap();
+    let g = build_graph_from_cypher("CREATE (a:X)-[:E]->(b:Y)-[:E]->(c:Z)").unwrap();
     assert_eq!(g.node_count(), 3);
     assert_eq!(g.edge_count(), 2);
 }
@@ -296,10 +291,7 @@ fn build_graph_left_directed_edge_direction() {
 
 #[test]
 fn build_graph_edge_with_properties() {
-    let g = build_graph_from_cypher(
-        r#"CREATE (a)-[:KNOWS {since: 2020}]->(b)"#,
-    )
-    .unwrap();
+    let g = build_graph_from_cypher(r#"CREATE (a)-[:KNOWS {since: 2020}]->(b)"#).unwrap();
     let e = g.edge_indices().next().unwrap();
     assert_eq!(
         g[e].properties.get("since"),
@@ -317,10 +309,7 @@ fn build_graph_anonymous_node() {
 
 #[test]
 fn build_graph_node_variable_data() {
-    let g = build_graph_from_cypher(
-        r#"CREATE (n:Person:Employee {age: 30})"#,
-    )
-    .unwrap();
+    let g = build_graph_from_cypher(r#"CREATE (n:Person:Employee {age: 30})"#).unwrap();
     let n = g.node_indices().next().unwrap();
     let data = &g[n];
     assert_eq!(data.variable.as_deref(), Some("n"));

@@ -35,8 +35,8 @@
 //! ```
 
 pub mod ast;
-pub mod error;
 mod builder;
+pub mod error;
 mod parser;
 
 pub use ast::{
@@ -47,10 +47,6 @@ pub use error::CypherError;
 
 use petgraph::Graph;
 use std::collections::HashMap;
-
-// ---------------------------------------------------------------------------
-// Public graph data types
-// ---------------------------------------------------------------------------
 
 /// Data stored at each node in the graph built by [`build_graph_from_cypher`].
 #[derive(Debug, Clone, PartialEq)]
@@ -73,10 +69,6 @@ pub struct EdgeData {
     /// Properties specified in the relationship pattern.
     pub properties: HashMap<String, CypherValue>,
 }
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Parse a Cypher query string and return its AST representation.
 ///

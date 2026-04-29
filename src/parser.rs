@@ -15,10 +15,6 @@ use nom::{
 use crate::ast::*;
 use crate::error::CypherError;
 
-// ---------------------------------------------------------------------------
-// Low-level helpers
-// ---------------------------------------------------------------------------
-
 /// Match an identifier: `[a-zA-Z_][a-zA-Z0-9_]*`
 fn identifier(input: &str) -> IResult<&str, &str> {
     recognize(pair(
@@ -46,10 +42,7 @@ fn keyword<'a>(kw: &'static str) -> impl Fn(&'a str) -> IResult<&'a str, ()> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Literal value parsers
-// ---------------------------------------------------------------------------
-
+/// Parse a double- or single-quoted string literal into a `CypherValue::String`.
 fn string_literal(input: &str) -> IResult<&str, CypherValue> {
     alt((
         map(
@@ -63,25 +56,30 @@ fn string_literal(input: &str) -> IResult<&str, CypherValue> {
     ))(input)
 }
 
+/// Parse a signed floating-point literal (e.g. `-3.14`) into a `CypherValue::Float`.
 fn float_literal(input: &str) -> IResult<&str, CypherValue> {
     map(
-        recognize(tuple((
-            opt(char('-')),
-            digit1,
-            char('.'),
-            digit1,
-        ))),
-        |s: &str| CypherValue::Float(s.parse::<f64>().expect("recognize guarantees valid float digits")),
+        recognize(tuple((opt(char('-')), digit1, char('.'), digit1))),
+        |s: &str| {
+            CypherValue::Float(
+                s.parse::<f64>()
+                    .expect("recognize guarantees valid float digits"),
+            )
+        },
     )(input)
 }
 
+/// Parse a signed integer literal (e.g. `42`, `-7`) into a `CypherValue::Integer`.
 fn integer_literal(input: &str) -> IResult<&str, CypherValue> {
-    map(
-        recognize(pair(opt(char('-')), digit1)),
-        |s: &str| CypherValue::Integer(s.parse::<i64>().expect("recognize guarantees valid integer digits")),
-    )(input)
+    map(recognize(pair(opt(char('-')), digit1)), |s: &str| {
+        CypherValue::Integer(
+            s.parse::<i64>()
+                .expect("recognize guarantees valid integer digits"),
+        )
+    })(input)
 }
 
+/// Parse the `true` or `false` keyword into a `CypherValue::Boolean`.
 fn boolean_literal(input: &str) -> IResult<&str, CypherValue> {
     alt((
         value(CypherValue::Boolean(true), keyword("true")),
@@ -89,6 +87,7 @@ fn boolean_literal(input: &str) -> IResult<&str, CypherValue> {
     ))(input)
 }
 
+/// Parse the `null` keyword into a `CypherValue::Null`.
 fn null_literal(input: &str) -> IResult<&str, CypherValue> {
     value(CypherValue::Null, keyword("null"))(input)
 }
@@ -99,15 +98,12 @@ fn cypher_value(input: &str) -> IResult<&str, CypherValue> {
         boolean_literal,
         null_literal,
         string_literal,
-        float_literal,   // must precede integer_literal
+        float_literal, // must precede integer_literal
         integer_literal,
     ))(input)
 }
 
-// ---------------------------------------------------------------------------
-// Property map parser  {key: value, ...}
-// ---------------------------------------------------------------------------
-
+/// Parse a single `key: value` pair inside a property map.
 fn property_pair(input: &str) -> IResult<&str, (String, CypherValue)> {
     map(
         tuple((
@@ -119,28 +115,24 @@ fn property_pair(input: &str) -> IResult<&str, (String, CypherValue)> {
     )(input)
 }
 
+/// Parse a `{key: value, ...}` property map into a `HashMap`.
 fn properties(input: &str) -> IResult<&str, HashMap<String, CypherValue>> {
     map(
         delimited(
             pair(char('{'), multispace0),
-            separated_list0(
-                tuple((multispace0, char(','), multispace0)),
-                property_pair,
-            ),
+            separated_list0(tuple((multispace0, char(','), multispace0)), property_pair),
             pair(multispace0, char('}')),
         ),
         |pairs| pairs.into_iter().collect(),
     )(input)
 }
 
-// ---------------------------------------------------------------------------
-// Node pattern parser  (var:Label {props})
-// ---------------------------------------------------------------------------
-
+/// Parse a node label prefixed with `:` (e.g. `:Person`).
 fn label(input: &str) -> IResult<&str, String> {
     map(preceded(char(':'), identifier), str::to_string)(input)
 }
 
+/// Parse a node pattern `(var:Label1:Label2 {props})`.
 fn node_pattern(input: &str) -> IResult<&str, NodePattern> {
     delimited(
         pair(char('('), multispace0),
@@ -166,10 +158,7 @@ fn node_pattern(input: &str) -> IResult<&str, NodePattern> {
     )(input)
 }
 
-// ---------------------------------------------------------------------------
-// Relationship pattern parser
-// ---------------------------------------------------------------------------
-
+/// Parse a relationship type prefixed with `:` (e.g. `:KNOWS`).
 fn rel_type_spec(input: &str) -> IResult<&str, String> {
     map(preceded(char(':'), identifier), str::to_string)(input)
 }
@@ -232,7 +221,7 @@ fn rel_left_bracketed(input: &str) -> IResult<&str, RelPattern> {
 /// Any relationship pattern form.
 fn rel_pattern(input: &str) -> IResult<&str, RelPattern> {
     alt((
-        rel_left_bracketed,                                          // <-[...]-
+        rel_left_bracketed,                                         // <-[...]-
         rel_right_or_undir,                                         // -[...]-> or -[...]-
         value(RelPattern::simple(RelDirection::Right), tag("-->")), // -->
         value(RelPattern::simple(RelDirection::Left), tag("<--")),  // <--
@@ -240,10 +229,7 @@ fn rel_pattern(input: &str) -> IResult<&str, RelPattern> {
     ))(input)
 }
 
-// ---------------------------------------------------------------------------
-// Path pattern parser
-// ---------------------------------------------------------------------------
-
+/// Parse a path pattern: a start node followed by zero or more (relationship, node) hops.
 fn path_pattern(input: &str) -> IResult<&str, PathPattern> {
     map(
         pair(
@@ -257,10 +243,7 @@ fn path_pattern(input: &str) -> IResult<&str, PathPattern> {
     )(input)
 }
 
-// ---------------------------------------------------------------------------
-// Expression / return-item parsers
-// ---------------------------------------------------------------------------
-
+/// Parse an expression: wildcard `*`, variable reference, or `var.prop` property access.
 fn expression(input: &str) -> IResult<&str, Expression> {
     alt((
         value(Expression::All, char('*')),
@@ -278,6 +261,7 @@ fn expression(input: &str) -> IResult<&str, Expression> {
     ))(input)
 }
 
+/// Parse a single RETURN item with an optional `AS alias`.
 fn return_item(input: &str) -> IResult<&str, ReturnItem> {
     map(
         pair(
@@ -294,10 +278,7 @@ fn return_item(input: &str) -> IResult<&str, ReturnItem> {
     )(input)
 }
 
-// ---------------------------------------------------------------------------
-// WHERE clause parser (basic equality checks)
-// ---------------------------------------------------------------------------
-
+/// Parse an equality expression `expr = value` inside a WHERE clause.
 fn where_equality(input: &str) -> IResult<&str, WhereExpr> {
     map(
         tuple((
@@ -309,6 +290,7 @@ fn where_equality(input: &str) -> IResult<&str, WhereExpr> {
     )(input)
 }
 
+/// Parse a WHERE expression, supporting chained `AND`-connected equality checks.
 fn where_expr(input: &str) -> IResult<&str, WhereExpr> {
     // Only equality for now; AND / OR can be layered on top
     let (rest, first) = where_equality(input)?;
@@ -323,21 +305,17 @@ fn where_expr(input: &str) -> IResult<&str, WhereExpr> {
     Ok((rest, combined))
 }
 
+/// Parse a `WHERE` keyword followed by a `where_expr`.
 fn where_clause(input: &str) -> IResult<&str, WhereExpr> {
     preceded(pair(keyword("WHERE"), multispace1), where_expr)(input)
 }
 
-// ---------------------------------------------------------------------------
-// Clause parsers
-// ---------------------------------------------------------------------------
-
+/// Parse a `MATCH` clause with comma-separated path patterns and an optional `WHERE` condition.
 fn match_clause(input: &str) -> IResult<&str, Clause> {
     let (rest, _) = keyword("MATCH")(input)?;
     let (rest, _) = multispace0(rest)?;
-    let (rest, patterns) = separated_list1(
-        tuple((multispace0, char(','), multispace0)),
-        path_pattern,
-    )(rest)?;
+    let (rest, patterns) =
+        separated_list1(tuple((multispace0, char(','), multispace0)), path_pattern)(rest)?;
     let (rest, wc) = opt(preceded(multispace1, where_clause))(rest)?;
     Ok((
         rest,
@@ -352,10 +330,7 @@ fn create_clause(input: &str) -> IResult<&str, Clause> {
     map(
         preceded(
             pair(keyword("CREATE"), multispace0),
-            separated_list1(
-                tuple((multispace0, char(','), multispace0)),
-                path_pattern,
-            ),
+            separated_list1(tuple((multispace0, char(','), multispace0)), path_pattern),
         ),
         |patterns| Clause::Create { patterns },
     )(input)
@@ -372,10 +347,7 @@ fn return_clause(input: &str) -> IResult<&str, Clause> {
     map(
         preceded(
             pair(keyword("RETURN"), multispace1),
-            separated_list1(
-                tuple((multispace0, char(','), multispace0)),
-                return_item,
-            ),
+            separated_list1(tuple((multispace0, char(','), multispace0)), return_item),
         ),
         |items| Clause::Return { items },
     )(input)
@@ -422,8 +394,7 @@ pub(crate) fn parse_query(input: &str) -> Result<CypherQuery, CypherError> {
     let mut clauses = Vec::new();
 
     while !remaining.is_empty() {
-        let (rest, c) =
-            clause(remaining).map_err(|e| CypherError::ParseError(format!("{}", e)))?;
+        let (rest, c) = clause(remaining).map_err(|e| CypherError::ParseError(format!("{}", e)))?;
         clauses.push(c);
         remaining = rest.trim_start();
         // Consume an optional semicolon between/after clauses.
