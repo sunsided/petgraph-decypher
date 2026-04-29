@@ -38,12 +38,14 @@ pub mod ast;
 mod builder;
 pub mod error;
 mod parser;
+pub mod query;
 
 pub use ast::{
     Clause, CypherQuery, CypherValue, Expression, NodePattern, PathPattern, RelDirection,
     RelPattern, ReturnItem, WhereExpr,
 };
 pub use error::CypherError;
+pub use query::{MatchStrategy, PetgraphCypher, QueryResult, ResultValue, Row};
 
 use petgraph::Graph;
 use std::collections::HashMap;
