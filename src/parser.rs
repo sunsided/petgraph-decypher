@@ -71,14 +71,14 @@ fn float_literal(input: &str) -> IResult<&str, CypherValue> {
             char('.'),
             digit1,
         ))),
-        |s: &str| CypherValue::Float(s.parse::<f64>().unwrap()),
+        |s: &str| CypherValue::Float(s.parse::<f64>().expect("recognize guarantees valid float digits")),
     )(input)
 }
 
 fn integer_literal(input: &str) -> IResult<&str, CypherValue> {
     map(
         recognize(pair(opt(char('-')), digit1)),
-        |s: &str| CypherValue::Integer(s.parse::<i64>().unwrap()),
+        |s: &str| CypherValue::Integer(s.parse::<i64>().expect("recognize guarantees valid integer digits")),
     )(input)
 }
 
