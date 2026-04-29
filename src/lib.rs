@@ -12,11 +12,11 @@
 //!
 //! | Feature | Status |
 //! |---------|--------|
-//! | `CREATE (n:Label {k: v})-[:TYPE]->(m)` | ✅ |
-//! | `MERGE  (n:Label {k: v})-[:TYPE]->(m)` | ✅ |
-//! | `MATCH  (n)-[r]->(m) WHERE n.p = v`    | parsed, not evaluated |
-//! | `RETURN n, n.prop AS alias, *`         | parsed |
-//! | `[DETACH] DELETE n`                    | parsed |
+//! | `CREATE (n:Label {k: v})-[:TYPE]->(m)` | ✅ materialised + executed |
+//! | `MERGE  (n:Label {k: v})-[:TYPE]->(m)` | ✅ materialised + executed |
+//! | `MATCH  (n)-[r]->(m) WHERE n.p = v`    | ✅ evaluated |
+//! | `RETURN n, n.prop AS alias, *`         | ✅ evaluated |
+//! | `[DETACH] DELETE n`                    | ✅ executed |
 //! | Multiple clauses in one query          | ✅ |
 //! | Semicolon-separated statements         | ✅ |
 //!

@@ -35,9 +35,7 @@ fn query_match_with_label_filter() {
     let result = g.cypher("MATCH (n:Person) RETURN n.name AS name").unwrap();
     let rows: Vec<_> = collect_rows(result);
     assert_eq!(rows.len(), 1);
-    if let ResultValue::Scalar(CypherValue::String(name)) =
-        rows[0].values.get("name").unwrap()
-    {
+    if let ResultValue::Scalar(CypherValue::String(name)) = rows[0].values.get("name").unwrap() {
         assert_eq!(name, "Alice");
     } else {
         panic!("expected string value");
@@ -69,9 +67,7 @@ fn query_match_no_matching_edges() {
     )
     .unwrap();
 
-    let result = g
-        .cypher("MATCH (a)-[r:HATES]->(b) RETURN a.name")
-        .unwrap();
+    let result = g.cypher("MATCH (a)-[r:HATES]->(b) RETURN a.name").unwrap();
     let rows: Vec<_> = collect_rows(result);
     assert!(rows.is_empty());
 }
@@ -94,9 +90,7 @@ fn query_where_filter() {
         .unwrap();
     let rows: Vec<_> = collect_rows(result);
     assert_eq!(rows.len(), 1);
-    if let ResultValue::Scalar(CypherValue::String(name)) =
-        rows[0].values.get("name").unwrap()
-    {
+    if let ResultValue::Scalar(CypherValue::String(name)) = rows[0].values.get("name").unwrap() {
         assert_eq!(name, "Alice");
     } else {
         panic!("expected string value");
@@ -120,10 +114,7 @@ fn query_where_with_and() {
 
 #[test]
 fn query_where_no_match() {
-    let g = build_graph_from_cypher(
-        r#"CREATE (a:Person {name: "Alice"})"#,
-    )
-    .unwrap();
+    let g = build_graph_from_cypher(r#"CREATE (a:Person {name: "Alice"})"#).unwrap();
 
     let result = g
         .cypher(r#"MATCH (n:Person) WHERE n.name = "Nobody" RETURN n.name"#)
@@ -152,10 +143,7 @@ fn query_match_two_hop_path() {
 
 #[test]
 fn query_match_chain_partial() {
-    let g = build_graph_from_cypher(
-        r#"CREATE (a)-[:E]->(b)-[:E]->(c)-[:E]->(d)"#,
-    )
-    .unwrap();
+    let g = build_graph_from_cypher(r#"CREATE (a)-[:E]->(b)-[:E]->(c)-[:E]->(d)"#).unwrap();
 
     // Match two hops: there are 2 such paths in a 4-node chain: a→b→c and b→c→d
     let result = g.cypher("MATCH (a)-[:E]->(b)-[:E]->(c) RETURN a").unwrap();
@@ -169,12 +157,11 @@ fn query_match_chain_partial() {
 
 #[test]
 fn query_return_property() {
-    let g = build_graph_from_cypher(
-        r#"CREATE (n:Person {name: "Alice", age: 30})"#,
-    )
-    .unwrap();
+    let g = build_graph_from_cypher(r#"CREATE (n:Person {name: "Alice", age: 30})"#).unwrap();
 
-    let result = g.cypher("MATCH (n) RETURN n.name AS name, n.age AS age").unwrap();
+    let result = g
+        .cypher("MATCH (n) RETURN n.name AS name, n.age AS age")
+        .unwrap();
     let rows: Vec<_> = collect_rows(result);
     assert_eq!(rows.len(), 1);
 }
@@ -201,13 +188,12 @@ fn query_return_wildcard() {
 
 #[test]
 fn query_columns() {
-    let g = build_graph_from_cypher(
-        r#"CREATE (n:Person {name: "Alice"})"#,
-    )
-    .unwrap();
+    let g = build_graph_from_cypher(r#"CREATE (n:Person {name: "Alice"})"#).unwrap();
 
-    let result = g.cypher("MATCH (n) RETURN n.name AS name, n.age AS age").unwrap();
-    assert_eq!(result.columns(), &["name", "age"]);
+    let result = g
+        .cypher("MATCH (n) RETURN n.name AS name, n.age AS age")
+        .unwrap();
+    assert_eq!(result.columns(), &["name".to_string(), "age".to_string()]);
 }
 
 // ---------------------------------------------------------------------------
@@ -240,10 +226,8 @@ fn query_mut_create_single_node() {
 fn query_mut_create_two_nodes_with_edge() {
     let mut g: Graph<petgraph_cypher::NodeData, petgraph_cypher::EdgeData> = Graph::new();
 
-    g.cypher_mut(
-        r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,
-    )
-    .unwrap();
+    g.cypher_mut(r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#)
+        .unwrap();
     assert_eq!(g.node_count(), 2);
     assert_eq!(g.edge_count(), 1);
 }
@@ -252,7 +236,8 @@ fn query_mut_create_two_nodes_with_edge() {
 fn query_mut_create_multiple_clauses() {
     let mut g: Graph<petgraph_cypher::NodeData, petgraph_cypher::EdgeData> = Graph::new();
 
-    g.cypher_mut(r#"CREATE (a:Person {name: "Alice"})"#).unwrap();
+    g.cypher_mut(r#"CREATE (a:Person {name: "Alice"})"#)
+        .unwrap();
     g.cypher_mut(r#"CREATE (b:Person {name: "Bob"})"#).unwrap();
     assert_eq!(g.node_count(), 2);
 }
@@ -297,17 +282,13 @@ fn query_mut_detach_delete() {
 fn query_mut_merge_creates_if_not_found() {
     let mut g: Graph<petgraph_cypher::NodeData, petgraph_cypher::EdgeData> = Graph::new();
 
-    g.cypher_mut(r#"MERGE (n:Person {name: "Alice"})"#)
-        .unwrap();
+    g.cypher_mut(r#"MERGE (n:Person {name: "Alice"})"#).unwrap();
     assert_eq!(g.node_count(), 1);
 }
 
 #[test]
 fn query_mut_merge_does_not_duplicate() {
-    let mut g = build_graph_from_cypher(
-        r#"CREATE (a:Person {name: "Alice"})"#,
-    )
-    .unwrap();
+    let mut g = build_graph_from_cypher(r#"CREATE (a:Person {name: "Alice"})"#).unwrap();
 
     // Merge a pattern that matches the existing node (anonymous node with label)
     g.cypher_mut(r#"MERGE (n:Person)"#).unwrap();
@@ -357,7 +338,10 @@ fn query_with_strategy_backtrack() {
     .unwrap();
 
     let result = g
-        .cypher_with_strategy("MATCH (a)-[:KNOWS]->(b) RETURN a.name", MatchStrategy::Backtrack)
+        .cypher_with_strategy(
+            "MATCH (a)-[:KNOWS]->(b) RETURN a.name",
+            MatchStrategy::Backtrack,
+        )
         .unwrap();
     let rows: Vec<_> = collect_rows(result);
     assert_eq!(rows.len(), 1);
@@ -391,7 +375,9 @@ fn query_match_multiple_patterns_cartesian() {
     )
     .unwrap();
 
-    let result = g.cypher("MATCH (a:Person), (b:Person) RETURN a.name, b.name").unwrap();
+    let result = g
+        .cypher("MATCH (a:Person), (b:Person) RETURN a.name, b.name")
+        .unwrap();
     let rows: Vec<_> = collect_rows(result);
     // 2 persons × 2 persons = 4 combinations
     assert_eq!(rows.len(), 4);

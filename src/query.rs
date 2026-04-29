@@ -13,18 +13,16 @@ use crate::{EdgeData, NodeData};
 
 /// Strategy to use when matching patterns against the graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum MatchStrategy {
     /// DFS backtracking (Neo4j-accurate semantics). Default strategy.
+    #[default]
     Backtrack,
-    /// petgraph-native algorithms (BFS/DFS, faster but less accurate).
+    /// Uses petgraph-native algorithms (BFS/DFS, faster but less accurate).
+    /// Currently delegates to Backtrack; a distinct optimized implementation is planned.
     Fast,
 }
 
-impl Default for MatchStrategy {
-    fn default() -> Self {
-        MatchStrategy::Backtrack
-    }
-}
 
 /// A value that can appear in a query result row.
 #[derive(Debug, Clone, PartialEq)]
@@ -310,10 +308,7 @@ impl<'a> ReadQueryExecutor<'a> {
                 } => {
                     bindings = self.execute_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
-                        bindings = bindings
-                            .into_iter()
-                            .filter(|b| self.evaluate_where(&where_expr, b))
-                            .collect();
+                        bindings.retain(|b| self.evaluate_where(&where_expr, b));
                     }
                 }
                 Clause::Return { items } => {
@@ -331,14 +326,14 @@ impl<'a> ReadQueryExecutor<'a> {
         if let Some(ri) = return_items {
             columns = ri
                 .iter()
-                .map(|item| {
+                .filter_map(|item| {
                     if let Some(ref alias) = item.alias {
-                        alias.clone()
+                        Some(alias.clone())
                     } else {
                         match &item.expression {
-                            Expression::Variable(v) => v.clone(),
-                            Expression::Property(v, p) => format!("{v}.{p}"),
-                            Expression::All => "*".to_string(),
+                            Expression::Variable(v) => Some(v.clone()),
+                            Expression::Property(v, p) => Some(format!("{v}.{p}")),
+                            Expression::All => None,
                         }
                     }
                 })
@@ -369,11 +364,7 @@ impl<'a> ReadQueryExecutor<'a> {
         results
     }
 
-    fn match_patterns(
-        &self,
-        patterns: &[PathPattern],
-        base_bindings: &Bindings,
-    ) -> Vec<Bindings> {
+    fn match_patterns(&self, patterns: &[PathPattern], base_bindings: &Bindings) -> Vec<Bindings> {
         if patterns.is_empty() {
             return vec![base_bindings.clone()];
         }
@@ -386,23 +377,25 @@ impl<'a> ReadQueryExecutor<'a> {
         per_pattern
             .iter()
             .multi_cartesian_product()
-            .map(|combo| {
+            .filter_map(|combo| {
                 let mut merged = base_bindings.clone();
                 for binding_set in combo {
                     for (k, v) in binding_set {
-                        merged.insert(k.clone(), *v);
+                        if let Some(existing) = merged.get(k) {
+                            if existing != v {
+                                return None;
+                            }
+                        } else {
+                            merged.insert(k.clone(), *v);
+                        }
                     }
                 }
-                merged
+                Some(merged)
             })
             .collect()
     }
 
-    fn match_single_path(
-        &self,
-        pattern: &PathPattern,
-        base_bindings: &Bindings,
-    ) -> Vec<Bindings> {
+    fn match_single_path(&self, pattern: &PathPattern, base_bindings: &Bindings) -> Vec<Bindings> {
         match self.strategy {
             MatchStrategy::Backtrack => self.match_path_backtrack(pattern, base_bindings),
             MatchStrategy::Fast => self.match_path_fast(pattern, base_bindings),
@@ -443,54 +436,51 @@ impl<'a> ReadQueryExecutor<'a> {
 
         let (rel, target_node) = &pattern.rels[hop_index];
 
-        let candidate_edges: Vec<_> = self
-            .graph
-            .edges(current_node)
-            .filter(|e| Self::edge_matches_rel(e, rel))
-            .collect();
+        let rel_pattern = rel;
+        let candidate_edges: Vec<_> = match rel_pattern.direction {
+            RelDirection::Right => self
+                .graph
+                .edges_directed(current_node, petgraph::Direction::Outgoing)
+                .filter(|e| Self::edge_matches_rel(e, rel_pattern))
+                .map(|e| (e, e.target()))
+                .collect(),
+            RelDirection::Left => self
+                .graph
+                .edges_directed(current_node, petgraph::Direction::Incoming)
+                .filter(|e| Self::edge_matches_rel(e, rel_pattern))
+                .map(|e| (e, e.source()))
+                .collect(),
+            RelDirection::Both => self
+                .graph
+                .edges(current_node)
+                .filter(|e| Self::edge_matches_rel(e, rel_pattern))
+                .map(|e| (e, e.target()))
+                .collect(),
+        };
 
-        for edge_ref in candidate_edges {
-            let target = edge_ref.target();
+        for (edge_ref, actual_target) in candidate_edges {
+            if self.node_matches_pattern(actual_target, target_node) {
+                let mut new_bindings = bindings.clone();
 
-            let mut targets = vec![target];
-            if rel.direction == RelDirection::Both {
-                for edge_ref2 in self.graph.edges(target) {
-                    if edge_ref2.target() == current_node
-                        && Self::edge_matches_rel(&edge_ref2, rel)
-                    {
-                        targets.push(edge_ref2.target());
-                    }
+                if let Some(var) = &rel.variable {
+                    new_bindings.insert(var.clone(), BoundValue::Edge(edge_ref.id()));
                 }
-            }
-
-            for actual_target in targets {
-                if self.node_matches_pattern(actual_target, target_node) {
-                    let mut new_bindings = bindings.clone();
-
-                    if let Some(var) = &rel.variable {
-                        new_bindings.insert(var.clone(), BoundValue::Edge(edge_ref.id()));
-                    }
-                    if let Some(var) = &target_node.variable {
-                        new_bindings.insert(var.clone(), BoundValue::Node(actual_target));
-                    }
-
-                    self.match_path_hops(
-                        pattern,
-                        hop_index + 1,
-                        actual_target,
-                        &mut new_bindings,
-                        results,
-                    );
+                if let Some(var) = &target_node.variable {
+                    new_bindings.insert(var.clone(), BoundValue::Node(actual_target));
                 }
+
+                self.match_path_hops(
+                    pattern,
+                    hop_index + 1,
+                    actual_target,
+                    &mut new_bindings,
+                    results,
+                );
             }
         }
     }
 
-    fn match_path_fast(
-        &self,
-        pattern: &PathPattern,
-        base_bindings: &Bindings,
-    ) -> Vec<Bindings> {
+    fn match_path_fast(&self, pattern: &PathPattern, base_bindings: &Bindings) -> Vec<Bindings> {
         self.match_path_backtrack(pattern, base_bindings)
     }
 
@@ -516,10 +506,20 @@ impl<'a> ReadQueryExecutor<'a> {
 
     fn node_matches_pattern(&self, node_idx: NodeIndex, pattern: &NodePattern) -> bool {
         let node_data = &self.graph[node_idx];
-        pattern
-            .labels
-            .iter()
-            .all(|label| node_data.labels.iter().any(|node_label| node_label == label))
+        if !pattern.labels.iter().all(|label| {
+            node_data
+                .labels
+                .iter()
+                .any(|node_label| node_label == label)
+        }) {
+            return false;
+        }
+        for (key, value) in &pattern.properties {
+            if node_data.properties.get(key) != Some(value) {
+                return false;
+            }
+        }
+        true
     }
 
     fn edge_matches_rel(edge_ref: &EdgeReference<'_, EdgeData>, rel: &RelPattern) -> bool {
@@ -596,33 +596,29 @@ impl<'a> MutQueryExecutor<'a> {
                 } => {
                     bindings = self.execute_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
-                        bindings = bindings
-                            .into_iter()
-                            .filter(|b| self.evaluate_where(&where_expr, b))
-                            .collect();
+                        bindings.retain(|b| self.evaluate_where(&where_expr, b));
                     }
                 }
                 Clause::Create { patterns } => {
-                    for pattern in &patterns {
-                        self.apply_path_pattern_mut(&mut bindings[0], pattern);
+                    for bindings_row in &mut bindings {
+                        for pattern in &patterns {
+                            self.apply_path_pattern_mut(bindings_row, pattern);
+                        }
                     }
-                    bindings = vec![bindings[0].clone()];
                 }
                 Clause::Merge { pattern } => {
-                    let test_bindings = bindings[0].clone();
-                    let test_results = {
-                        let reader = ReadQueryExecutor::new(self.graph, MatchStrategy::Backtrack);
-                        reader.match_single_path(&pattern, &test_bindings)
-                    };
-                    if test_results.is_empty() {
-                        self.apply_path_pattern_mut(&mut bindings[0], &pattern);
+                    for bindings_row in &mut bindings {
+                        let test_results = {
+                            let reader =
+                                ReadQueryExecutor::new(self.graph, MatchStrategy::Backtrack);
+                            reader.match_single_path(&pattern, bindings_row)
+                        };
+                        if test_results.is_empty() {
+                            self.apply_path_pattern_mut(bindings_row, &pattern);
+                        }
                     }
-                    bindings = vec![bindings[0].clone()];
                 }
-                Clause::Delete {
-                    variables,
-                    detach,
-                } => {
+                Clause::Delete { variables, detach } => {
                     self.execute_delete(&variables, detach, &bindings)?;
                 }
                 Clause::Return { .. } => {
@@ -651,11 +647,7 @@ impl<'a> MutQueryExecutor<'a> {
         results
     }
 
-    fn match_patterns(
-        &self,
-        patterns: &[PathPattern],
-        base_bindings: &Bindings,
-    ) -> Vec<Bindings> {
+    fn match_patterns(&self, patterns: &[PathPattern], base_bindings: &Bindings) -> Vec<Bindings> {
         if patterns.is_empty() {
             return vec![base_bindings.clone()];
         }
@@ -668,23 +660,25 @@ impl<'a> MutQueryExecutor<'a> {
         per_pattern
             .iter()
             .multi_cartesian_product()
-            .map(|combo| {
+            .filter_map(|combo| {
                 let mut merged = base_bindings.clone();
                 for binding_set in combo {
                     for (k, v) in binding_set {
-                        merged.insert(k.clone(), *v);
+                        if let Some(existing) = merged.get(k) {
+                            if existing != v {
+                                return None;
+                            }
+                        } else {
+                            merged.insert(k.clone(), *v);
+                        }
                     }
                 }
-                merged
+                Some(merged)
             })
             .collect()
     }
 
-    fn match_single_path(
-        &self,
-        pattern: &PathPattern,
-        base_bindings: &Bindings,
-    ) -> Vec<Bindings> {
+    fn match_single_path(&self, pattern: &PathPattern, base_bindings: &Bindings) -> Vec<Bindings> {
         self.match_path_backtrack(pattern, base_bindings)
     }
 
@@ -722,45 +716,45 @@ impl<'a> MutQueryExecutor<'a> {
 
         let (rel, target_node) = &pattern.rels[hop_index];
 
-        let candidate_edges: Vec<_> = self
-            .graph
-            .edges(current_node)
-            .filter(|e| ReadQueryExecutor::edge_matches_rel(e, rel))
-            .collect();
+        let candidate_edges: Vec<_> = match rel.direction {
+            RelDirection::Right => self
+                .graph
+                .edges_directed(current_node, petgraph::Direction::Outgoing)
+                .filter(|e| ReadQueryExecutor::edge_matches_rel(e, rel))
+                .map(|e| (e, e.target()))
+                .collect(),
+            RelDirection::Left => self
+                .graph
+                .edges_directed(current_node, petgraph::Direction::Incoming)
+                .filter(|e| ReadQueryExecutor::edge_matches_rel(e, rel))
+                .map(|e| (e, e.source()))
+                .collect(),
+            RelDirection::Both => self
+                .graph
+                .edges(current_node)
+                .filter(|e| ReadQueryExecutor::edge_matches_rel(e, rel))
+                .map(|e| (e, e.target()))
+                .collect(),
+        };
 
-        for edge_ref in candidate_edges {
-            let target = edge_ref.target();
+        for (edge_ref, actual_target) in candidate_edges {
+            if self.node_matches_pattern(actual_target, target_node) {
+                let mut new_bindings = bindings.clone();
 
-            let mut targets = vec![target];
-            if rel.direction == RelDirection::Both {
-                for edge_ref2 in self.graph.edges(target) {
-                    if edge_ref2.target() == current_node
-                        && ReadQueryExecutor::edge_matches_rel(&edge_ref2, rel)
-                    {
-                        targets.push(edge_ref2.target());
-                    }
+                if let Some(var) = &rel.variable {
+                    new_bindings.insert(var.clone(), BoundValue::Edge(edge_ref.id()));
                 }
-            }
-
-            for actual_target in targets {
-                if self.node_matches_pattern(actual_target, target_node) {
-                    let mut new_bindings = bindings.clone();
-
-                    if let Some(var) = &rel.variable {
-                        new_bindings.insert(var.clone(), BoundValue::Edge(edge_ref.id()));
-                    }
-                    if let Some(var) = &target_node.variable {
-                        new_bindings.insert(var.clone(), BoundValue::Node(actual_target));
-                    }
-
-                    self.match_path_hops(
-                        pattern,
-                        hop_index + 1,
-                        actual_target,
-                        &mut new_bindings,
-                        results,
-                    );
+                if let Some(var) = &target_node.variable {
+                    new_bindings.insert(var.clone(), BoundValue::Node(actual_target));
                 }
+
+                self.match_path_hops(
+                    pattern,
+                    hop_index + 1,
+                    actual_target,
+                    &mut new_bindings,
+                    results,
+                );
             }
         }
     }
@@ -787,10 +781,20 @@ impl<'a> MutQueryExecutor<'a> {
 
     fn node_matches_pattern(&self, node_idx: NodeIndex, pattern: &NodePattern) -> bool {
         let node_data = &self.graph[node_idx];
-        pattern
-            .labels
-            .iter()
-            .all(|label| node_data.labels.iter().any(|node_label| node_label == label))
+        if !pattern.labels.iter().all(|label| {
+            node_data
+                .labels
+                .iter()
+                .any(|node_label| node_label == label)
+        }) {
+            return false;
+        }
+        for (key, value) in &pattern.properties {
+            if node_data.properties.get(key) != Some(value) {
+                return false;
+            }
+        }
+        true
     }
 
     fn evaluate_where(&self, expr: &WhereExpr, bindings: &Bindings) -> bool {
@@ -839,14 +843,31 @@ impl<'a> MutQueryExecutor<'a> {
         bindings: &[Bindings],
     ) -> Result<(), CypherError> {
         for var in variables {
-            let bound = bindings
+            let bound_values: Vec<BoundValue> = bindings
                 .iter()
-                .find_map(|b| b.get(var))
-                .ok_or_else(|| CypherError::InvalidQuery(format!("Variable '{}' not bound", var)))?;
+                .filter_map(|b| b.get(var).copied())
+                .unique()
+                .collect();
 
-            match bound {
-                BoundValue::Node(idx) => {
-                    let idx = *idx;
+            if bound_values.is_empty() {
+                return Err(CypherError::InvalidQuery(format!(
+                    "Variable '{}' not bound",
+                    var
+                )));
+            }
+
+            let (nodes, edges): (Vec<_>, Vec<_>) = bound_values
+                .into_iter()
+                .partition(|b| matches!(b, BoundValue::Node(_)));
+
+            for edge_idx in edges {
+                if let BoundValue::Edge(idx) = edge_idx {
+                    self.graph.remove_edge(idx);
+                }
+            }
+
+            for node_idx in nodes {
+                if let BoundValue::Node(idx) = node_idx {
                     if detach {
                         let edges_to_remove: Vec<_> = self
                             .graph
@@ -864,19 +885,12 @@ impl<'a> MutQueryExecutor<'a> {
                     }
                     self.graph.remove_node(idx);
                 }
-                BoundValue::Edge(idx) => {
-                    self.graph.remove_edge(*idx);
-                }
             }
         }
         Ok(())
     }
 
-    fn apply_path_pattern_mut(
-        &mut self,
-        var_map: &mut Bindings,
-        pattern: &PathPattern,
-    ) {
+    fn apply_path_pattern_mut(&mut self, var_map: &mut Bindings, pattern: &PathPattern) {
         let mut prev_idx = self.get_or_add_node_mut(var_map, &pattern.start);
 
         for (rel, target_node) in &pattern.rels {
@@ -902,11 +916,7 @@ impl<'a> MutQueryExecutor<'a> {
         }
     }
 
-    fn get_or_add_node_mut(
-        &mut self,
-        var_map: &mut Bindings,
-        pattern: &NodePattern,
-    ) -> NodeIndex {
+    fn get_or_add_node_mut(&mut self, var_map: &mut Bindings, pattern: &NodePattern) -> NodeIndex {
         if let Some(var) = &pattern.variable {
             if let Some(&BoundValue::Node(idx)) = var_map.get(var) {
                 return idx;

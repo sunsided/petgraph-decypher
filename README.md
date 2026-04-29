@@ -24,11 +24,11 @@ assert_eq!(graph.edge_count(), 1);
 
 | Feature | Status |
 |---------|--------|
-| `CREATE (n:Label {k: v})-[:TYPE]->(m)` | ✅ |
-| `MERGE  (n:Label {k: v})-[:TYPE]->(m)` | ✅ |
-| `MATCH  (n)-[r]->(m) WHERE n.p = v`    | parsed |
-| `RETURN n, n.prop AS alias, *`         | parsed |
-| `[DETACH] DELETE n`                    | parsed |
+| `CREATE (n:Label {k: v})-[:TYPE]->(m)` | ✅ materialised + executed |
+| `MERGE  (n:Label {k: v})-[:TYPE]->(m)` | ✅ materialised + executed |
+| `MATCH  (n)-[r]->(m) WHERE n.p = v`    | ✅ evaluated |
+| `RETURN n, n.prop AS alias, *`         | ✅ evaluated |
+| `[DETACH] DELETE n`                    | ✅ executed |
 | Multiple clauses in one query          | ✅ |
 | Semicolon-separated statements         | ✅ |
 | Multi-label nodes `(n:A:B)`            | ✅ |
@@ -47,6 +47,13 @@ let graph = petgraph_cypher::build_graph_from_cypher(
     "CREATE (a)-[:KNOWS]->(b)"
 )
 .unwrap();
+
+// Read-only query execution via PetgraphCypher trait
+use petgraph_cypher::PetgraphCypher;
+let result = graph.cypher("MATCH (n) RETURN n").unwrap();
+
+// Mutating query execution via PetgraphCypher trait
+graph.cypher_mut("CREATE (n:Person {name: \"Alice\"})").unwrap();
 ```
 
 ### Node data
