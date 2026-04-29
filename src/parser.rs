@@ -282,11 +282,23 @@ fn return_item(input: &str) -> IResult<&str, ReturnItem> {
 fn where_equality(input: &str) -> IResult<&str, WhereExpr> {
     map(
         tuple((
-            preceded(multispace0, expression),
+            preceded(multispace0, where_expression),
             preceded(multispace0, char('=')),
             preceded(multispace0, cypher_value),
         )),
         |(expr, _, val)| WhereExpr::Eq(expr, val),
+    )(input)
+}
+
+/// Parse a WHERE expression: only `var.prop` property access is supported.
+/// Bare variables and wildcards are rejected to prevent silent "match nothing" behavior.
+fn where_expression(input: &str) -> IResult<&str, Expression> {
+    map(
+        pair(
+            map(identifier, str::to_string),
+            preceded(char('.'), map(identifier, str::to_string)),
+        ),
+        |(var, prop)| Expression::Property(var, prop),
     )(input)
 }
 

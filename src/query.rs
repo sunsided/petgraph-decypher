@@ -281,85 +281,19 @@ fn validate_mutation_query(query: &CypherQuery) -> Result<(), CypherError> {
 }
 
 // ---------------------------------------------------------------------------
-// Read-only executor
+// Shared pattern matcher
 // ---------------------------------------------------------------------------
 
-struct ReadQueryExecutor<'a> {
+/// Shared matcher for pattern matching against a graph. Used by both the read
+/// and mutation executors to avoid code duplication.
+struct PatternMatcher<'a> {
     graph: &'a Graph<NodeData, EdgeData>,
     strategy: MatchStrategy,
 }
 
-impl<'a> ReadQueryExecutor<'a> {
+impl<'a> PatternMatcher<'a> {
     fn new(graph: &'a Graph<NodeData, EdgeData>, strategy: MatchStrategy) -> Self {
         Self { graph, strategy }
-    }
-
-    fn execute(self, query: CypherQuery) -> Result<QueryResult<'a>, CypherError> {
-        let mut bindings: Vec<Bindings> = vec![HashMap::new()];
-        let mut return_items: Option<Vec<ReturnItem>> = None;
-
-        for clause in query.clauses {
-            match clause {
-                Clause::Match {
-                    patterns,
-                    where_clause,
-                } => {
-                    bindings = self.execute_match(patterns, bindings);
-                    if let Some(where_expr) = where_clause {
-                        bindings.retain(|b| self.evaluate_where(&where_expr, b));
-                    }
-                }
-                Clause::Return { items } => {
-                    return_items = Some(items);
-                }
-                Clause::Create { .. } | Clause::Merge { .. } | Clause::Delete { .. } => {
-                    unreachable!("validated by validate_read_query")
-                }
-            }
-        }
-
-        let columns: Vec<String>;
-        let items: Vec<ReturnItem>;
-
-        if let Some(ri) = return_items {
-            columns = ri
-                .iter()
-                .filter_map(|item| {
-                    if let Some(ref alias) = item.alias {
-                        Some(alias.clone())
-                    } else {
-                        match &item.expression {
-                            Expression::Variable(v) => Some(v.clone()),
-                            Expression::Property(v, p) => Some(format!("{v}.{p}")),
-                            Expression::All => None,
-                        }
-                    }
-                })
-                .collect();
-            items = ri;
-        } else {
-            columns = vec![];
-            items = vec![];
-        }
-
-        Ok(QueryResult::new(columns, bindings, self.graph, items))
-    }
-
-    fn execute_match(
-        &self,
-        patterns: Vec<PathPattern>,
-        input_bindings: Vec<Bindings>,
-    ) -> Vec<Bindings> {
-        if patterns.is_empty() {
-            return input_bindings;
-        }
-
-        let mut results = Vec::new();
-        for existing_bindings in &input_bindings {
-            let pattern_results = self.match_patterns(&patterns, existing_bindings);
-            results.extend(pattern_results);
-        }
-        results
     }
 
     fn match_patterns(&self, patterns: &[PathPattern], base_bindings: &Bindings) -> Vec<Bindings> {
@@ -434,30 +368,29 @@ impl<'a> ReadQueryExecutor<'a> {
 
         let (rel, target_node) = &pattern.rels[hop_index];
 
-        let rel_pattern = rel;
-        let candidate_edges: Vec<_> = match rel_pattern.direction {
+        let candidate_edges: Vec<_> = match rel.direction {
             RelDirection::Right => self
                 .graph
                 .edges_directed(current_node, petgraph::Direction::Outgoing)
-                .filter(|e| Self::edge_matches_rel(e, rel_pattern))
+                .filter(|e| Self::edge_matches_rel(e, rel))
                 .map(|e| (e, e.target()))
                 .collect(),
             RelDirection::Left => self
                 .graph
                 .edges_directed(current_node, petgraph::Direction::Incoming)
-                .filter(|e| Self::edge_matches_rel(e, rel_pattern))
+                .filter(|e| Self::edge_matches_rel(e, rel))
                 .map(|e| (e, e.source()))
                 .collect(),
             RelDirection::Both => {
                 let out = self
                     .graph
                     .edges_directed(current_node, petgraph::Direction::Outgoing)
-                    .filter(|e| Self::edge_matches_rel(e, rel_pattern))
+                    .filter(|e| Self::edge_matches_rel(e, rel))
                     .map(|e| (e, e.target()));
                 let incoming = self
                     .graph
                     .edges_directed(current_node, petgraph::Direction::Incoming)
-                    .filter(|e| Self::edge_matches_rel(e, rel_pattern))
+                    .filter(|e| Self::edge_matches_rel(e, rel))
                     .map(|e| (e, e.source()));
                 out.chain(incoming).collect()
             }
@@ -597,6 +530,95 @@ impl<'a> ReadQueryExecutor<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Read-only executor
+// ---------------------------------------------------------------------------
+
+struct ReadQueryExecutor<'a> {
+    matcher: PatternMatcher<'a>,
+}
+
+impl<'a> ReadQueryExecutor<'a> {
+    fn new(graph: &'a Graph<NodeData, EdgeData>, strategy: MatchStrategy) -> Self {
+        Self {
+            matcher: PatternMatcher::new(graph, strategy),
+        }
+    }
+
+    fn execute(self, query: CypherQuery) -> Result<QueryResult<'a>, CypherError> {
+        let mut bindings: Vec<Bindings> = vec![HashMap::new()];
+        let mut return_items: Option<Vec<ReturnItem>> = None;
+
+        for clause in query.clauses {
+            match clause {
+                Clause::Match {
+                    patterns,
+                    where_clause,
+                } => {
+                    bindings = self.execute_match(patterns, bindings);
+                    if let Some(where_expr) = where_clause {
+                        bindings.retain(|b| self.matcher.evaluate_where(&where_expr, b));
+                    }
+                }
+                Clause::Return { items } => {
+                    return_items = Some(items);
+                }
+                Clause::Create { .. } | Clause::Merge { .. } | Clause::Delete { .. } => {
+                    unreachable!("validated by validate_read_query")
+                }
+            }
+        }
+
+        let columns: Vec<String>;
+        let items: Vec<ReturnItem>;
+
+        if let Some(ri) = return_items {
+            columns = ri
+                .iter()
+                .filter_map(|item| {
+                    if let Some(ref alias) = item.alias {
+                        Some(alias.clone())
+                    } else {
+                        match &item.expression {
+                            Expression::Variable(v) => Some(v.clone()),
+                            Expression::Property(v, p) => Some(format!("{v}.{p}")),
+                            Expression::All => None,
+                        }
+                    }
+                })
+                .collect();
+            items = ri;
+        } else {
+            columns = vec![];
+            items = vec![];
+        }
+
+        Ok(QueryResult::new(
+            columns,
+            bindings,
+            self.matcher.graph,
+            items,
+        ))
+    }
+
+    fn execute_match(
+        &self,
+        patterns: Vec<PathPattern>,
+        input_bindings: Vec<Bindings>,
+    ) -> Vec<Bindings> {
+        if patterns.is_empty() {
+            return input_bindings;
+        }
+
+        let mut results = Vec::new();
+        for existing_bindings in &input_bindings {
+            let pattern_results = self.matcher.match_patterns(&patterns, existing_bindings);
+            results.extend(pattern_results);
+        }
+        results
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Mutating executor
 // ---------------------------------------------------------------------------
 
@@ -620,32 +642,33 @@ impl<'a> MutQueryExecutor<'a> {
                 } => {
                     bindings = self.execute_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
-                        bindings.retain(|b| self.evaluate_where(&where_expr, b));
+                        let matcher = PatternMatcher::new(self.graph, MatchStrategy::Backtrack);
+                        bindings.retain(|b| matcher.evaluate_where(&where_expr, b));
                     }
                 }
                 Clause::Create { patterns } => {
                     for bindings_row in &mut bindings {
                         for pattern in &patterns {
-                            self.apply_path_pattern_mut(bindings_row, pattern);
+                            self.apply_path_pattern_mut(bindings_row, pattern)?;
                         }
                     }
                 }
                 Clause::Merge { pattern } => {
                     for bindings_row in &mut bindings {
-                        let test_results = {
-                            let reader =
-                                ReadQueryExecutor::new(self.graph, MatchStrategy::Backtrack);
-                            reader.match_single_path(&pattern, bindings_row)
-                        };
+                        let matcher = PatternMatcher::new(self.graph, MatchStrategy::Backtrack);
+                        let test_results = matcher.match_single_path(&pattern, bindings_row);
                         if test_results.is_empty() {
-                            self.apply_path_pattern_mut(bindings_row, &pattern);
+                            self.apply_path_pattern_mut(bindings_row, &pattern)?;
                         } else {
                             // Propagate matched bindings into bindings_row
                             let first = &test_results[0];
                             for (k, v) in first {
                                 if let Some(existing) = bindings_row.get(k) {
                                     if existing != v {
-                                        panic!("MERGE binding conflict on '{}'", k);
+                                        return Err(CypherError::InvalidQuery(format!(
+                                            "MERGE binding conflict on '{}': existing value differs from matched value",
+                                            k
+                                        )));
                                     }
                                 } else {
                                     bindings_row.insert(k.clone(), *v);
@@ -675,222 +698,13 @@ impl<'a> MutQueryExecutor<'a> {
             return input_bindings;
         }
 
+        let matcher = PatternMatcher::new(self.graph, MatchStrategy::Backtrack);
         let mut results = Vec::new();
         for existing_bindings in &input_bindings {
-            let pattern_results = self.match_patterns(&patterns, existing_bindings);
+            let pattern_results = matcher.match_patterns(&patterns, existing_bindings);
             results.extend(pattern_results);
         }
         results
-    }
-
-    fn match_patterns(&self, patterns: &[PathPattern], base_bindings: &Bindings) -> Vec<Bindings> {
-        if patterns.is_empty() {
-            return vec![base_bindings.clone()];
-        }
-
-        let per_pattern: Vec<Vec<Bindings>> = patterns
-            .iter()
-            .map(|p| self.match_single_path(p, base_bindings))
-            .collect();
-
-        per_pattern
-            .iter()
-            .multi_cartesian_product()
-            .filter_map(|combo| {
-                let mut merged = base_bindings.clone();
-                for binding_set in combo {
-                    for (k, v) in binding_set {
-                        if let Some(existing) = merged.get(k) {
-                            if existing != v {
-                                return None;
-                            }
-                        } else {
-                            merged.insert(k.clone(), *v);
-                        }
-                    }
-                }
-                Some(merged)
-            })
-            .collect()
-    }
-
-    fn match_single_path(&self, pattern: &PathPattern, base_bindings: &Bindings) -> Vec<Bindings> {
-        self.match_path_backtrack(pattern, base_bindings)
-    }
-
-    fn match_path_backtrack(
-        &self,
-        pattern: &PathPattern,
-        base_bindings: &Bindings,
-    ) -> Vec<Bindings> {
-        let mut results = Vec::new();
-        let start_candidates = self.find_matching_nodes(&pattern.start, base_bindings);
-
-        for &start_node in &start_candidates {
-            let mut bindings = base_bindings.clone();
-            if let Some(var) = &pattern.start.variable {
-                bindings.insert(var.clone(), BoundValue::Node(start_node));
-            }
-            self.match_path_hops(pattern, 0, start_node, &mut bindings, &mut results);
-        }
-
-        results
-    }
-
-    fn match_path_hops(
-        &self,
-        pattern: &PathPattern,
-        hop_index: usize,
-        current_node: NodeIndex,
-        bindings: &mut Bindings,
-        results: &mut Vec<Bindings>,
-    ) {
-        if hop_index >= pattern.rels.len() {
-            results.push(bindings.clone());
-            return;
-        }
-
-        let (rel, target_node) = &pattern.rels[hop_index];
-
-        let candidate_edges: Vec<_> = match rel.direction {
-            RelDirection::Right => self
-                .graph
-                .edges_directed(current_node, petgraph::Direction::Outgoing)
-                .filter(|e| ReadQueryExecutor::edge_matches_rel(e, rel))
-                .map(|e| (e, e.target()))
-                .collect(),
-            RelDirection::Left => self
-                .graph
-                .edges_directed(current_node, petgraph::Direction::Incoming)
-                .filter(|e| ReadQueryExecutor::edge_matches_rel(e, rel))
-                .map(|e| (e, e.source()))
-                .collect(),
-            RelDirection::Both => {
-                let out = self
-                    .graph
-                    .edges_directed(current_node, petgraph::Direction::Outgoing)
-                    .filter(|e| ReadQueryExecutor::edge_matches_rel(e, rel))
-                    .map(|e| (e, e.target()));
-                let incoming = self
-                    .graph
-                    .edges_directed(current_node, petgraph::Direction::Incoming)
-                    .filter(|e| ReadQueryExecutor::edge_matches_rel(e, rel))
-                    .map(|e| (e, e.source()));
-                out.chain(incoming).collect()
-            }
-        };
-
-        for (edge_ref, actual_target) in candidate_edges {
-            if self.node_matches_pattern(actual_target, target_node) {
-                let mut new_bindings = bindings.clone();
-
-                if let Some(var) = &rel.variable {
-                    let edge_val = BoundValue::Edge(edge_ref.id());
-                    if let Some(existing) = new_bindings.get(var) {
-                        if existing != &edge_val {
-                            continue;
-                        }
-                    } else {
-                        new_bindings.insert(var.clone(), edge_val);
-                    }
-                }
-                if let Some(var) = &target_node.variable {
-                    let node_val = BoundValue::Node(actual_target);
-                    if let Some(existing) = new_bindings.get(var) {
-                        if existing != &node_val {
-                            continue;
-                        }
-                    } else {
-                        new_bindings.insert(var.clone(), node_val);
-                    }
-                }
-
-                self.match_path_hops(
-                    pattern,
-                    hop_index + 1,
-                    actual_target,
-                    &mut new_bindings,
-                    results,
-                );
-            }
-        }
-    }
-
-    fn find_matching_nodes(
-        &self,
-        pattern: &NodePattern,
-        base_bindings: &Bindings,
-    ) -> Vec<NodeIndex> {
-        if let Some(var) = &pattern.variable {
-            if let Some(&BoundValue::Node(idx)) = base_bindings.get(var) {
-                if self.node_matches_pattern(idx, pattern) {
-                    return vec![idx];
-                }
-                return vec![];
-            }
-        }
-
-        self.graph
-            .node_indices()
-            .filter(|&idx| self.node_matches_pattern(idx, pattern))
-            .collect()
-    }
-
-    fn node_matches_pattern(&self, node_idx: NodeIndex, pattern: &NodePattern) -> bool {
-        let node_data = &self.graph[node_idx];
-        if !pattern.labels.iter().all(|label| {
-            node_data
-                .labels
-                .iter()
-                .any(|node_label| node_label == label)
-        }) {
-            return false;
-        }
-        for (key, value) in &pattern.properties {
-            if node_data.properties.get(key) != Some(value) {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn evaluate_where(&self, expr: &WhereExpr, bindings: &Bindings) -> bool {
-        match expr {
-            WhereExpr::Eq(expression, value) => match expression {
-                Expression::Property(var, prop) => {
-                    if let Some(&bound) = bindings.get(var) {
-                        match bound {
-                            BoundValue::Node(idx) => {
-                                let node_data = &self.graph[idx];
-                                node_data
-                                    .properties
-                                    .get(prop)
-                                    .map(|v| v == value)
-                                    .unwrap_or(false)
-                            }
-                            BoundValue::Edge(idx) => {
-                                let edge_data = &self.graph[idx];
-                                edge_data
-                                    .properties
-                                    .get(prop)
-                                    .map(|v| v == value)
-                                    .unwrap_or(false)
-                            }
-                        }
-                    } else {
-                        false
-                    }
-                }
-                Expression::Variable(_) => false,
-                Expression::All => false,
-            },
-            WhereExpr::And(left, right) => {
-                self.evaluate_where(left, bindings) && self.evaluate_where(right, bindings)
-            }
-            WhereExpr::Or(left, right) => {
-                self.evaluate_where(left, bindings) || self.evaluate_where(right, bindings)
-            }
-        }
     }
 
     fn execute_delete(
@@ -907,8 +721,7 @@ impl<'a> MutQueryExecutor<'a> {
                 .collect();
 
             if bound_values.is_empty() {
-                // No matching rows — DELETE is a no-op per Cypher semantics
-                return Ok(());
+                continue;
             }
 
             let (nodes, edges): (Vec<_>, Vec<_>) = bound_values
@@ -954,11 +767,15 @@ impl<'a> MutQueryExecutor<'a> {
         Ok(())
     }
 
-    fn apply_path_pattern_mut(&mut self, var_map: &mut Bindings, pattern: &PathPattern) {
-        let mut prev_idx = self.get_or_add_node_mut(var_map, &pattern.start);
+    fn apply_path_pattern_mut(
+        &mut self,
+        var_map: &mut Bindings,
+        pattern: &PathPattern,
+    ) -> Result<(), CypherError> {
+        let mut prev_idx = self.get_or_add_node_mut(var_map, &pattern.start)?;
 
         for (rel, target_node) in &pattern.rels {
-            let target_idx = self.get_or_add_node_mut(var_map, target_node);
+            let target_idx = self.get_or_add_node_mut(var_map, target_node)?;
 
             let edge_data = EdgeData {
                 variable: rel.variable.clone(),
@@ -973,17 +790,40 @@ impl<'a> MutQueryExecutor<'a> {
             };
 
             if let Some(var) = &rel.variable {
-                var_map.insert(var.clone(), BoundValue::Edge(edge_id));
+                let edge_val = BoundValue::Edge(edge_id);
+                if let Some(existing) = var_map.get(var) {
+                    if existing != &edge_val {
+                        return Err(CypherError::InvalidQuery(format!(
+                            "Variable '{}' is already bound to a different value",
+                            var
+                        )));
+                    }
+                } else {
+                    var_map.insert(var.clone(), edge_val);
+                }
             }
 
             prev_idx = target_idx;
         }
+        Ok(())
     }
 
-    fn get_or_add_node_mut(&mut self, var_map: &mut Bindings, pattern: &NodePattern) -> NodeIndex {
+    fn get_or_add_node_mut(
+        &mut self,
+        var_map: &mut Bindings,
+        pattern: &NodePattern,
+    ) -> Result<NodeIndex, CypherError> {
         if let Some(var) = &pattern.variable {
-            if let Some(&BoundValue::Node(idx)) = var_map.get(var) {
-                return idx;
+            if let Some(&existing) = var_map.get(var) {
+                match existing {
+                    BoundValue::Node(idx) => return Ok(idx),
+                    BoundValue::Edge(_) => {
+                        return Err(CypherError::InvalidQuery(format!(
+                            "Variable '{}' is bound to an edge, cannot use as node",
+                            var
+                        )));
+                    }
+                }
             }
         }
 
@@ -999,6 +839,6 @@ impl<'a> MutQueryExecutor<'a> {
             var_map.insert(var.clone(), BoundValue::Node(idx));
         }
 
-        idx
+        Ok(idx)
     }
 }
