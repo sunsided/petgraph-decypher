@@ -66,13 +66,12 @@ fn build_graph_left_directed_edge_direction() {
     let g = build_graph_from_cypher("CREATE (a)<-[:LIKES]-(b)").unwrap();
     assert_eq!(g.edge_count(), 1);
     let e = g.edge_indices().next().unwrap();
-    // The HIR currently lowers this pattern as an undirected relationship,
-    // which is materialized from source to target order.
+    // `(a)<-[:LIKES]-(b)` means the edge runs b → a, so b is the source.
     let (src, tgt) = g.edge_endpoints(e).unwrap();
     let src_data = &g[src];
     let tgt_data = &g[tgt];
-    assert_eq!(src_data.variable.as_deref(), Some("a"));
-    assert_eq!(tgt_data.variable.as_deref(), Some("b"));
+    assert_eq!(src_data.variable.as_deref(), Some("b"));
+    assert_eq!(tgt_data.variable.as_deref(), Some("a"));
 }
 
 #[test]

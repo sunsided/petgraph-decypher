@@ -280,14 +280,6 @@ impl<'a> PlanningContext<'a> {
         };
 
         let direction = match relationship.direction {
-            // NOTE: The `cypher` crate (v0.2.0-alpha.2) lowers the left-directed
-            // syntax `(a)<-[:T]-(b)` as `Undirected` rather than `RightToLeft`
-            // due to a known upstream limitation in its HIR lowering pass.
-            // Until the upstream crate preserves direction for this syntax,
-            // `Undirected` is mapped to `Both` (match in either direction), which
-            // is the safest available approximation. Queries that rely on
-            // left-directed edges being strictly reversed should use the
-            // right-directed form `(b)-[:T]->(a)` instead.
             RelationshipDirection::Undirected => RelDirection::Both,
             RelationshipDirection::Both => {
                 return Err(CypherError::Unsupported(

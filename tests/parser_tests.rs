@@ -46,7 +46,7 @@ fn parse_create_left_directed_relationship() {
     };
     let (rel, _) = &patterns[0].rels[0];
     assert_eq!(rel.rel_type.as_deref(), Some("LIKES"));
-    assert_eq!(rel.direction, RelDirection::Both);
+    assert_eq!(rel.direction, RelDirection::Left);
 }
 
 #[test]
