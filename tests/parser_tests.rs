@@ -1,7 +1,7 @@
 //! Integration tests for the Cypher parser.
 
 use petgraph_cypher::{
-    ast::Clause, parse_cypher, CypherError, CypherValue, Expression, RelDirection, WhereExpr,
+    CypherError, CypherValue, Expression, RelDirection, WhereExpr, ast::Clause, parse_cypher,
 };
 
 #[test]
@@ -33,7 +33,7 @@ fn parse_create_two_nodes_relationship() {
     assert_eq!(path.start.variable.as_deref(), Some("a"));
     assert_eq!(path.rels.len(), 1);
     let (rel, target) = &path.rels[0];
-    assert_eq!(rel.rel_type.as_deref(), Some("KNOWS"));
+    assert_eq!(rel.rel_types.first().map(|s| s.as_str()), Some("KNOWS"));
     assert_eq!(rel.direction, RelDirection::Right);
     assert_eq!(target.variable.as_deref(), Some("b"));
 }
@@ -45,7 +45,7 @@ fn parse_create_left_directed_relationship() {
         panic!("expected Create clause");
     };
     let (rel, _) = &patterns[0].rels[0];
-    assert_eq!(rel.rel_type.as_deref(), Some("LIKES"));
+    assert_eq!(rel.rel_types.first().map(|s| s.as_str()), Some("LIKES"));
     assert_eq!(rel.direction, RelDirection::Left);
 }
 
@@ -106,7 +106,7 @@ fn parse_match_clause() {
     assert!(where_clause.is_none());
     assert_eq!(patterns[0].start.labels, vec!["Person"]);
     let (rel, target) = &patterns[0].rels[0];
-    assert_eq!(rel.rel_type.as_deref(), Some("KNOWS"));
+    assert_eq!(rel.rel_types.first().map(|s| s.as_str()), Some("KNOWS"));
     assert_eq!(target.variable.as_deref(), Some("m"));
 }
 
@@ -134,7 +134,7 @@ fn parse_merge_clause() {
 #[test]
 fn parse_return_clause() {
     let q = parse_cypher("MATCH (n) RETURN n, n.name AS name, *").unwrap();
-    let Clause::Return { items } = &q.clauses[1] else {
+    let Clause::Return { items, .. } = &q.clauses[1] else {
         panic!("expected Return clause");
     };
     assert_eq!(items.len(), 3);
@@ -199,7 +199,7 @@ fn parse_simple_arrow_relationship() {
     };
     let (rel, _) = &patterns[0].rels[0];
     assert_eq!(rel.direction, RelDirection::Right);
-    assert!(rel.rel_type.is_none());
+    assert!(rel.rel_types.is_empty());
 }
 
 #[test]

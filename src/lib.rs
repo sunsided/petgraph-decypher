@@ -41,8 +41,8 @@ mod parser;
 pub mod query;
 
 pub use ast::{
-    Clause, CypherQuery, CypherValue, Expression, NodePattern, PathPattern, RelDirection,
-    RelPattern, ReturnItem, WhereExpr,
+    AggregationKind, Clause, CypherQuery, CypherValue, Expression, NodePattern, OrderByItem,
+    OrderDirection, PathPattern, RelDirection, RelPattern, ReturnItem, VariableLength, WhereExpr,
 };
 pub use error::CypherError;
 pub use query::{MatchStrategy, PetgraphCypher, QueryResult, ResultValue, Row};

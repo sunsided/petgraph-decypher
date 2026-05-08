@@ -1,6 +1,6 @@
 //! Integration tests for the graph builder.
 
-use petgraph_cypher::{build_graph_from_cypher, CypherValue, NodeData};
+use petgraph_cypher::{CypherValue, NodeData, build_graph_from_cypher};
 
 #[test]
 fn build_graph_single_node() {

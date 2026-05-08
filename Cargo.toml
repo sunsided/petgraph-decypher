@@ -1,9 +1,10 @@
 [package]
 name = "petgraph-cypher"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+authors = ["Markus Mayer <widemeadows@gmail.com>"]
 description = "Build petgraph graphs from OpenCypher queries"
-license = "MIT OR Apache-2.0"
+license = "EUPL-1.2 OR MIT OR Apache-2.0"
 repository = "https://github.com/sunsided/petgraph-cypher"
 readme = "README.md"
 keywords = ["petgraph", "cypher", "opencypher", "graph"]

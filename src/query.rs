@@ -1,11 +1,12 @@
 //! Query execution engine for running Cypher queries against a petgraph.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use itertools::Itertools;
+use petgraph::Graph;
 use petgraph::graph::{EdgeIndex, EdgeReference, NodeIndex};
 use petgraph::visit::EdgeRef;
-use petgraph::Graph;
 
 use crate::ast::*;
 use crate::error::CypherError;
@@ -55,29 +56,17 @@ enum BoundValue {
 /// A set of variable bindings from pattern matching.
 type Bindings = HashMap<String, BoundValue>;
 
-/// An iterator over query result rows.
-///
-/// The MATCH phase is executed eagerly to collect all bindings.
-/// The RETURN phase is executed lazily, projecting one row at a time.
-pub struct QueryResult<'a> {
+/// Query result rows, pre-computed eagerly.
+pub struct QueryResult {
     columns: Vec<String>,
-    bindings: std::vec::IntoIter<Bindings>,
-    graph: &'a Graph<NodeData, EdgeData>,
-    items: Vec<ReturnItem>,
+    rows: std::vec::IntoIter<Row>,
 }
 
-impl<'a> QueryResult<'a> {
-    fn new(
-        columns: Vec<String>,
-        bindings: Vec<Bindings>,
-        graph: &'a Graph<NodeData, EdgeData>,
-        items: Vec<ReturnItem>,
-    ) -> Self {
+impl QueryResult {
+    fn new(columns: Vec<String>, rows: Vec<Row>) -> Self {
         Self {
             columns,
-            bindings: bindings.into_iter(),
-            graph,
-            items,
+            rows: rows.into_iter(),
         }
     }
 
@@ -85,115 +74,88 @@ impl<'a> QueryResult<'a> {
         &self.columns
     }
 
-    fn project_row(&self, bindings: &Bindings) -> Row {
-        let mut values = HashMap::new();
-
-        for item in &self.items {
-            let key = if let Some(ref alias) = item.alias {
-                alias.clone()
-            } else {
-                match &item.expression {
-                    Expression::Variable(v) => v.clone(),
-                    Expression::Property(v, p) => format!("{v}.{p}"),
-                    Expression::All => "*".to_string(),
+    fn expression_display_name(expr: &Expression) -> String {
+        match expr {
+            Expression::Variable(v) => v.clone(),
+            Expression::Property(v, p) => format!("{v}.{p}"),
+            Expression::NestedProperty {
+                variable,
+                properties,
+            } => {
+                let mut name = variable.clone();
+                for p in properties {
+                    name.push('.');
+                    name.push_str(p);
                 }
-            };
-
-            if matches!(item.expression, Expression::All) {
-                for (var, bound) in bindings {
-                    match bound {
-                        BoundValue::Node(idx) => {
-                            let data = &self.graph[*idx];
-                            values.insert(
-                                var.clone(),
-                                ResultValue::Node {
-                                    labels: data.labels.clone(),
-                                    properties: data.properties.clone(),
-                                },
-                            );
-                        }
-                        BoundValue::Edge(idx) => {
-                            let data = &self.graph[*idx];
-                            values.insert(
-                                var.clone(),
-                                ResultValue::Edge {
-                                    rel_type: data.rel_type.clone(),
-                                    properties: data.properties.clone(),
-                                },
-                            );
-                        }
-                    }
-                }
-                continue;
+                name
             }
-
-            let result_value = match &item.expression {
-                Expression::Variable(var) => {
-                    if let Some(&bound) = bindings.get(var) {
-                        match bound {
-                            BoundValue::Node(idx) => {
-                                let data = &self.graph[idx];
-                                ResultValue::Node {
-                                    labels: data.labels.clone(),
-                                    properties: data.properties.clone(),
-                                }
-                            }
-                            BoundValue::Edge(idx) => {
-                                let data = &self.graph[idx];
-                                ResultValue::Edge {
-                                    rel_type: data.rel_type.clone(),
-                                    properties: data.properties.clone(),
-                                }
-                            }
-                        }
-                    } else {
-                        ResultValue::Scalar(CypherValue::Null)
-                    }
-                }
-                Expression::Property(var, prop) => {
-                    if let Some(&bound) = bindings.get(var) {
-                        match bound {
-                            BoundValue::Node(idx) => {
-                                let data = &self.graph[idx];
-                                data.properties
-                                    .get(prop)
-                                    .cloned()
-                                    .map(ResultValue::Scalar)
-                                    .unwrap_or(ResultValue::Scalar(CypherValue::Null))
-                            }
-                            BoundValue::Edge(idx) => {
-                                let data = &self.graph[idx];
-                                data.properties
-                                    .get(prop)
-                                    .cloned()
-                                    .map(ResultValue::Scalar)
-                                    .unwrap_or(ResultValue::Scalar(CypherValue::Null))
-                            }
-                        }
-                    } else {
-                        ResultValue::Scalar(CypherValue::Null)
-                    }
-                }
-                Expression::All => unreachable!(),
-            };
-
-            values.insert(key, result_value);
+            Expression::All => "*".to_string(),
+            Expression::Literal(_) => "literal".to_string(),
+            Expression::Add(a, b)
+            | Expression::Sub(a, b)
+            | Expression::Mul(a, b)
+            | Expression::Div(a, b)
+            | Expression::Mod(a, b) => {
+                format!(
+                    "{} ? {}",
+                    Self::expression_display_name(a),
+                    Self::expression_display_name(b)
+                )
+            }
+            Expression::List(_) => "[...]".to_string(),
+            Expression::Map(_) => "{...}".to_string(),
+            Expression::FunctionCall { name, .. } => format!("{name}()"),
+            Expression::Parameter(p) => format!("${p}"),
+            Expression::Case { .. } => "CASE".to_string(),
+            Expression::Aggregation { kind, .. } => {
+                let kind_name = match kind {
+                    AggregationKind::Count => "count",
+                    AggregationKind::Sum => "sum",
+                    AggregationKind::Avg => "avg",
+                    AggregationKind::Min => "min",
+                    AggregationKind::Max => "max",
+                    AggregationKind::Collect => "collect",
+                };
+                format!("{kind_name}()")
+            }
+            Expression::Gt(a, b) => format!(
+                "{} > {}",
+                Self::expression_display_name(a),
+                Self::expression_display_name(b)
+            ),
+            Expression::Lt(a, b) => format!(
+                "{} < {}",
+                Self::expression_display_name(a),
+                Self::expression_display_name(b)
+            ),
+            Expression::Gte(a, b) => format!(
+                "{} >= {}",
+                Self::expression_display_name(a),
+                Self::expression_display_name(b)
+            ),
+            Expression::Lte(a, b) => format!(
+                "{} <= {}",
+                Self::expression_display_name(a),
+                Self::expression_display_name(b)
+            ),
+            Expression::Neq(a, b) => format!(
+                "{} <> {}",
+                Self::expression_display_name(a),
+                Self::expression_display_name(b)
+            ),
         }
-
-        Row { values }
     }
 }
 
-impl<'a> Iterator for QueryResult<'a> {
+impl Iterator for QueryResult {
     type Item = Row;
 
     fn next(&mut self) -> Option<Row> {
-        let bindings = self.bindings.next()?;
-        Some(self.project_row(&bindings))
+        self.rows.next()
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.bindings.size_hint()
+        self.rows.size_hint()
     }
 }
 
@@ -205,7 +167,7 @@ pub trait PetgraphCypher {
     /// Returns an error if mutation clauses (`CREATE`, `MERGE`, `DELETE`) are present.
     ///
     /// Uses the default `Backtrack` match strategy.
-    fn cypher(&self, query: &str) -> Result<QueryResult<'_>, CypherError>;
+    fn cypher(&self, query: &str) -> Result<QueryResult, CypherError>;
 
     /// Execute a mutating Cypher query.
     ///
@@ -218,29 +180,7 @@ pub trait PetgraphCypher {
         &self,
         query: &str,
         strategy: MatchStrategy,
-    ) -> Result<QueryResult<'_>, CypherError>;
-}
-
-impl PetgraphCypher for Graph<NodeData, EdgeData> {
-    fn cypher(&self, query: &str) -> Result<QueryResult<'_>, CypherError> {
-        self.cypher_with_strategy(query, MatchStrategy::default())
-    }
-
-    fn cypher_mut(&mut self, query: &str) -> Result<(), CypherError> {
-        let ast = crate::parse_cypher(query)?;
-        validate_mutation_query(&ast)?;
-        MutQueryExecutor::new(self).execute(ast)
-    }
-
-    fn cypher_with_strategy(
-        &self,
-        query: &str,
-        strategy: MatchStrategy,
-    ) -> Result<QueryResult<'_>, CypherError> {
-        let ast = crate::parse_cypher(query)?;
-        validate_read_query(&ast)?;
-        ReadQueryExecutor::new(self, strategy).execute(ast)
-    }
+    ) -> Result<QueryResult, CypherError>;
 }
 
 /// Validate that a query only contains read clauses.
@@ -262,6 +202,18 @@ fn validate_read_query(query: &CypherQuery) -> Result<(), CypherError> {
                     "DELETE not allowed in cypher(); use cypher_mut()".into(),
                 ));
             }
+            Clause::SetProperty { .. }
+            | Clause::SetMerge { .. }
+            | Clause::SetAddLabels { .. } => {
+                return Err(CypherError::Unsupported(
+                    "SET not allowed in cypher(); use cypher_mut()".into(),
+                ));
+            }
+            Clause::RemoveProperty { .. } | Clause::RemoveLabels { .. } => {
+                return Err(CypherError::Unsupported(
+                    "REMOVE not allowed in cypher(); use cypher_mut()".into(),
+                ));
+            }
             _ => {}
         }
     }
@@ -280,7 +232,27 @@ fn validate_mutation_query(query: &CypherQuery) -> Result<(), CypherError> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
+impl PetgraphCypher for Graph<NodeData, EdgeData> {
+    fn cypher(&self, query: &str) -> Result<QueryResult, CypherError> {
+        self.cypher_with_strategy(query, MatchStrategy::default())
+    }
+
+    fn cypher_mut(&mut self, query: &str) -> Result<(), CypherError> {
+        let ast = crate::parse_cypher(query)?;
+        validate_mutation_query(&ast)?;
+        MutQueryExecutor::new(self).execute(ast)
+    }
+
+    fn cypher_with_strategy(
+        &self,
+        query: &str,
+        strategy: MatchStrategy,
+    ) -> Result<QueryResult, CypherError> {
+        let ast = crate::parse_cypher(query)?;
+        validate_read_query(&ast)?;
+        ReadQueryExecutor::new(self, strategy).execute(ast)
+    }
+}
 // Shared pattern matcher
 // ---------------------------------------------------------------------------
 
@@ -368,6 +340,30 @@ impl<'a> PatternMatcher<'a> {
 
         let (rel, target_node) = &pattern.rels[hop_index];
 
+        if let Some(vl) = &rel.variable_length {
+            let min_hops = vl.min.unwrap_or(0);
+            let max_hops = vl.max.unwrap_or(u64::MAX);
+            self.match_variable_length(
+                pattern, hop_index, current_node, bindings, results,
+                rel, target_node, min_hops, max_hops, 0,
+            );
+        } else {
+            self.match_fixed_hop(
+                pattern, hop_index, current_node, bindings, results, rel, target_node,
+            );
+        }
+    }
+
+    fn match_fixed_hop(
+        &self,
+        pattern: &PathPattern,
+        hop_index: usize,
+        current_node: NodeIndex,
+        bindings: &mut Bindings,
+        results: &mut Vec<Bindings>,
+        rel: &RelPattern,
+        target_node: &NodePattern,
+    ) {
         let candidate_edges: Vec<_> = match rel.direction {
             RelDirection::Right => self
                 .graph
@@ -399,13 +395,10 @@ impl<'a> PatternMatcher<'a> {
         for (edge_ref, actual_target) in candidate_edges {
             if self.node_matches_pattern(actual_target, target_node) {
                 let mut new_bindings = bindings.clone();
-
                 if let Some(var) = &rel.variable {
                     let edge_val = BoundValue::Edge(edge_ref.id());
                     if let Some(existing) = new_bindings.get(var) {
-                        if existing != &edge_val {
-                            continue;
-                        }
+                        if existing != &edge_val { continue; }
                     } else {
                         new_bindings.insert(var.clone(), edge_val);
                     }
@@ -413,22 +406,148 @@ impl<'a> PatternMatcher<'a> {
                 if let Some(var) = &target_node.variable {
                     let node_val = BoundValue::Node(actual_target);
                     if let Some(existing) = new_bindings.get(var) {
-                        if existing != &node_val {
-                            continue;
-                        }
+                        if existing != &node_val { continue; }
                     } else {
                         new_bindings.insert(var.clone(), node_val);
                     }
                 }
-
                 self.match_path_hops(
-                    pattern,
-                    hop_index + 1,
-                    actual_target,
-                    &mut new_bindings,
-                    results,
+                    pattern, hop_index + 1, actual_target, &mut new_bindings, results,
                 );
             }
+        }
+    }
+
+    fn match_variable_length(
+        &self,
+        pattern: &PathPattern,
+        hop_index: usize,
+        current_node: NodeIndex,
+        bindings: &Bindings,
+        results: &mut Vec<Bindings>,
+        rel: &RelPattern,
+        target_node: &NodePattern,
+        min_hops: u64,
+        max_hops: u64,
+        depth: u64,
+    ) {
+        // Guard: prevent infinite traversal
+        if depth > 1000 {
+            return;
+        }
+
+        // Check if current node matches target and we're within the range
+        if depth >= min_hops && self.node_matches_pattern(current_node, target_node) {
+            let mut new_bindings = bindings.clone();
+            if let Some(var) = &target_node.variable {
+                let node_val = BoundValue::Node(current_node);
+                if let Some(existing) = new_bindings.get(var) {
+                    if existing != &node_val {
+                        // Binding conflict — skip this path
+                    } else {
+                        new_bindings.insert(var.clone(), node_val);
+                        self.match_path_hops(
+                            pattern, hop_index + 1, current_node, &mut new_bindings, results,
+                        );
+                    }
+                } else {
+                    new_bindings.insert(var.clone(), node_val);
+                    self.match_path_hops(
+                        pattern, hop_index + 1, current_node, &mut new_bindings, results,
+                    );
+                }
+            } else {
+                self.match_path_hops(
+                    pattern, hop_index + 1, current_node, &mut new_bindings, results,
+                );
+            }
+        }
+
+        // Continue traversing if we haven't hit max
+        if depth < max_hops {
+            let mut visited = std::collections::HashSet::new();
+            visited.insert(current_node);
+            self.traverse_variable_length(
+                pattern, hop_index, current_node, bindings, results,
+                rel, target_node, min_hops, max_hops, depth, &mut visited,
+            );
+        }
+    }
+
+    fn traverse_variable_length(
+        &self,
+        pattern: &PathPattern,
+        hop_index: usize,
+        current_node: NodeIndex,
+        bindings: &Bindings,
+        results: &mut Vec<Bindings>,
+        rel: &RelPattern,
+        target_node: &NodePattern,
+        min_hops: u64,
+        max_hops: u64,
+        depth: u64,
+        visited: &mut std::collections::HashSet<NodeIndex>,
+    ) {
+        let edges: Vec<_> = match rel.direction {
+            RelDirection::Right => self
+                .graph
+                .edges_directed(current_node, petgraph::Direction::Outgoing)
+                .filter(|e| Self::edge_matches_rel(e, rel))
+                .map(|e| (e, e.target()))
+                .collect(),
+            RelDirection::Left => self
+                .graph
+                .edges_directed(current_node, petgraph::Direction::Incoming)
+                .filter(|e| Self::edge_matches_rel(e, rel))
+                .map(|e| (e, e.source()))
+                .collect(),
+            RelDirection::Both => {
+                let out = self
+                    .graph
+                    .edges_directed(current_node, petgraph::Direction::Outgoing)
+                    .filter(|e| Self::edge_matches_rel(e, rel))
+                    .map(|e| (e, e.target()));
+                let incoming = self
+                    .graph
+                    .edges_directed(current_node, petgraph::Direction::Incoming)
+                    .filter(|e| Self::edge_matches_rel(e, rel))
+                    .map(|e| (e, e.source()));
+                out.chain(incoming).collect()
+            }
+        };
+
+        for (_edge_ref, next_node) in edges {
+            if visited.contains(&next_node) {
+                continue;
+            }
+            let new_depth = depth + 1;
+            visited.insert(next_node);
+
+            // If this node matches target and we're in range, produce a result
+            if new_depth >= min_hops && self.node_matches_pattern(next_node, target_node) {
+                let mut new_bindings = bindings.clone();
+                if let Some(var) = &target_node.variable {
+                    let node_val = BoundValue::Node(next_node);
+                    if let Some(existing) = new_bindings.get(var) {
+                        if existing != &node_val {
+                            visited.remove(&next_node);
+                            continue;
+                        }
+                    }
+                    new_bindings.insert(var.clone(), node_val);
+                }
+                self.match_path_hops(
+                    pattern, hop_index + 1, next_node, &mut new_bindings, results,
+                );
+            }
+
+            if new_depth < max_hops {
+                self.traverse_variable_length(
+                    pattern, hop_index, next_node, bindings, results,
+                    rel, target_node, min_hops, max_hops, new_depth, visited,
+                );
+            }
+            visited.remove(&next_node);
         }
     }
 
@@ -476,8 +595,12 @@ impl<'a> PatternMatcher<'a> {
 
     fn edge_matches_rel(edge_ref: &EdgeReference<'_, EdgeData>, rel: &RelPattern) -> bool {
         let edge_data = edge_ref.weight();
-        if let Some(ref rel_type) = rel.rel_type {
-            if edge_data.rel_type.as_ref() != Some(rel_type) {
+        if !rel.rel_types.is_empty() {
+            if let Some(ref edge_type) = edge_data.rel_type {
+                if !rel.rel_types.iter().any(|t| t == edge_type) {
+                    return false;
+                }
+            } else {
                 return false;
             }
         }
@@ -491,40 +614,421 @@ impl<'a> PatternMatcher<'a> {
 
     fn evaluate_where(&self, expr: &WhereExpr, bindings: &Bindings) -> bool {
         match expr {
-            WhereExpr::Eq(expression, value) => match expression {
-                Expression::Property(var, prop) => {
-                    if let Some(&bound) = bindings.get(var) {
-                        match bound {
-                            BoundValue::Node(idx) => {
-                                let node_data = &self.graph[idx];
-                                node_data
-                                    .properties
-                                    .get(prop)
-                                    .map(|v| v == value)
-                                    .unwrap_or(false)
-                            }
-                            BoundValue::Edge(idx) => {
-                                let edge_data = &self.graph[idx];
-                                edge_data
-                                    .properties
-                                    .get(prop)
-                                    .map(|v| v == value)
-                                    .unwrap_or(false)
-                            }
-                        }
-                    } else {
-                        false
-                    }
+            WhereExpr::Eq(expression, value) => {
+                let actual = eval_expression_to_value(self.graph, expression, bindings);
+                actual.as_ref() == Some(value)
+            }
+            WhereExpr::Neq(expression, value) => {
+                let actual = eval_expression_to_value(self.graph, expression, bindings);
+                actual.as_ref() != Some(value)
+            }
+            WhereExpr::Lt(expression, value) => {
+                let actual = eval_expression_to_number(self.graph, expression, bindings);
+                let expected = cypher_value_to_number(value);
+                match (actual, expected) {
+                    (Some(a), Some(b)) => a < b,
+                    _ => false,
                 }
-                Expression::Variable(_) => false,
-                Expression::All => false,
-            },
+            }
+            WhereExpr::Gt(expression, value) => {
+                let actual = eval_expression_to_number(self.graph, expression, bindings);
+                let expected = cypher_value_to_number(value);
+                match (actual, expected) {
+                    (Some(a), Some(b)) => a > b,
+                    _ => false,
+                }
+            }
+            WhereExpr::Lte(expression, value) => {
+                let actual = eval_expression_to_number(self.graph, expression, bindings);
+                let expected = cypher_value_to_number(value);
+                match (actual, expected) {
+                    (Some(a), Some(b)) => a <= b,
+                    _ => false,
+                }
+            }
+            WhereExpr::Gte(expression, value) => {
+                let actual = eval_expression_to_number(self.graph, expression, bindings);
+                let expected = cypher_value_to_number(value);
+                match (actual, expected) {
+                    (Some(a), Some(b)) => a >= b,
+                    _ => false,
+                }
+            }
+            WhereExpr::In(_expression, _list_expr) => {
+                // List membership not yet fully supported as a WHERE filter
+                false
+            }
+            WhereExpr::IsNull(expression) => {
+                matches!(
+                    eval_expression_to_value(self.graph, expression, bindings),
+                    None | Some(CypherValue::Null)
+                )
+            }
+            WhereExpr::IsNotNull(expression) => !matches!(
+                eval_expression_to_value(self.graph, expression, bindings),
+                None | Some(CypherValue::Null)
+            ),
+            WhereExpr::StartsWith(left, right) => {
+                let a = eval_expression_to_string(self.graph, left, bindings);
+                let b = eval_expression_to_string(self.graph, right, bindings);
+                match (a, b) {
+                    (Some(a_str), Some(b_str)) => a_str.starts_with(&b_str),
+                    _ => false,
+                }
+            }
+            WhereExpr::EndsWith(left, right) => {
+                let a = eval_expression_to_string(self.graph, left, bindings);
+                let b = eval_expression_to_string(self.graph, right, bindings);
+                match (a, b) {
+                    (Some(a_str), Some(b_str)) => a_str.ends_with(&b_str),
+                    _ => false,
+                }
+            }
+            WhereExpr::Contains(left, right) => {
+                let a = eval_expression_to_string(self.graph, left, bindings);
+                let b = eval_expression_to_string(self.graph, right, bindings);
+                match (a, b) {
+                    (Some(a_str), Some(b_str)) => a_str.contains(&b_str),
+                    _ => false,
+                }
+            }
+            WhereExpr::Not(inner) => !self.evaluate_where(inner, bindings),
             WhereExpr::And(left, right) => {
                 self.evaluate_where(left, bindings) && self.evaluate_where(right, bindings)
             }
             WhereExpr::Or(left, right) => {
                 self.evaluate_where(left, bindings) || self.evaluate_where(right, bindings)
             }
+            WhereExpr::Expr(expr) => {
+                matches!(
+                    eval_expression_to_value(self.graph, expr, bindings),
+                    Some(CypherValue::Boolean(true))
+                )
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Eager result helpers (Phase 3)
+// ---------------------------------------------------------------------------
+
+fn project_row(
+    graph: &Graph<NodeData, EdgeData>,
+    bindings: &Bindings,
+    items: &[ReturnItem],
+) -> Row {
+    let mut values = HashMap::new();
+
+    for item in items {
+        let key = if let Some(ref alias) = item.alias {
+            alias.clone()
+        } else {
+            QueryResult::expression_display_name(&item.expression)
+        };
+
+        if matches!(item.expression, Expression::All) {
+            for (var, bound) in bindings {
+                match bound {
+                    BoundValue::Node(idx) => {
+                        let data = &graph[*idx];
+                        values.insert(
+                            var.clone(),
+                            ResultValue::Node {
+                                labels: data.labels.clone(),
+                                properties: data.properties.clone(),
+                            },
+                        );
+                    }
+                    BoundValue::Edge(idx) => {
+                        let data = &graph[*idx];
+                        values.insert(
+                            var.clone(),
+                            ResultValue::Edge {
+                                rel_type: data.rel_type.clone(),
+                                properties: data.properties.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+
+        let result_value = evaluate_expression_for_return(graph, &item.expression, bindings);
+        values.insert(key, result_value);
+    }
+
+    Row { values }
+}
+
+fn evaluate_expression_for_return(
+    graph: &Graph<NodeData, EdgeData>,
+    expr: &Expression,
+    bindings: &Bindings,
+) -> ResultValue {
+    match expr {
+        Expression::Variable(var) => {
+            if let Some(&bound) = bindings.get(var) {
+                match bound {
+                    BoundValue::Node(idx) => {
+                        let data = &graph[idx];
+                        ResultValue::Node {
+                            labels: data.labels.clone(),
+                            properties: data.properties.clone(),
+                        }
+                    }
+                    BoundValue::Edge(idx) => {
+                        let data = &graph[idx];
+                        ResultValue::Edge {
+                            rel_type: data.rel_type.clone(),
+                            properties: data.properties.clone(),
+                        }
+                    }
+                }
+            } else {
+                ResultValue::Scalar(CypherValue::Null)
+            }
+        }
+        Expression::Property(var, prop) => {
+            if let Some(&bound) = bindings.get(var) {
+                match bound {
+                    BoundValue::Node(idx) => graph[idx]
+                        .properties
+                        .get(prop)
+                        .cloned()
+                        .map(ResultValue::Scalar)
+                        .unwrap_or(ResultValue::Scalar(CypherValue::Null)),
+                    BoundValue::Edge(idx) => graph[idx]
+                        .properties
+                        .get(prop)
+                        .cloned()
+                        .map(ResultValue::Scalar)
+                        .unwrap_or(ResultValue::Scalar(CypherValue::Null)),
+                }
+            } else {
+                ResultValue::Scalar(CypherValue::Null)
+            }
+        }
+        Expression::NestedProperty { variable, properties } => {
+            if let Some(&bound) = bindings.get(variable) {
+                let props = match bound {
+                    BoundValue::Node(idx) => &graph[idx].properties,
+                    BoundValue::Edge(idx) => &graph[idx].properties,
+                };
+                if properties.is_empty() {
+                    ResultValue::Scalar(CypherValue::Null)
+                } else {
+                    props
+                        .get(&properties[0])
+                        .cloned()
+                        .map(ResultValue::Scalar)
+                        .unwrap_or(ResultValue::Scalar(CypherValue::Null))
+                }
+            } else {
+                ResultValue::Scalar(CypherValue::Null)
+            }
+        }
+        Expression::All => unreachable!(),
+        Expression::Literal(val) => ResultValue::Scalar(val.clone()),
+        Expression::Add(l, r) => eval_arithmetic_return(graph, l, r, |a, b| a + b, bindings),
+        Expression::Sub(l, r) => eval_arithmetic_return(graph, l, r, |a, b| a - b, bindings),
+        Expression::Mul(l, r) => eval_arithmetic_return(graph, l, r, |a, b| a * b, bindings),
+        Expression::Div(l, r) => eval_arithmetic_return(graph, l, r, |a, b| {
+            if b == 0.0 { f64::NAN } else { a / b }
+        }, bindings),
+        Expression::Mod(l, r) => eval_arithmetic_return(graph, l, r, |a, b| a % b, bindings),
+        Expression::List(_) => ResultValue::Scalar(CypherValue::Null),
+        Expression::Map(_) => ResultValue::Scalar(CypherValue::Null),
+        Expression::FunctionCall { .. } => ResultValue::Scalar(CypherValue::Null),
+        Expression::Parameter(_) => ResultValue::Scalar(CypherValue::Null),
+        Expression::Case { .. } => ResultValue::Scalar(CypherValue::Null),
+        Expression::Aggregation { .. } => ResultValue::Scalar(CypherValue::Null),
+        Expression::Gt(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings);
+            let b = eval_expression_to_number(graph, r, bindings);
+            match (a, b) {
+                (Some(a), Some(b)) => ResultValue::Scalar(CypherValue::Boolean(a > b)),
+                _ => ResultValue::Scalar(CypherValue::Null),
+            }
+        }
+        Expression::Lt(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings);
+            let b = eval_expression_to_number(graph, r, bindings);
+            match (a, b) {
+                (Some(a), Some(b)) => ResultValue::Scalar(CypherValue::Boolean(a < b)),
+                _ => ResultValue::Scalar(CypherValue::Null),
+            }
+        }
+        Expression::Gte(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings);
+            let b = eval_expression_to_number(graph, r, bindings);
+            match (a, b) {
+                (Some(a), Some(b)) => ResultValue::Scalar(CypherValue::Boolean(a >= b)),
+                _ => ResultValue::Scalar(CypherValue::Null),
+            }
+        }
+        Expression::Lte(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings);
+            let b = eval_expression_to_number(graph, r, bindings);
+            match (a, b) {
+                (Some(a), Some(b)) => ResultValue::Scalar(CypherValue::Boolean(a <= b)),
+                _ => ResultValue::Scalar(CypherValue::Null),
+            }
+        }
+        Expression::Neq(l, r) => {
+            let a = eval_expression_to_value(graph, l, bindings);
+            let b = eval_expression_to_value(graph, r, bindings);
+            ResultValue::Scalar(CypherValue::Boolean(a != b))
+        }
+    }
+}
+
+fn eval_arithmetic_return<F>(
+    graph: &Graph<NodeData, EdgeData>,
+    left: &Expression,
+    right: &Expression,
+    op: F,
+    bindings: &Bindings,
+) -> ResultValue
+where
+    F: Fn(f64, f64) -> f64,
+{
+    let l = eval_expression_to_number(graph, left, bindings);
+    let r = eval_expression_to_number(graph, right, bindings);
+    match (l, r) {
+        (Some(a), Some(b)) => {
+            let result = op(a, b);
+            if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
+                ResultValue::Scalar(CypherValue::Integer(result as i64))
+            } else {
+                ResultValue::Scalar(CypherValue::Float(result))
+            }
+        }
+        _ => ResultValue::Scalar(CypherValue::Null),
+    }
+}
+
+fn compute_columns(items: &[ReturnItem]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|item| {
+            if let Some(ref alias) = item.alias {
+                Some(alias.clone())
+            } else {
+                match &item.expression {
+                    Expression::Variable(v) => Some(v.clone()),
+                    Expression::Property(v, p) => Some(format!("{v}.{p}")),
+                    Expression::NestedProperty { variable, properties } => {
+                        let mut name = variable.clone();
+                        for p in properties {
+                            name.push('.');
+                            name.push_str(p);
+                        }
+                        Some(name)
+                    }
+                    Expression::All => None,
+                    Expression::Literal(_) => Some("literal".to_string()),
+                    Expression::Add(..)
+                    | Expression::Sub(..)
+                    | Expression::Mul(..)
+                    | Expression::Div(..)
+                    | Expression::Mod(..) => Some("expr".to_string()),
+                    Expression::List(_) => Some("list".to_string()),
+                    Expression::Map(_) => Some("map".to_string()),
+                    Expression::FunctionCall { name, .. } => Some(name.clone()),
+                    Expression::Parameter(p) => Some(p.clone()),
+                    Expression::Case { .. } => Some("case".to_string()),
+                    Expression::Aggregation { kind, .. } => {
+                        let kind_name = match kind {
+                            AggregationKind::Count => "count",
+                            AggregationKind::Sum => "sum",
+                            AggregationKind::Avg => "avg",
+                            AggregationKind::Min => "min",
+                            AggregationKind::Max => "max",
+                            AggregationKind::Collect => "collect",
+                        };
+                        Some(kind_name.to_string())
+                    }
+                    Expression::Gt(..)
+                    | Expression::Lt(..)
+                    | Expression::Gte(..)
+                    | Expression::Lte(..)
+                    | Expression::Neq(..) => Some("comparison".to_string()),
+                }
+            }
+        })
+        .collect()
+}
+
+fn deduplicate_rows(paired: Vec<(Bindings, Row)>) -> Vec<(Bindings, Row)> {
+    let mut result: Vec<(Bindings, Row)> = Vec::with_capacity(paired.len());
+    for (bindings, row) in paired {
+        let is_duplicate = result.iter().any(|(_, existing)| existing.values == row.values);
+        if !is_duplicate {
+            result.push((bindings, row));
+        }
+    }
+    result
+}
+
+fn compare_order_by(
+    order_by: &[OrderByItem],
+    b1: &Bindings,
+    b2: &Bindings,
+    graph: &Graph<NodeData, EdgeData>,
+) -> Ordering {
+    for item in order_by {
+        let v1 = eval_expression_to_value(graph, &item.expression, b1);
+        let v2 = eval_expression_to_value(graph, &item.expression, b2);
+        let cmp = compare_cypher_values(&v1, &v2);
+        if cmp != Ordering::Equal {
+            return match item.direction {
+                OrderDirection::Ascending => cmp,
+                OrderDirection::Descending => cmp.reverse(),
+            };
+        }
+    }
+    Ordering::Equal
+}
+
+fn compare_cypher_values(a: &Option<CypherValue>, b: &Option<CypherValue>) -> Ordering {
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(a), Some(b)) => compare_cypher_value_inner(a, b),
+    }
+}
+
+fn compare_cypher_value_inner(a: &CypherValue, b: &CypherValue) -> Ordering {
+    match (a, b) {
+        (CypherValue::Integer(a), CypherValue::Integer(b)) => a.cmp(b),
+        (CypherValue::Float(a), CypherValue::Float(b)) => {
+            a.partial_cmp(b).unwrap_or(Ordering::Equal)
+        }
+        (CypherValue::Integer(a), CypherValue::Float(b)) => {
+            (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal)
+        }
+        (CypherValue::Float(a), CypherValue::Integer(b)) => {
+            a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)
+        }
+        (CypherValue::String(a), CypherValue::String(b)) => a.cmp(b),
+        (CypherValue::Boolean(a), CypherValue::Boolean(b)) => a.cmp(b),
+        (CypherValue::Null, CypherValue::Null) => Ordering::Equal,
+        (CypherValue::Null, _) => Ordering::Less,
+        (_, CypherValue::Null) => Ordering::Greater,
+        _ => {
+            let type_order = |v: &CypherValue| -> u8 {
+                match v {
+                    CypherValue::Null => 0,
+                    CypherValue::Boolean(_) => 1,
+                    CypherValue::Integer(_) => 2,
+                    CypherValue::Float(_) => 3,
+                    CypherValue::String(_) => 4,
+                }
+            };
+            type_order(a).cmp(&type_order(b))
         }
     }
 }
@@ -544,9 +1048,9 @@ impl<'a> ReadQueryExecutor<'a> {
         }
     }
 
-    fn execute(self, query: CypherQuery) -> Result<QueryResult<'a>, CypherError> {
+    fn execute(self, query: CypherQuery) -> Result<QueryResult, CypherError> {
         let mut bindings: Vec<Bindings> = vec![HashMap::new()];
-        let mut return_items: Option<Vec<ReturnItem>> = None;
+        let mut return_items: Option<(Vec<ReturnItem>, bool)> = None;
 
         for clause in query.clauses {
             match clause {
@@ -559,45 +1063,62 @@ impl<'a> ReadQueryExecutor<'a> {
                         bindings.retain(|b| self.matcher.evaluate_where(&where_expr, b));
                     }
                 }
-                Clause::Return { items } => {
-                    return_items = Some(items);
+                Clause::Return { items, distinct } => {
+                    return_items = Some((items, distinct));
                 }
-                Clause::Create { .. } | Clause::Merge { .. } | Clause::Delete { .. } => {
+                Clause::Create { .. }
+                | Clause::Merge { .. }
+                | Clause::Delete { .. }
+                | Clause::SetProperty { .. }
+                | Clause::SetMerge { .. }
+                | Clause::SetAddLabels { .. }
+                | Clause::RemoveProperty { .. }
+                | Clause::RemoveLabels { .. } => {
                     unreachable!("validated by validate_read_query")
                 }
             }
         }
 
-        let columns: Vec<String>;
-        let items: Vec<ReturnItem>;
+        let (items, distinct) = return_items.unwrap_or_else(|| (vec![], false));
+        let columns = compute_columns(&items);
+        let graph = self.matcher.graph;
 
-        if let Some(ri) = return_items {
-            columns = ri
-                .iter()
-                .filter_map(|item| {
-                    if let Some(ref alias) = item.alias {
-                        Some(alias.clone())
-                    } else {
-                        match &item.expression {
-                            Expression::Variable(v) => Some(v.clone()),
-                            Expression::Property(v, p) => Some(format!("{v}.{p}")),
-                            Expression::All => None,
-                        }
-                    }
-                })
-                .collect();
-            items = ri;
-        } else {
-            columns = vec![];
-            items = vec![];
+        let mut paired: Vec<(Bindings, Row)> = bindings
+            .into_iter()
+            .map(|b| {
+                let row = project_row(graph, &b, &items);
+                (b, row)
+            })
+            .collect();
+
+        if distinct {
+            paired = deduplicate_rows(paired);
         }
 
-        Ok(QueryResult::new(
-            columns,
-            bindings,
-            self.matcher.graph,
-            items,
-        ))
+        if !query.order_by.is_empty() {
+            let ob = query.order_by;
+            paired.sort_by(|(b1, _), (b2, _)| {
+                compare_order_by(&ob, b1, b2, graph)
+            });
+        }
+
+        let start = query.skip.unwrap_or(0) as usize;
+        let remaining = if start < paired.len() {
+            &paired[start..]
+        } else {
+            &[]
+        };
+        let take_count = match query.limit {
+            Some(l) => remaining.len().min(l as usize),
+            None => remaining.len(),
+        };
+
+        let rows: Vec<Row> = remaining[..take_count]
+            .iter()
+            .map(|(_, row)| row.clone())
+            .collect();
+
+        Ok(QueryResult::new(columns, rows))
     }
 
     fn execute_match(
@@ -679,6 +1200,28 @@ impl<'a> MutQueryExecutor<'a> {
                 }
                 Clause::Delete { variables, detach } => {
                     self.execute_delete(&variables, detach, &bindings)?;
+                }
+                Clause::SetProperty {
+                    variable,
+                    property,
+                    value,
+                } => {
+                    self.execute_set_property(&variable, &property, &value, &bindings)?;
+                }
+                Clause::SetMerge {
+                    variable,
+                    properties,
+                } => {
+                    self.execute_set_merge(&variable, &properties, &bindings)?;
+                }
+                Clause::SetAddLabels { variable, labels } => {
+                    self.execute_set_labels(&variable, &labels, &bindings)?;
+                }
+                Clause::RemoveProperty { variable, property } => {
+                    self.execute_remove_property(&variable, &property, &bindings)?;
+                }
+                Clause::RemoveLabels { variable, labels } => {
+                    self.execute_remove_labels(&variable, &labels, &bindings)?;
                 }
                 Clause::Return { .. } => {
                     unreachable!("validated by validate_mutation_query")
@@ -779,7 +1322,7 @@ impl<'a> MutQueryExecutor<'a> {
 
             let edge_data = EdgeData {
                 variable: rel.variable.clone(),
-                rel_type: rel.rel_type.clone(),
+                rel_type: rel.rel_types.first().cloned(),
                 properties: rel.properties.clone(),
             };
 
@@ -840,5 +1383,391 @@ impl<'a> MutQueryExecutor<'a> {
         }
 
         Ok(idx)
+    }
+
+    fn execute_set_property(
+        &mut self,
+        variable: &str,
+        property: &str,
+        value: &CypherValue,
+        bindings: &[Bindings],
+    ) -> Result<(), CypherError> {
+        for bindings_row in bindings {
+            if let Some(&bound) = bindings_row.get(variable) {
+                match bound {
+                    BoundValue::Node(idx) => {
+                        let node_data = &mut self.graph[idx];
+                        node_data
+                            .properties
+                            .insert(property.to_string(), value.clone());
+                    }
+                    BoundValue::Edge(idx) => {
+                        let edge_data = &mut self.graph[idx];
+                        edge_data
+                            .properties
+                            .insert(property.to_string(), value.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_set_merge(
+        &mut self,
+        variable: &str,
+        properties: &HashMap<String, CypherValue>,
+        bindings: &[Bindings],
+    ) -> Result<(), CypherError> {
+        for bindings_row in bindings {
+            if let Some(&bound) = bindings_row.get(variable) {
+                match bound {
+                    BoundValue::Node(idx) => {
+                        let node_data = &mut self.graph[idx];
+                        for (k, v) in properties {
+                            node_data.properties.insert(k.clone(), v.clone());
+                        }
+                    }
+                    BoundValue::Edge(idx) => {
+                        let edge_data = &mut self.graph[idx];
+                        for (k, v) in properties {
+                            edge_data.properties.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_set_labels(
+        &mut self,
+        variable: &str,
+        labels: &[String],
+        bindings: &[Bindings],
+    ) -> Result<(), CypherError> {
+        for bindings_row in bindings {
+            if let Some(&bound) = bindings_row.get(variable) {
+                if let BoundValue::Node(idx) = bound {
+                    let node_data = &mut self.graph[idx];
+                    for label in labels {
+                        if !node_data.labels.contains(label) {
+                            node_data.labels.push(label.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_remove_property(
+        &mut self,
+        variable: &str,
+        property: &str,
+        bindings: &[Bindings],
+    ) -> Result<(), CypherError> {
+        for bindings_row in bindings {
+            if let Some(&bound) = bindings_row.get(variable) {
+                match bound {
+                    BoundValue::Node(idx) => {
+                        let node_data = &mut self.graph[idx];
+                        node_data.properties.remove(property);
+                    }
+                    BoundValue::Edge(idx) => {
+                        let edge_data = &mut self.graph[idx];
+                        edge_data.properties.remove(property);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_remove_labels(
+        &mut self,
+        variable: &str,
+        labels: &[String],
+        bindings: &[Bindings],
+    ) -> Result<(), CypherError> {
+        for bindings_row in bindings {
+            if let Some(&bound) = bindings_row.get(variable) {
+                if let BoundValue::Node(idx) = bound {
+                    let node_data = &mut self.graph[idx];
+                    node_data.labels.retain(|l| !labels.contains(l));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Standalone expression evaluation helpers
+// ---------------------------------------------------------------------------
+
+fn cypher_value_to_number(val: &CypherValue) -> Option<f64> {
+    match val {
+        CypherValue::Integer(i) => Some(*i as f64),
+        CypherValue::Float(f) => Some(*f),
+        _ => None,
+    }
+}
+
+fn resolve_bound_to_number(graph: &Graph<NodeData, EdgeData>, bound: &BoundValue) -> Option<f64> {
+    match bound {
+        BoundValue::Node(idx) => graph[*idx]
+            .properties
+            .values()
+            .next()
+            .and_then(cypher_value_to_number),
+        BoundValue::Edge(idx) => graph[*idx]
+            .properties
+            .values()
+            .next()
+            .and_then(cypher_value_to_number),
+    }
+}
+
+/// Extract a `CypherValue` from an `Expression` given the current bindings.
+fn eval_expression_to_value<'a>(
+    graph: &'a Graph<NodeData, EdgeData>,
+    expr: &Expression,
+    bindings: &Bindings,
+) -> Option<CypherValue> {
+    match expr {
+        Expression::Literal(v) => Some(v.clone()),
+        Expression::Property(var, prop) => bindings.get(var).and_then(|bound| match bound {
+            BoundValue::Node(idx) => graph[*idx].properties.get(prop).cloned(),
+            BoundValue::Edge(idx) => graph[*idx].properties.get(prop).cloned(),
+        }),
+        Expression::NestedProperty {
+            variable,
+            properties,
+        } => bindings.get(variable).and_then(|bound| {
+            let props = match bound {
+                BoundValue::Node(idx) => &graph[*idx].properties,
+                BoundValue::Edge(idx) => &graph[*idx].properties,
+            };
+            if properties.is_empty() {
+                None
+            } else {
+                props.get(&properties[0]).cloned()
+            }
+        }),
+        Expression::Variable(_) => None,
+        Expression::All => None,
+        Expression::Add(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            let result = a + b;
+            if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
+                Some(CypherValue::Integer(result as i64))
+            } else {
+                Some(CypherValue::Float(result))
+            }
+        }
+        Expression::Sub(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            let result = a - b;
+            if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
+                Some(CypherValue::Integer(result as i64))
+            } else {
+                Some(CypherValue::Float(result))
+            }
+        }
+        Expression::Mul(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            let result = a * b;
+            if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
+                Some(CypherValue::Integer(result as i64))
+            } else {
+                Some(CypherValue::Float(result))
+            }
+        }
+        Expression::Div(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            if b == 0.0 {
+                None
+            } else {
+                let result = a / b;
+                if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
+                    Some(CypherValue::Integer(result as i64))
+                } else {
+                    Some(CypherValue::Float(result))
+                }
+            }
+        }
+        Expression::Mod(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            let result = a % b;
+            if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
+                Some(CypherValue::Integer(result as i64))
+            } else {
+                Some(CypherValue::Float(result))
+            }
+        }
+        Expression::List(_) => None,
+        Expression::Map(_) => None,
+        Expression::FunctionCall { .. } => None,
+        Expression::Parameter(_) => None,
+        Expression::Case { .. } => None,
+        Expression::Aggregation { .. } => None,
+        Expression::Gt(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            Some(CypherValue::Boolean(a > b))
+        }
+        Expression::Lt(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            Some(CypherValue::Boolean(a < b))
+        }
+        Expression::Gte(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            Some(CypherValue::Boolean(a >= b))
+        }
+        Expression::Lte(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            Some(CypherValue::Boolean(a <= b))
+        }
+        Expression::Neq(l, r) => {
+            let a = eval_expression_to_value(graph, l, bindings);
+            let b = eval_expression_to_value(graph, r, bindings);
+            Some(CypherValue::Boolean(a != b))
+        }
+    }
+}
+
+fn eval_expression_to_number(
+    graph: &Graph<NodeData, EdgeData>,
+    expr: &Expression,
+    bindings: &Bindings,
+) -> Option<f64> {
+    match expr {
+        Expression::Literal(CypherValue::Integer(i)) => Some(*i as f64),
+        Expression::Literal(CypherValue::Float(f)) => Some(*f),
+        Expression::Literal(_) => None,
+        Expression::Add(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            Some(a + b)
+        }
+        Expression::Sub(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            Some(a - b)
+        }
+        Expression::Mul(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            Some(a * b)
+        }
+        Expression::Div(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            if b == 0.0 { None } else { Some(a / b) }
+        }
+        Expression::Mod(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            Some(a % b)
+        }
+        Expression::Property(var, prop) => bindings.get(var).and_then(|bound| match bound {
+            BoundValue::Node(idx) => graph[*idx]
+                .properties
+                .get(prop)
+                .and_then(cypher_value_to_number),
+            BoundValue::Edge(idx) => graph[*idx]
+                .properties
+                .get(prop)
+                .and_then(cypher_value_to_number),
+        }),
+        Expression::NestedProperty {
+            variable,
+            properties,
+        } => bindings.get(variable).and_then(|bound| {
+            let props = match bound {
+                BoundValue::Node(idx) => &graph[*idx].properties,
+                BoundValue::Edge(idx) => &graph[*idx].properties,
+            };
+            if properties.is_empty() {
+                None
+            } else {
+                props.get(&properties[0]).and_then(cypher_value_to_number)
+            }
+        }),
+        Expression::Variable(var) => bindings
+            .get(var)
+            .and_then(|bound| resolve_bound_to_number(graph, bound)),
+        Expression::All => None,
+        Expression::List(_) => None,
+        Expression::Map(_) => None,
+        Expression::FunctionCall { .. } => None,
+        Expression::Parameter(_) => None,
+        Expression::Case { .. } => None,
+        Expression::Aggregation { .. } => None,
+        Expression::Gt(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            if a > b { Some(1.0) } else { Some(0.0) }
+        }
+        Expression::Lt(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            if a < b { Some(1.0) } else { Some(0.0) }
+        }
+        Expression::Gte(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            if a >= b { Some(1.0) } else { Some(0.0) }
+        }
+        Expression::Lte(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            if a <= b { Some(1.0) } else { Some(0.0) }
+        }
+        Expression::Neq(l, r) => {
+            let a = eval_expression_to_number(graph, l, bindings)?;
+            let b = eval_expression_to_number(graph, r, bindings)?;
+            if a != b { Some(1.0) } else { Some(0.0) }
+        }
+    }
+}
+
+fn eval_expression_to_string(
+    graph: &Graph<NodeData, EdgeData>,
+    expr: &Expression,
+    bindings: &Bindings,
+) -> Option<String> {
+    match expr {
+        Expression::Literal(CypherValue::String(s)) => Some(s.clone()),
+        Expression::Property(var, prop) => bindings.get(var).and_then(|bound| match bound {
+            BoundValue::Node(idx) => graph[*idx].properties.get(prop).and_then(|v| match v {
+                CypherValue::String(s) => Some(s.clone()),
+                _ => None,
+            }),
+            BoundValue::Edge(idx) => graph[*idx].properties.get(prop).and_then(|v| match v {
+                CypherValue::String(s) => Some(s.clone()),
+                _ => None,
+            }),
+        }),
+        Expression::Variable(var) => bindings.get(var).and_then(|bound| match bound {
+            BoundValue::Node(idx) => graph[*idx].properties.get("name").and_then(|v| match v {
+                CypherValue::String(s) => Some(s.clone()),
+                _ => None,
+            }),
+            BoundValue::Edge(idx) => graph[*idx].properties.get("name").and_then(|v| match v {
+                CypherValue::String(s) => Some(s.clone()),
+                _ => None,
+            }),
+        }),
+        _ => None,
     }
 }

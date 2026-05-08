@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 
-use petgraph::graph::NodeIndex;
 use petgraph::Graph;
+use petgraph::graph::NodeIndex;
 
 use crate::ast::*;
 use crate::error::CypherError;
@@ -51,7 +51,7 @@ fn apply_path_pattern(
 
         let edge_data = EdgeData {
             variable: rel.variable.clone(),
-            rel_type: rel.rel_type.clone(),
+            rel_type: rel.rel_types.first().cloned(),
             properties: rel.properties.clone(),
         };
 
