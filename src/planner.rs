@@ -15,15 +15,20 @@ use crate::error::CypherError;
 
 pub(crate) fn plan_query(input: &str) -> Result<CypherQuery, CypherError> {
     // First, attempt a direct parse. If it succeeds, plan immediately.
-    if let Ok(hir) = analyze_query(input) {
-        return PlanningContext::new(&hir).plan();
-    }
+    let first_err = match analyze_query(input) {
+        Ok(hir) => return PlanningContext::new(&hir).plan(),
+        Err(e) => e,
+    };
 
     // If the direct parse failed, attempt a second pass with an appended
     // `RETURN *`. This robustly handles MATCH-only queries (and any other
     // single-part query that the `cypher` crate requires to end with RETURN)
     // without relying on fragile upstream error message strings.
-    let with_return = format!("{input} RETURN *");
+    //
+    // Strip any trailing semicolons and whitespace before appending so that
+    // `MATCH (n);` does not become `MATCH (n); RETURN *` (two statements).
+    let trimmed = input.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
+    let with_return = format!("{trimmed} RETURN *");
     match analyze_query(&with_return) {
         Ok(hir) => {
             let mut query = PlanningContext::new(&hir).plan()?;
@@ -33,9 +38,9 @@ pub(crate) fn plan_query(input: &str) -> Result<CypherQuery, CypherError> {
             }
             Ok(query)
         }
-        Err(err) => {
-            // Re-run the original query to surface its error to the caller.
-            Err(CypherError::ParseError(err.to_string()))
+        Err(_) => {
+            // Return the original error so the caller sees the correct query.
+            Err(CypherError::ParseError(first_err.to_string()))
         }
     }
 }
@@ -487,5 +492,14 @@ mod tests {
         };
         assert_eq!(patterns.len(), 1, "expected a single chained path pattern");
         assert_eq!(patterns[0].rels.len(), 2);
+    }
+
+    #[test]
+    fn plan_match_with_trailing_semicolon() {
+        // A MATCH query ending with `;` must not become `MATCH (n); RETURN *`
+        // (two statements). Trailing semicolons are stripped before the retry.
+        let q = plan_query("MATCH (n);").expect("MATCH with trailing semicolon should work");
+        assert_eq!(q.clauses.len(), 1);
+        assert!(matches!(q.clauses[0], Clause::Match { .. }));
     }
 }
