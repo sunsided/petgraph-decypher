@@ -64,19 +64,6 @@ pub struct RelPattern {
     pub direction: RelDirection,
 }
 
-impl RelPattern {
-    /// Construct an anonymous, untyped, property-less relationship with the
-    /// given direction.
-    pub(crate) fn simple(direction: RelDirection) -> Self {
-        RelPattern {
-            variable: None,
-            rel_type: None,
-            properties: HashMap::new(),
-            direction,
-        }
-    }
-}
-
 /// A path pattern: a start node followed by zero or more
 /// (relationship, node) pairs.
 ///

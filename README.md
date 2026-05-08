@@ -27,7 +27,7 @@ assert_eq!(graph.edge_count(), 1);
 | `CREATE (n:Label {k: v})-[:TYPE]->(m)` | ✅ materialised + executed |
 | `MERGE  (n:Label {k: v})-[:TYPE]->(m)` | ✅ materialised + executed |
 | `MATCH  (n)-[r]->(m) WHERE n.p = v`    | ✅ evaluated |
-| `RETURN n, n.prop AS alias, *`         | ✅ evaluated |
+| `RETURN n, n.prop AS alias` / `RETURN *` | ✅ evaluated |
 | `[DETACH] DELETE n`                    | ✅ executed |
 | Multiple clauses in one query          | ✅ |
 | Semicolon-separated statements         | ✅ |
@@ -38,7 +38,7 @@ assert_eq!(graph.edge_count(), 1);
 ## API
 
 ```rust
-// Parse only – returns the AST
+// Parse only – returns the HIR-backed query plan
 let query = petgraph_cypher::parse_cypher("CREATE (n:Person {name: \"Alice\"})")
     .unwrap();
 
@@ -68,6 +68,9 @@ pub struct NodeData {
 }
 ```
 
+`NodeData` implements `CypherNode`, and its property map is exposed through
+`CypherProperties::get`.
+
 ### Edge data
 
 Each petgraph edge carries an `EdgeData` value:
@@ -79,6 +82,9 @@ pub struct EdgeData {
     pub properties: HashMap<String, CypherValue>,
 }
 ```
+
+`EdgeData` implements `CypherEdge`, and exposes relationship properties through
+`CypherProperties::get`.
 
 ## License
 

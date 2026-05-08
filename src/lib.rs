@@ -4,7 +4,7 @@
 //!
 //! This crate provides two main entry points:
 //!
-//! * [`parse_cypher`] – parse a Cypher query string and return the AST.
+//! * [`parse_cypher`] – parse a Cypher query string into the internal query plan.
 //! * [`build_graph_from_cypher`] – parse a Cypher query and materialise all
 //!   `CREATE` / `MERGE` operations into a [`petgraph::Graph`].
 //!
@@ -15,7 +15,7 @@
 //! | `CREATE (n:Label {k: v})-[:TYPE]->(m)` | ✅ materialised + executed |
 //! | `MERGE  (n:Label {k: v})-[:TYPE]->(m)` | ✅ materialised + executed |
 //! | `MATCH  (n)-[r]->(m) WHERE n.p = v`    | ✅ evaluated |
-//! | `RETURN n, n.prop AS alias, *`         | ✅ evaluated |
+//! | `RETURN n, n.prop AS alias` / `RETURN *` | ✅ evaluated |
 //! | `[DETACH] DELETE n`                    | ✅ executed |
 //! | Multiple clauses in one query          | ✅ |
 //! | Semicolon-separated statements         | ✅ |
@@ -37,7 +37,7 @@
 pub mod ast;
 mod builder;
 pub mod error;
-mod parser;
+mod planner;
 pub mod query;
 
 pub use ast::{
@@ -61,6 +61,31 @@ pub struct NodeData {
     pub properties: HashMap<String, CypherValue>,
 }
 
+/// Common property access used by the query planner and executor.
+pub trait CypherProperties {
+    /// Get a property value by name.
+    fn get(&self, name: &str) -> Option<&CypherValue>;
+
+    /// Return all properties as a cloned map for query results.
+    fn properties(&self) -> HashMap<String, CypherValue>;
+}
+
+/// Metadata required from node weights during Cypher planning and execution.
+pub trait CypherNode: CypherProperties {
+    /// Returns whether this node has the requested label.
+    fn has_label(&self, label: &str) -> bool;
+
+    /// Return all node labels.
+    fn labels(&self) -> Vec<String>;
+
+    /// Construct a node value from a Cypher pattern.
+    fn from_cypher(
+        variable: Option<String>,
+        labels: Vec<String>,
+        properties: HashMap<String, CypherValue>,
+    ) -> Self;
+}
+
 /// Data stored at each edge in the graph built by [`build_graph_from_cypher`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct EdgeData {
@@ -72,7 +97,87 @@ pub struct EdgeData {
     pub properties: HashMap<String, CypherValue>,
 }
 
-/// Parse a Cypher query string and return its AST representation.
+/// Metadata required from edge weights during Cypher planning and execution.
+pub trait CypherEdge: CypherProperties {
+    /// Returns whether this edge matches the requested relationship type.
+    fn has_rel_type(&self, rel_type: &str) -> bool;
+
+    /// Return the relationship type, if any.
+    fn rel_type(&self) -> Option<&str>;
+
+    /// Construct an edge value from a Cypher pattern.
+    fn from_cypher(
+        variable: Option<String>,
+        rel_type: Option<String>,
+        properties: HashMap<String, CypherValue>,
+    ) -> Self;
+}
+
+impl CypherProperties for NodeData {
+    fn get(&self, name: &str) -> Option<&CypherValue> {
+        self.properties.get(name)
+    }
+
+    fn properties(&self) -> HashMap<String, CypherValue> {
+        self.properties.clone()
+    }
+}
+
+impl CypherNode for NodeData {
+    fn has_label(&self, label: &str) -> bool {
+        self.labels.iter().any(|node_label| node_label == label)
+    }
+
+    fn labels(&self) -> Vec<String> {
+        self.labels.clone()
+    }
+
+    fn from_cypher(
+        variable: Option<String>,
+        labels: Vec<String>,
+        properties: HashMap<String, CypherValue>,
+    ) -> Self {
+        Self {
+            variable,
+            labels,
+            properties,
+        }
+    }
+}
+
+impl CypherProperties for EdgeData {
+    fn get(&self, name: &str) -> Option<&CypherValue> {
+        self.properties.get(name)
+    }
+
+    fn properties(&self) -> HashMap<String, CypherValue> {
+        self.properties.clone()
+    }
+}
+
+impl CypherEdge for EdgeData {
+    fn has_rel_type(&self, rel_type: &str) -> bool {
+        self.rel_type.as_deref() == Some(rel_type)
+    }
+
+    fn rel_type(&self) -> Option<&str> {
+        self.rel_type.as_deref()
+    }
+
+    fn from_cypher(
+        variable: Option<String>,
+        rel_type: Option<String>,
+        properties: HashMap<String, CypherValue>,
+    ) -> Self {
+        Self {
+            variable,
+            rel_type,
+            properties,
+        }
+    }
+}
+
+/// Parse a Cypher query string and return its HIR-backed query plan representation.
 ///
 /// # Errors
 ///
@@ -87,7 +192,7 @@ pub struct EdgeData {
 /// assert_eq!(query.clauses.len(), 1);
 /// ```
 pub fn parse_cypher(query: &str) -> Result<CypherQuery, CypherError> {
-    parser::parse_query(query)
+    planner::plan_query(query)
 }
 
 /// Parse a Cypher query and build a petgraph [`Graph`] from its `CREATE` and

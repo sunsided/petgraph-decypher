@@ -7,7 +7,7 @@ use petgraph::Graph;
 
 use crate::ast::*;
 use crate::error::CypherError;
-use crate::{EdgeData, NodeData};
+use crate::{CypherEdge, CypherNode, EdgeData, NodeData};
 
 /// Build a petgraph [`Graph`] by executing all `CREATE` and `MERGE` clauses
 /// found in the parsed query.
@@ -49,11 +49,11 @@ fn apply_path_pattern(
     for (rel, target_node) in &pattern.rels {
         let target_idx = get_or_add_node(graph, var_map, target_node);
 
-        let edge_data = EdgeData {
-            variable: rel.variable.clone(),
-            rel_type: rel.rel_type.clone(),
-            properties: rel.properties.clone(),
-        };
+        let edge_data = EdgeData::from_cypher(
+            rel.variable.clone(),
+            rel.rel_type.clone(),
+            rel.properties.clone(),
+        );
 
         match rel.direction {
             RelDirection::Right => {
@@ -88,11 +88,11 @@ fn get_or_add_node(
         }
     }
 
-    let data = NodeData {
-        variable: pattern.variable.clone(),
-        labels: pattern.labels.clone(),
-        properties: pattern.properties.clone(),
-    };
+    let data = NodeData::from_cypher(
+        pattern.variable.clone(),
+        pattern.labels.clone(),
+        pattern.properties.clone(),
+    );
 
     let idx = graph.add_node(data);
 

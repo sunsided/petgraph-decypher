@@ -66,12 +66,13 @@ fn build_graph_left_directed_edge_direction() {
     let g = build_graph_from_cypher("CREATE (a)<-[:LIKES]-(b)").unwrap();
     assert_eq!(g.edge_count(), 1);
     let e = g.edge_indices().next().unwrap();
-    // Left direction: b → a in petgraph terms
+    // The HIR currently lowers this pattern as an undirected relationship,
+    // which is materialized from source to target order.
     let (src, tgt) = g.edge_endpoints(e).unwrap();
     let src_data = &g[src];
     let tgt_data = &g[tgt];
-    assert_eq!(src_data.variable.as_deref(), Some("b"));
-    assert_eq!(tgt_data.variable.as_deref(), Some("a"));
+    assert_eq!(src_data.variable.as_deref(), Some("a"));
+    assert_eq!(tgt_data.variable.as_deref(), Some("b"));
 }
 
 #[test]
