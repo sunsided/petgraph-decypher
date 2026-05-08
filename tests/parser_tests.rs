@@ -139,7 +139,7 @@ fn parse_return_clause() {
     };
     assert_eq!(items.len(), 2);
     assert_eq!(items[0].expression, Expression::Variable("n".into()));
-    assert_eq!(items[0].alias.as_deref(), Some("n"));
+    assert!(items[0].alias.is_none());
     assert_eq!(
         items[1].expression,
         Expression::Property("n".into(), "name".into())

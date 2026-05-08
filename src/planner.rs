@@ -14,19 +14,27 @@ use crate::ast::*;
 use crate::error::CypherError;
 
 pub(crate) fn plan_query(input: &str) -> Result<CypherQuery, CypherError> {
-    match plan_hir(input) {
-        Ok(query) => Ok(query),
-        Err(CypherError::ParseError(message))
-            if message.contains("single-part query must end with RETURN") =>
+    match analyze_query(input) {
+        Ok(hir) => PlanningContext::new(&hir).plan(),
+        Err(err)
+            if matches!(
+                err.kind(),
+                cypher::ErrorKind::Internal { message }
+                    if message == "single-part query must end with RETURN"
+            ) =>
         {
             plan_match_without_return(input)
         }
-        Err(err) => Err(err),
+        Err(err) => Err(CypherError::ParseError(err.to_string())),
     }
 }
 
+fn analyze_query(input: &str) -> Result<hir::HirQuery, cypher::CypherError> {
+    cypher::analyze(input)
+}
+
 fn plan_hir(input: &str) -> Result<CypherQuery, CypherError> {
-    let hir = cypher::analyze(input).map_err(|err| CypherError::ParseError(err.to_string()))?;
+    let hir = analyze_query(input).map_err(|err| CypherError::ParseError(err.to_string()))?;
     PlanningContext::new(&hir).plan()
 }
 
@@ -99,9 +107,14 @@ impl<'a> PlanningContext<'a> {
     fn return_items(&self, items: &[ProjectionItem]) -> Result<Vec<ReturnItem>, CypherError> {
         items.iter()
             .map(|item| {
+                let expression = self.expression(item.expression)?;
+                let alias = self.binding_name(item.alias)?.to_string();
                 Ok(ReturnItem {
-                    expression: self.expression(item.expression)?,
-                    alias: Some(self.binding_name(item.alias)?.to_string()),
+                    alias: match &expression {
+                        Expression::Variable(name) if name == &alias => None,
+                        _ => Some(alias),
+                    },
+                    expression,
                 })
             })
             .collect()
