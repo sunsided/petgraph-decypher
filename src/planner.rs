@@ -105,7 +105,8 @@ impl<'a> PlanningContext<'a> {
     }
 
     fn return_items(&self, items: &[ProjectionItem]) -> Result<Vec<ReturnItem>, CypherError> {
-        items.iter()
+        items
+            .iter()
             .map(|item| {
                 let expression = self.expression(item.expression)?;
                 let alias = self.binding_name(item.alias)?.to_string();
@@ -174,7 +175,10 @@ impl<'a> PlanningContext<'a> {
                         "unsupported comparison operator in WHERE clause: {operator:?}"
                     )));
                 }
-                Ok(WhereExpr::Eq(self.expression(*left)?, self.literal_value(right)?))
+                Ok(WhereExpr::Eq(
+                    self.expression(*left)?,
+                    self.literal_value(right)?,
+                ))
             }
             other => Err(CypherError::Unsupported(format!(
                 "unsupported WHERE expression: {other:?}"
@@ -184,7 +188,9 @@ impl<'a> PlanningContext<'a> {
 
     fn expression(&self, expr_id: ExprId) -> Result<Expression, CypherError> {
         match &self.expr(expr_id)?.kind {
-            ExprKind::Binding(binding) => Ok(Expression::Variable(self.binding_name(*binding)?.into())),
+            ExprKind::Binding(binding) => {
+                Ok(Expression::Variable(self.binding_name(*binding)?.into()))
+            }
             ExprKind::Property { base, key } => {
                 let Expression::Variable(variable) = self.expression(*base)? else {
                     return Err(CypherError::Unsupported(
@@ -217,7 +223,10 @@ impl<'a> PlanningContext<'a> {
         }
     }
 
-    fn properties(&self, expr_id: Option<ExprId>) -> Result<HashMap<String, CypherValue>, CypherError> {
+    fn properties(
+        &self,
+        expr_id: Option<ExprId>,
+    ) -> Result<HashMap<String, CypherValue>, CypherError> {
         let Some(expr_id) = expr_id else {
             return Ok(HashMap::new());
         };
@@ -225,7 +234,12 @@ impl<'a> PlanningContext<'a> {
         match &self.expr(expr_id)?.kind {
             ExprKind::Map(entries) => entries
                 .iter()
-                .map(|(key, value)| Ok((self.property_key(*key)?.to_string(), self.literal_value(*value)?)))
+                .map(|(key, value)| {
+                    Ok((
+                        self.property_key(*key)?.to_string(),
+                        self.literal_value(*value)?,
+                    ))
+                })
                 .collect(),
             other => Err(CypherError::Unsupported(format!(
                 "unsupported property map expression: {other:?}"
@@ -233,7 +247,10 @@ impl<'a> PlanningContext<'a> {
         }
     }
 
-    fn node_pattern(&self, pattern: &hir::pattern::NodePattern) -> Result<NodePattern, CypherError> {
+    fn node_pattern(
+        &self,
+        pattern: &hir::pattern::NodePattern,
+    ) -> Result<NodePattern, CypherError> {
         Ok(NodePattern {
             variable: pattern
                 .binding

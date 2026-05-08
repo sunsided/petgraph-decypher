@@ -456,7 +456,11 @@ impl<'a> PatternMatcher<'a> {
 
     fn node_matches_pattern(&self, node_idx: NodeIndex, pattern: &NodePattern) -> bool {
         let node_data = &self.graph[node_idx];
-        if !pattern.labels.iter().all(|label| node_data.has_label(label)) {
+        if !pattern
+            .labels
+            .iter()
+            .all(|label| node_data.has_label(label))
+        {
             return false;
         }
         for (key, value) in &pattern.properties {
@@ -490,17 +494,11 @@ impl<'a> PatternMatcher<'a> {
                         match bound {
                             BoundValue::Node(idx) => {
                                 let node_data = &self.graph[idx];
-                                node_data
-                                    .get(prop)
-                                    .map(|v| v == value)
-                                    .unwrap_or(false)
+                                node_data.get(prop).map(|v| v == value).unwrap_or(false)
                             }
                             BoundValue::Edge(idx) => {
                                 let edge_data = &self.graph[idx];
-                                edge_data
-                                    .get(prop)
-                                    .map(|v| v == value)
-                                    .unwrap_or(false)
+                                edge_data.get(prop).map(|v| v == value).unwrap_or(false)
                             }
                         }
                     } else {
