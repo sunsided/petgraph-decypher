@@ -9,7 +9,7 @@ use petgraph::Graph;
 
 use crate::ast::*;
 use crate::error::CypherError;
-use crate::{EdgeData, NodeData};
+use crate::{CypherEdge, CypherNode, CypherProperties, EdgeData, NodeData};
 
 /// Strategy to use when matching patterns against the graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -107,8 +107,8 @@ impl<'a> QueryResult<'a> {
                             values.insert(
                                 var.clone(),
                                 ResultValue::Node {
-                                    labels: data.labels.clone(),
-                                    properties: data.properties.clone(),
+                                    labels: data.labels(),
+                                    properties: data.properties(),
                                 },
                             );
                         }
@@ -117,8 +117,8 @@ impl<'a> QueryResult<'a> {
                             values.insert(
                                 var.clone(),
                                 ResultValue::Edge {
-                                    rel_type: data.rel_type.clone(),
-                                    properties: data.properties.clone(),
+                                    rel_type: data.rel_type().map(str::to_string),
+                                    properties: data.properties(),
                                 },
                             );
                         }
@@ -134,15 +134,15 @@ impl<'a> QueryResult<'a> {
                             BoundValue::Node(idx) => {
                                 let data = &self.graph[idx];
                                 ResultValue::Node {
-                                    labels: data.labels.clone(),
-                                    properties: data.properties.clone(),
+                                    labels: data.labels(),
+                                    properties: data.properties(),
                                 }
                             }
                             BoundValue::Edge(idx) => {
                                 let data = &self.graph[idx];
                                 ResultValue::Edge {
-                                    rel_type: data.rel_type.clone(),
-                                    properties: data.properties.clone(),
+                                    rel_type: data.rel_type().map(str::to_string),
+                                    properties: data.properties(),
                                 }
                             }
                         }
@@ -155,16 +155,14 @@ impl<'a> QueryResult<'a> {
                         match bound {
                             BoundValue::Node(idx) => {
                                 let data = &self.graph[idx];
-                                data.properties
-                                    .get(prop)
+                                data.get(prop)
                                     .cloned()
                                     .map(ResultValue::Scalar)
                                     .unwrap_or(ResultValue::Scalar(CypherValue::Null))
                             }
                             BoundValue::Edge(idx) => {
                                 let data = &self.graph[idx];
-                                data.properties
-                                    .get(prop)
+                                data.get(prop)
                                     .cloned()
                                     .map(ResultValue::Scalar)
                                     .unwrap_or(ResultValue::Scalar(CypherValue::Null))
@@ -458,16 +456,15 @@ impl<'a> PatternMatcher<'a> {
 
     fn node_matches_pattern(&self, node_idx: NodeIndex, pattern: &NodePattern) -> bool {
         let node_data = &self.graph[node_idx];
-        if !pattern.labels.iter().all(|label| {
-            node_data
-                .labels
-                .iter()
-                .any(|node_label| node_label == label)
-        }) {
+        if !pattern
+            .labels
+            .iter()
+            .all(|label| node_data.has_label(label))
+        {
             return false;
         }
         for (key, value) in &pattern.properties {
-            if node_data.properties.get(key) != Some(value) {
+            if node_data.get(key) != Some(value) {
                 return false;
             }
         }
@@ -477,12 +474,12 @@ impl<'a> PatternMatcher<'a> {
     fn edge_matches_rel(edge_ref: &EdgeReference<'_, EdgeData>, rel: &RelPattern) -> bool {
         let edge_data = edge_ref.weight();
         if let Some(ref rel_type) = rel.rel_type {
-            if edge_data.rel_type.as_ref() != Some(rel_type) {
+            if !edge_data.has_rel_type(rel_type) {
                 return false;
             }
         }
         for (key, value) in &rel.properties {
-            if edge_data.properties.get(key) != Some(value) {
+            if edge_data.get(key) != Some(value) {
                 return false;
             }
         }
@@ -497,19 +494,11 @@ impl<'a> PatternMatcher<'a> {
                         match bound {
                             BoundValue::Node(idx) => {
                                 let node_data = &self.graph[idx];
-                                node_data
-                                    .properties
-                                    .get(prop)
-                                    .map(|v| v == value)
-                                    .unwrap_or(false)
+                                node_data.get(prop).map(|v| v == value).unwrap_or(false)
                             }
                             BoundValue::Edge(idx) => {
                                 let edge_data = &self.graph[idx];
-                                edge_data
-                                    .properties
-                                    .get(prop)
-                                    .map(|v| v == value)
-                                    .unwrap_or(false)
+                                edge_data.get(prop).map(|v| v == value).unwrap_or(false)
                             }
                         }
                     } else {
@@ -777,11 +766,11 @@ impl<'a> MutQueryExecutor<'a> {
         for (rel, target_node) in &pattern.rels {
             let target_idx = self.get_or_add_node_mut(var_map, target_node)?;
 
-            let edge_data = EdgeData {
-                variable: rel.variable.clone(),
-                rel_type: rel.rel_type.clone(),
-                properties: rel.properties.clone(),
-            };
+            let edge_data = EdgeData::from_cypher(
+                rel.variable.clone(),
+                rel.rel_type.clone(),
+                rel.properties.clone(),
+            );
 
             let edge_id = match rel.direction {
                 RelDirection::Right => self.graph.add_edge(prev_idx, target_idx, edge_data),
@@ -827,11 +816,11 @@ impl<'a> MutQueryExecutor<'a> {
             }
         }
 
-        let data = NodeData {
-            variable: pattern.variable.clone(),
-            labels: pattern.labels.clone(),
-            properties: pattern.properties.clone(),
-        };
+        let data = NodeData::from_cypher(
+            pattern.variable.clone(),
+            pattern.labels.clone(),
+            pattern.properties.clone(),
+        );
 
         let idx = self.graph.add_node(data);
 

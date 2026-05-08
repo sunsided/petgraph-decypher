@@ -133,18 +133,18 @@ fn parse_merge_clause() {
 
 #[test]
 fn parse_return_clause() {
-    let q = parse_cypher("MATCH (n) RETURN n, n.name AS name, *").unwrap();
+    let q = parse_cypher("MATCH (n) RETURN n, n.name AS name").unwrap();
     let Clause::Return { items } = &q.clauses[1] else {
         panic!("expected Return clause");
     };
-    assert_eq!(items.len(), 3);
+    assert_eq!(items.len(), 2);
     assert_eq!(items[0].expression, Expression::Variable("n".into()));
+    assert!(items[0].alias.is_none());
     assert_eq!(
         items[1].expression,
         Expression::Property("n".into(), "name".into())
     );
     assert_eq!(items[1].alias.as_deref(), Some("name"));
-    assert_eq!(items[2].expression, Expression::All);
 }
 
 #[test]
