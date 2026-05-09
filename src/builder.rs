@@ -7,15 +7,17 @@ use petgraph::graph::NodeIndex;
 
 use crate::ast::*;
 use crate::error::CypherError;
-use crate::{CypherEdge, CypherNode, EdgeData, NodeData};
+use crate::{CypherEdge, CypherNode};
 
 /// Build a petgraph [`Graph`] by executing all `CREATE` and `MERGE` clauses
 /// found in the parsed query.
 ///
 /// Variables that appear in multiple patterns refer to the same node in the
 /// resulting graph.
-pub(crate) fn build_graph(query: CypherQuery) -> Result<Graph<NodeData, EdgeData>, CypherError> {
-    let mut graph: Graph<NodeData, EdgeData> = Graph::new();
+pub(crate) fn build_graph<N: CypherNode, E: CypherEdge>(
+    query: CypherQuery,
+) -> Result<Graph<N, E>, CypherError> {
+    let mut graph: Graph<N, E> = Graph::new();
     // Tracks variable name → NodeIndex for reuse across patterns.
     let mut var_map: HashMap<String, NodeIndex> = HashMap::new();
 
@@ -39,8 +41,8 @@ pub(crate) fn build_graph(query: CypherQuery) -> Result<Graph<NodeData, EdgeData
 }
 
 /// Walk a single path pattern, adding nodes and edges to the graph.
-fn apply_path_pattern(
-    graph: &mut Graph<NodeData, EdgeData>,
+fn apply_path_pattern<N: CypherNode, E: CypherEdge>(
+    graph: &mut Graph<N, E>,
     var_map: &mut HashMap<String, NodeIndex>,
     pattern: &PathPattern,
 ) {
@@ -49,7 +51,7 @@ fn apply_path_pattern(
     for (rel, target_node) in &pattern.rels {
         let target_idx = get_or_add_node(graph, var_map, target_node);
 
-        let edge_data = EdgeData::from_cypher(
+        let edge_data = E::from_cypher(
             rel.variable.clone(),
             rel.rel_type.clone(),
             rel.properties.clone(),
@@ -77,8 +79,8 @@ fn apply_path_pattern(
 /// Return the `NodeIndex` for a node pattern.  If the pattern has a variable
 /// that was already added, the existing index is returned so that later
 /// patterns can reference the same node.  Otherwise a new node is inserted.
-fn get_or_add_node(
-    graph: &mut Graph<NodeData, EdgeData>,
+fn get_or_add_node<N: CypherNode, E: CypherEdge>(
+    graph: &mut Graph<N, E>,
     var_map: &mut HashMap<String, NodeIndex>,
     pattern: &NodePattern,
 ) -> NodeIndex {
@@ -88,7 +90,7 @@ fn get_or_add_node(
         return idx;
     }
 
-    let data = NodeData::from_cypher(
+    let data = N::from_cypher(
         pattern.variable.clone(),
         pattern.labels.clone(),
         pattern.properties.clone(),

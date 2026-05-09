@@ -2,11 +2,14 @@
 //!
 //! # Overview
 //!
-//! This crate provides two main entry points:
+//! This crate provides three main entry points:
 //!
 //! * [`parse_cypher`] – parse a Cypher query string into the internal query plan.
 //! * [`build_graph_from_cypher`] – parse a Cypher query and materialise all
-//!   `CREATE` / `MERGE` operations into a [`petgraph::Graph`].
+//!   `CREATE` / `MERGE` operations into a [`petgraph::Graph`] with the default
+//!   [`NodeData`] / [`EdgeData`] types.
+//! * [`build_graph_from_cypher_typed`] – generic version that accepts any types
+//!   implementing [`CypherNode`] and [`CypherEdge`].
 //!
 //! # Supported Cypher subset
 //!
@@ -197,6 +200,40 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, CypherError> {
 }
 
 /// Parse a Cypher query and build a petgraph [`Graph`] from its `CREATE` and
+/// `MERGE` clauses using custom node and edge types.
+///
+/// This is the generic version of [`build_graph_from_cypher`]. Use it when you
+/// want to supply your own types that implement [`CypherNode`] and [`CypherEdge`].
+///
+/// Each distinct variable in the query corresponds to a single node; if the
+/// same variable appears in multiple patterns it maps to the same
+/// [`petgraph::graph::NodeIndex`].
+///
+/// # Errors
+///
+/// Returns [`CypherError::ParseError`] if the input cannot be parsed.
+///
+/// # Example
+///
+/// ```rust
+/// use petgraph_decypher::{build_graph_from_cypher_typed, NodeData, EdgeData};
+///
+/// let graph = build_graph_from_cypher_typed::<NodeData, EdgeData>(
+///     r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,
+/// )
+/// .unwrap();
+///
+/// assert_eq!(graph.node_count(), 2);
+/// assert_eq!(graph.edge_count(), 1);
+/// ```
+pub fn build_graph_from_cypher_typed<N: CypherNode, E: CypherEdge>(
+    query: &str,
+) -> Result<Graph<N, E>, CypherError> {
+    let ast = parse_cypher(query)?;
+    builder::build_graph(ast)
+}
+
+/// Parse a Cypher query and build a petgraph [`Graph`] from its `CREATE` and
 /// `MERGE` clauses.
 ///
 /// Each distinct variable in the query corresponds to a single node; if the
@@ -225,6 +262,5 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, CypherError> {
 /// assert_eq!(graph[edge].rel_type.as_deref(), Some("KNOWS"));
 /// ```
 pub fn build_graph_from_cypher(query: &str) -> Result<Graph<NodeData, EdgeData>, CypherError> {
-    let ast = parse_cypher(query)?;
-    builder::build_graph(ast)
+    build_graph_from_cypher_typed(query)
 }
