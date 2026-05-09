@@ -105,11 +105,23 @@ fn query_match_all_nodes_with_custom_weights() {
     )
     .unwrap();
 
-    let result =
-        petgraph_decypher::PetgraphCypherRead::cypher(&g, "MATCH (n:Person) RETURN n.name AS name")
-            .unwrap();
+    let result = petgraph_decypher::query::PetgraphCypherRead::cypher(
+        &g,
+        "MATCH (n:Person) RETURN n.name AS name",
+    )
+    .unwrap();
+    assert_eq!(result.columns(), &["name".to_string()]);
     let rows: Vec<_> = collect_rows(result);
     assert_eq!(rows.len(), 2);
+    let mut names = rows
+        .iter()
+        .map(|row| match row.values.get("name").unwrap() {
+            ResultValue::Scalar(CypherValue::String(name)) => name.clone(),
+            _ => panic!("expected string value"),
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
 }
 
 #[test]
@@ -119,13 +131,24 @@ fn query_match_relationship_with_custom_weights() {
     )
     .unwrap();
 
-    let result = petgraph_decypher::PetgraphCypherRead::cypher(
+    let result = petgraph_decypher::query::PetgraphCypherRead::cypher(
         &g,
         "MATCH (a)-[r:KNOWS]->(b) RETURN r.since AS since, b.name AS name",
     )
     .unwrap();
+    assert_eq!(result.columns(), &["since".to_string(), "name".to_string()]);
     let rows: Vec<_> = collect_rows(result);
     assert_eq!(rows.len(), 1);
+    if let ResultValue::Scalar(CypherValue::Integer(since)) = rows[0].values.get("since").unwrap() {
+        assert_eq!(*since, 2020);
+    } else {
+        panic!("expected integer value");
+    }
+    if let ResultValue::Scalar(CypherValue::String(name)) = rows[0].values.get("name").unwrap() {
+        assert_eq!(name, "Bob");
+    } else {
+        panic!("expected string value");
+    }
 }
 
 #[test]
