@@ -2,11 +2,84 @@
 
 use petgraph::Graph;
 use petgraph_decypher::{
-    CypherValue, PetgraphCypher, QueryResult, ResultValue, Row, build_graph_from_cypher,
+    CypherEdge, CypherNode, CypherProperties, CypherValue, PetgraphCypher, QueryResult,
+    ResultValue, Row, build_graph_from_cypher, build_graph_from_cypher_typed,
 };
+use std::collections::HashMap;
 
-fn collect_rows(result: QueryResult<'_>) -> Vec<Row> {
+fn collect_rows<N, E>(result: QueryResult<'_, N, E>) -> Vec<Row> {
     result.into_iter().collect()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CustomNode {
+    labels: Vec<String>,
+    properties: HashMap<String, CypherValue>,
+}
+
+impl CypherProperties for CustomNode {
+    fn get(&self, name: &str) -> Option<&CypherValue> {
+        self.properties.get(name)
+    }
+
+    fn properties(&self) -> HashMap<String, CypherValue> {
+        self.properties.clone()
+    }
+}
+
+impl CypherNode for CustomNode {
+    fn has_label(&self, label: &str) -> bool {
+        self.labels.iter().any(|node_label| node_label == label)
+    }
+
+    fn labels(&self) -> Vec<String> {
+        self.labels.clone()
+    }
+
+    fn from_cypher(
+        _variable: Option<String>,
+        labels: Vec<String>,
+        properties: HashMap<String, CypherValue>,
+    ) -> Self {
+        Self { labels, properties }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CustomEdge {
+    rel_type: Option<String>,
+    properties: HashMap<String, CypherValue>,
+}
+
+impl CypherProperties for CustomEdge {
+    fn get(&self, name: &str) -> Option<&CypherValue> {
+        self.properties.get(name)
+    }
+
+    fn properties(&self) -> HashMap<String, CypherValue> {
+        self.properties.clone()
+    }
+}
+
+impl CypherEdge for CustomEdge {
+    fn has_rel_type(&self, rel_type: &str) -> bool {
+        self.rel_type.as_deref() == Some(rel_type)
+    }
+
+    fn rel_type(&self) -> Option<&str> {
+        self.rel_type.as_deref()
+    }
+
+    fn from_cypher(
+        _variable: Option<String>,
+        rel_type: Option<String>,
+        properties: HashMap<String, CypherValue>,
+    ) -> Self {
+        Self {
+            rel_type,
+            properties,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -23,6 +96,36 @@ fn query_match_all_nodes() {
     let result = g.cypher("MATCH (n) RETURN n.name AS name").unwrap();
     let rows: Vec<_> = collect_rows(result);
     assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn query_match_all_nodes_with_custom_weights() {
+    let g = build_graph_from_cypher_typed::<CustomNode, CustomEdge>(
+        r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,
+    )
+    .unwrap();
+
+    let result =
+        petgraph_decypher::PetgraphCypherRead::cypher(&g, "MATCH (n:Person) RETURN n.name AS name")
+            .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn query_match_relationship_with_custom_weights() {
+    let g = build_graph_from_cypher_typed::<CustomNode, CustomEdge>(
+        r#"CREATE (a:Person {name: "Alice"})-[:KNOWS {since: 2020}]->(b:Person {name: "Bob"})"#,
+    )
+    .unwrap();
+
+    let result = petgraph_decypher::PetgraphCypherRead::cypher(
+        &g,
+        "MATCH (a)-[r:KNOWS]->(b) RETURN r.since AS since, b.name AS name",
+    )
+    .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
 }
 
 #[test]

@@ -9,7 +9,7 @@ use petgraph::visit::EdgeRef;
 
 use crate::ast::*;
 use crate::error::CypherError;
-use crate::{CypherEdge, CypherNode, CypherProperties, EdgeData, NodeData};
+use crate::{CypherEdge, CypherNode, EdgeData, NodeData};
 
 /// Strategy to use when matching patterns against the graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -59,14 +59,14 @@ type Bindings = HashMap<String, BoundValue>;
 ///
 /// Both the MATCH and RETURN projection phases are executed eagerly.
 /// The returned iterator streams over the fully materialized result rows.
-pub struct QueryResult<'a> {
+pub struct QueryResult<'a, N = NodeData, E = EdgeData> {
     columns: Vec<String>,
     rows: std::vec::IntoIter<Row>,
-    _graph: &'a Graph<NodeData, EdgeData>,
+    _graph: &'a Graph<N, E>,
 }
 
-impl<'a> QueryResult<'a> {
-    fn new(columns: Vec<String>, rows: Vec<Row>, graph: &'a Graph<NodeData, EdgeData>) -> Self {
+impl<'a, N, E> QueryResult<'a, N, E> {
+    fn new(columns: Vec<String>, rows: Vec<Row>, graph: &'a Graph<N, E>) -> Self {
         Self {
             columns,
             rows: rows.into_iter(),
@@ -79,7 +79,7 @@ impl<'a> QueryResult<'a> {
     }
 }
 
-impl<'a> Iterator for QueryResult<'a> {
+impl<'a, N, E> Iterator for QueryResult<'a, N, E> {
     type Item = Row;
 
     fn next(&mut self) -> Option<Row> {
@@ -115,9 +115,44 @@ pub trait PetgraphCypher {
     ) -> Result<QueryResult<'_>, CypherError>;
 }
 
+/// Extension trait for executing read-only Cypher queries on a
+/// [`Graph`] with custom node and edge weights.
+pub trait PetgraphCypherRead<N: CypherNode, E: CypherEdge> {
+    /// Execute a read-only Cypher query and stream the results.
+    ///
+    /// Supports `MATCH`, `WHERE`, and `RETURN` clauses.
+    /// Returns an error if mutation clauses (`CREATE`, `MERGE`, `DELETE`) are present.
+    ///
+    /// Uses the default `Backtrack` match strategy.
+    fn cypher(&self, query: &str) -> Result<QueryResult<'_, N, E>, CypherError>;
+
+    /// Execute a read-only Cypher query with a specific match strategy.
+    fn cypher_with_strategy(
+        &self,
+        query: &str,
+        strategy: MatchStrategy,
+    ) -> Result<QueryResult<'_, N, E>, CypherError>;
+}
+
+impl<N: CypherNode, E: CypherEdge> PetgraphCypherRead<N, E> for Graph<N, E> {
+    fn cypher(&self, query: &str) -> Result<QueryResult<'_, N, E>, CypherError> {
+        self.cypher_with_strategy(query, MatchStrategy::default())
+    }
+
+    fn cypher_with_strategy(
+        &self,
+        query: &str,
+        strategy: MatchStrategy,
+    ) -> Result<QueryResult<'_, N, E>, CypherError> {
+        let ast = crate::parse_cypher(query)?;
+        validate_read_query(&ast)?;
+        ReadQueryExecutor::new(self, strategy).execute(ast)
+    }
+}
+
 impl PetgraphCypher for Graph<NodeData, EdgeData> {
     fn cypher(&self, query: &str) -> Result<QueryResult<'_>, CypherError> {
-        self.cypher_with_strategy(query, MatchStrategy::default())
+        PetgraphCypher::cypher_with_strategy(self, query, MatchStrategy::default())
     }
 
     fn cypher_mut(&mut self, query: &str) -> Result<(), CypherError> {
@@ -427,7 +462,7 @@ fn evaluate_function(
     args: &[Expression],
     _distinct: bool,
     bindings: &Bindings,
-    graph: &Graph<NodeData, EdgeData>,
+    graph: &Graph<impl CypherNode, impl CypherEdge>,
 ) -> Result<CypherValue, CypherError> {
     // Helper to evaluate all args.
     let eval_args = || {
@@ -1060,7 +1095,7 @@ fn evaluate_function(
 fn evaluate_case(
     case: &CaseExpr,
     bindings: &Bindings,
-    graph: &Graph<NodeData, EdgeData>,
+    graph: &Graph<impl CypherNode, impl CypherEdge>,
 ) -> Result<CypherValue, CypherError> {
     if let Some(scrutinee) = &case.scrutinee {
         let scrutinee_val = evaluate_expression(scrutinee, bindings, graph)?;
@@ -1088,7 +1123,7 @@ fn evaluate_case(
 fn evaluate_expression(
     expr: &Expression,
     bindings: &Bindings,
-    graph: &Graph<NodeData, EdgeData>,
+    graph: &Graph<impl CypherNode, impl CypherEdge>,
 ) -> Result<CypherValue, CypherError> {
     match expr {
         Expression::Variable(var) => {
@@ -1176,7 +1211,7 @@ fn evaluate_expression(
 fn evaluate_where(
     expr: &WhereExpr,
     bindings: &Bindings,
-    graph: &Graph<NodeData, EdgeData>,
+    graph: &Graph<impl CypherNode, impl CypherEdge>,
 ) -> bool {
     match expr {
         WhereExpr::Eq(left, right) => {
@@ -1298,13 +1333,13 @@ fn evaluate_where(
 
 /// Shared matcher for pattern matching against a graph. Used by both the read
 /// and mutation executors to avoid code duplication.
-struct PatternMatcher<'a> {
-    graph: &'a Graph<NodeData, EdgeData>,
+struct PatternMatcher<'a, N: CypherNode, E: CypherEdge> {
+    graph: &'a Graph<N, E>,
     strategy: MatchStrategy,
 }
 
-impl<'a> PatternMatcher<'a> {
-    fn new(graph: &'a Graph<NodeData, EdgeData>, strategy: MatchStrategy) -> Self {
+impl<'a, N: CypherNode, E: CypherEdge> PatternMatcher<'a, N, E> {
+    fn new(graph: &'a Graph<N, E>, strategy: MatchStrategy) -> Self {
         Self { graph, strategy }
     }
 
@@ -1485,7 +1520,7 @@ impl<'a> PatternMatcher<'a> {
         true
     }
 
-    fn edge_matches_rel(edge_ref: &EdgeReference<'_, EdgeData>, rel: &RelPattern) -> bool {
+    fn edge_matches_rel(edge_ref: &EdgeReference<'_, E>, rel: &RelPattern) -> bool {
         let edge_data = edge_ref.weight();
         if let Some(ref rel_type) = rel.rel_type
             && !edge_data.has_rel_type(rel_type)
@@ -1508,7 +1543,7 @@ impl<'a> PatternMatcher<'a> {
 fn project_expression(
     expr: &Expression,
     bindings: &Bindings,
-    graph: &Graph<NodeData, EdgeData>,
+    graph: &Graph<impl CypherNode, impl CypherEdge>,
 ) -> Result<ResultValue, CypherError> {
     match expr {
         Expression::Variable(var) => {
@@ -1593,7 +1628,7 @@ fn result_columns(items: &[ReturnItem]) -> Vec<String> {
 fn project_row(
     items: &[ReturnItem],
     bindings: &Bindings,
-    graph: &Graph<NodeData, EdgeData>,
+    graph: &Graph<impl CypherNode, impl CypherEdge>,
 ) -> Result<Row, CypherError> {
     let mut values = HashMap::new();
     let mut expr_counter = 0;
@@ -1738,17 +1773,17 @@ fn apply_skip_limit(rows: Vec<Row>, skip: Option<usize>, limit: Option<usize>) -
 // Read-only executor
 // ---------------------------------------------------------------------------
 
-struct ReadQueryExecutor<'a> {
-    graph: &'a Graph<NodeData, EdgeData>,
+struct ReadQueryExecutor<'a, N: CypherNode, E: CypherEdge> {
+    graph: &'a Graph<N, E>,
     strategy: MatchStrategy,
 }
 
-impl<'a> ReadQueryExecutor<'a> {
-    fn new(graph: &'a Graph<NodeData, EdgeData>, strategy: MatchStrategy) -> Self {
+impl<'a, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'a, N, E> {
+    fn new(graph: &'a Graph<N, E>, strategy: MatchStrategy) -> Self {
         Self { graph, strategy }
     }
 
-    fn execute(self, query: CypherQuery) -> Result<QueryResult<'a>, CypherError> {
+    fn execute(self, query: CypherQuery) -> Result<QueryResult<'a, N, E>, CypherError> {
         let mut bindings: Vec<Bindings> = vec![HashMap::new()];
         let mut return_items: Option<Vec<ReturnItem>> = None;
         let mut return_distinct = false;
