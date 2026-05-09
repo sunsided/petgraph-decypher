@@ -1,6 +1,10 @@
 //! Integration tests for the graph builder.
 
-use petgraph_decypher::{CypherValue, NodeData, build_graph_from_cypher};
+use petgraph_decypher::{
+    CypherEdge, CypherNode, CypherProperties, CypherValue, NodeData, build_graph_from_cypher,
+    build_graph_from_cypher_typed,
+};
+use std::collections::HashMap;
 
 #[test]
 fn build_graph_single_node() {
@@ -101,4 +105,112 @@ fn build_graph_node_variable_data() {
     assert!(data.labels.contains(&"Person".to_string()));
     assert!(data.labels.contains(&"Employee".to_string()));
     assert_eq!(data.properties.get("age"), Some(&CypherValue::Integer(30)));
+}
+
+/// Minimal custom node type for testing `build_graph_from_cypher_typed`.
+#[derive(Debug, Clone, PartialEq)]
+struct CustomNode {
+    variable: Option<String>,
+    labels: Vec<String>,
+    properties: HashMap<String, CypherValue>,
+}
+
+impl CypherProperties for CustomNode {
+    fn get(&self, name: &str) -> Option<&CypherValue> {
+        self.properties.get(name)
+    }
+
+    fn properties(&self) -> HashMap<String, CypherValue> {
+        self.properties.clone()
+    }
+}
+
+impl CypherNode for CustomNode {
+    fn has_label(&self, label: &str) -> bool {
+        self.labels.iter().any(|l| l == label)
+    }
+
+    fn labels(&self) -> Vec<String> {
+        self.labels.clone()
+    }
+
+    fn from_cypher(
+        variable: Option<String>,
+        labels: Vec<String>,
+        properties: HashMap<String, CypherValue>,
+    ) -> Self {
+        Self {
+            variable,
+            labels,
+            properties,
+        }
+    }
+}
+
+/// Minimal custom edge type for testing `build_graph_from_cypher_typed`.
+#[derive(Debug, Clone, PartialEq)]
+struct CustomEdge {
+    variable: Option<String>,
+    rel_type: Option<String>,
+    properties: HashMap<String, CypherValue>,
+}
+
+impl CypherProperties for CustomEdge {
+    fn get(&self, name: &str) -> Option<&CypherValue> {
+        self.properties.get(name)
+    }
+
+    fn properties(&self) -> HashMap<String, CypherValue> {
+        self.properties.clone()
+    }
+}
+
+impl CypherEdge for CustomEdge {
+    fn has_rel_type(&self, rel_type: &str) -> bool {
+        self.rel_type.as_deref() == Some(rel_type)
+    }
+
+    fn rel_type(&self) -> Option<&str> {
+        self.rel_type.as_deref()
+    }
+
+    fn from_cypher(
+        variable: Option<String>,
+        rel_type: Option<String>,
+        properties: HashMap<String, CypherValue>,
+    ) -> Self {
+        Self {
+            variable,
+            rel_type,
+            properties,
+        }
+    }
+}
+
+#[test]
+fn build_graph_typed_with_custom_types() {
+    let g = build_graph_from_cypher_typed::<CustomNode, CustomEdge>(
+        r#"CREATE (a:Person {name: "Alice"})-[:KNOWS {since: 2020}]->(b:Person {name: "Bob"})"#,
+    )
+    .unwrap();
+
+    assert_eq!(g.node_count(), 2);
+    assert_eq!(g.edge_count(), 1);
+
+    let nodes: Vec<_> = g.node_weights().collect();
+    assert!(nodes.iter().any(|n| n.has_label("Person")));
+    assert!(
+        nodes
+            .iter()
+            .any(|n| n.get("name") == Some(&CypherValue::String("Alice".into())))
+    );
+    assert!(
+        nodes
+            .iter()
+            .any(|n| n.get("name") == Some(&CypherValue::String("Bob".into())))
+    );
+
+    let edge = g.edge_indices().next().unwrap();
+    assert_eq!(g[edge].rel_type(), Some("KNOWS"));
+    assert_eq!(g[edge].get("since"), Some(&CypherValue::Integer(2020)));
 }

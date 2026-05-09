@@ -2,7 +2,7 @@
 //!
 //! # Overview
 //!
-//! This crate provides two main entry points:
+//! This crate provides three main entry points:
 //!
 //! * [`parse_cypher`] – parse a Cypher query string into the internal query plan.
 //! * [`build_graph_from_cypher`] – parse a Cypher query and materialise all
