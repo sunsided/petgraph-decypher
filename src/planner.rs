@@ -1,4 +1,4 @@
-//! HIR-backed query planner built on the external `cypher` crate.
+//! HIR-backed query planner built on the external `decypher` crate.
 
 use std::collections::HashMap;
 

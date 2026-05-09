@@ -9,8 +9,15 @@ readme = "README.md"
 keywords = ["petgraph", "cypher", "opencypher", "graph"]
 categories = ["data-structures"]
 
+[features]
+default = ["rng-rand"]
+rng-rand = ["dep:rand"]
+rng-fastrand = ["dep:fastrand"]
+
 [dependencies]
 petgraph = "0.8"
 decypher = "0.2.0-alpha.4"
 thiserror = "2"
 itertools = "0.13"
+rand = { version = "0.9", optional = true }
+fastrand = { version = "2", optional = true }

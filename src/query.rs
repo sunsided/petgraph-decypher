@@ -161,6 +161,9 @@ fn validate_read_query(query: &CypherQuery) -> Result<(), CypherError> {
                     "SET/REMOVE not allowed in cypher(); use cypher_mut()".into(),
                 ));
             }
+            Clause::With { .. } => {
+                return Err(CypherError::Unsupported("WITH is not yet supported".into()));
+            }
             _ => {}
         }
     }
@@ -315,6 +318,11 @@ fn evaluate_binary_op(
                 if *b < 0 {
                     return Err(CypherError::TypeMismatch(
                         "negative integer exponents are not supported for integer base; use a float base".into(),
+                    ));
+                }
+                if *b > u32::MAX as i64 {
+                    return Err(CypherError::TypeMismatch(
+                        "integer exponent is too large".into(),
                     ));
                 }
                 Ok(CypherValue::Integer(a.pow(*b as u32)))
@@ -828,9 +836,28 @@ fn evaluate_function(
                 ))),
             }
         }
-        "rand" => Err(CypherError::Unsupported(
-            "rand() is not yet implemented".into(),
-        )),
+        "rand" => {
+            if !args.is_empty() {
+                return Err(CypherError::InvalidQuery(
+                    "rand() takes no arguments".into(),
+                ));
+            }
+            #[cfg(feature = "rng-rand")]
+            {
+                Ok(CypherValue::Float(rand::random::<f64>()))
+            }
+            #[cfg(all(feature = "rng-fastrand", not(feature = "rng-rand")))]
+            {
+                Ok(CypherValue::Float(fastrand::f64()))
+            }
+            #[cfg(not(any(feature = "rng-rand", feature = "rng-fastrand")))]
+            {
+                Err(CypherError::Unsupported(
+                    "rand() requires an RNG feature to be enabled (rng-rand or rng-fastrand)"
+                        .into(),
+                ))
+            }
+        }
         "range" => {
             let vals = eval_args()?;
             if vals.len() < 2 || vals.len() > 3 {
@@ -1067,8 +1094,12 @@ fn evaluate_expression(
         Expression::Variable(var) => {
             if let Some(bound) = bindings.get(var) {
                 match bound {
-                    BoundValue::Node(_idx) => Ok(CypherValue::Null),
-                    BoundValue::Edge(_idx) => Ok(CypherValue::Null),
+                    BoundValue::Node(_) | BoundValue::Edge(_) => {
+                        Err(CypherError::TypeMismatch(format!(
+                            "node/edge variable '{}' cannot be used in a scalar expression",
+                            var
+                        )))
+                    }
                 }
             } else {
                 Ok(CypherValue::Null)
@@ -1095,7 +1126,10 @@ fn evaluate_expression(
         Expression::Unary(op, expr) => {
             let val = evaluate_expression(expr, bindings, graph)?;
             match op {
-                UnaryOp::Not => Ok(CypherValue::Boolean(is_truthy(&val) == Some(false))),
+                UnaryOp::Not => match val {
+                    CypherValue::Null => Ok(CypherValue::Null),
+                    _ => Ok(CypherValue::Boolean(is_truthy(&val) == Some(false))),
+                },
                 UnaryOp::Negate => match val {
                     CypherValue::Integer(i) => Ok(CypherValue::Integer(-i)),
                     CypherValue::Float(f) => Ok(CypherValue::Float(-f)),
@@ -1150,7 +1184,7 @@ fn evaluate_where(
                 evaluate_expression(left, bindings, graph),
                 evaluate_expression(right, bindings, graph),
             ) {
-                (Ok(l), Ok(r)) => l == r,
+                (Ok(l), Ok(r)) => matches!(cypher_value_eq(&l, &r), CypherValue::Boolean(true)),
                 _ => false,
             }
         }
@@ -1159,7 +1193,7 @@ fn evaluate_where(
                 evaluate_expression(left, bindings, graph),
                 evaluate_expression(right, bindings, graph),
             ) {
-                (Ok(l), Ok(r)) => l != r,
+                (Ok(l), Ok(r)) => matches!(cypher_value_eq(&l, &r), CypherValue::Boolean(false)),
                 _ => false,
             }
         }
@@ -1603,17 +1637,61 @@ fn project_row(
 }
 
 fn compare_sort_keys(a: &CypherValue, b: &CypherValue) -> std::cmp::Ordering {
-    match compare_cypher_values(a, b) {
-        Some(ord) => ord,
-        None => {
-            // Nulls last
-            if matches!(a, CypherValue::Null) && !matches!(b, CypherValue::Null) {
-                std::cmp::Ordering::Greater
-            } else if matches!(b, CypherValue::Null) && !matches!(a, CypherValue::Null) {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Equal
-            }
+    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+}
+
+fn stable_cypher_value_string(v: &CypherValue) -> String {
+    match v {
+        CypherValue::Null => "N".to_string(),
+        CypherValue::Boolean(b) => format!("B{}", b),
+        CypherValue::Integer(i) => format!("I{}", i),
+        CypherValue::Float(f) => format!("F{}", f.to_bits()),
+        CypherValue::String(s) => format!("S{}", s),
+        CypherValue::List(items) => {
+            let parts: Vec<_> = items.iter().map(stable_cypher_value_string).collect();
+            format!("L[{}]", parts.join(","))
+        }
+        CypherValue::Map(entries) => {
+            let mut keys: Vec<_> = entries.keys().collect();
+            keys.sort();
+            let parts: Vec<_> = keys
+                .iter()
+                .map(|k| format!("{}:{}", k, stable_cypher_value_string(&entries[*k])))
+                .collect();
+            format!("M{{{}}}", parts.join(","))
+        }
+    }
+}
+
+fn stable_result_value_string(v: &ResultValue) -> String {
+    match v {
+        ResultValue::Scalar(cv) => stable_cypher_value_string(cv),
+        ResultValue::Node { labels, properties } => {
+            let mut labels: Vec<_> = labels.clone();
+            labels.sort();
+            let mut keys: Vec<_> = properties.keys().collect();
+            keys.sort();
+            let parts: Vec<_> = keys
+                .iter()
+                .map(|k| format!("{}:{}", k, stable_cypher_value_string(&properties[*k])))
+                .collect();
+            format!("Node({}:{{{}}})", labels.join(":"), parts.join(","))
+        }
+        ResultValue::Edge {
+            rel_type,
+            properties,
+        } => {
+            let mut keys: Vec<_> = properties.keys().collect();
+            keys.sort();
+            let parts: Vec<_> = keys
+                .iter()
+                .map(|k| format!("{}:{}", k, stable_cypher_value_string(&properties[*k])))
+                .collect();
+            format!(
+                "Edge({}:{{{}}})",
+                rel_type.as_deref().unwrap_or(""),
+                parts.join(",")
+            )
         }
     }
 }
@@ -1622,7 +1700,7 @@ fn row_canonical_key(row: &Row) -> String {
     let mut pairs: Vec<_> = row
         .values
         .iter()
-        .map(|(k, v)| (k.clone(), format!("{:?}", v)))
+        .map(|(k, v)| (k.clone(), stable_result_value_string(v)))
         .collect();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
     let mut result = String::new();
@@ -2077,10 +2155,18 @@ impl<'a> MutQueryExecutor<'a> {
                         let val = evaluate_expression(value, bindings, self.graph)?;
                         match bound {
                             BoundValue::Node(idx) => {
-                                self.graph[*idx].properties.insert(property.clone(), val);
+                                if matches!(val, CypherValue::Null) {
+                                    self.graph[*idx].properties.remove(property);
+                                } else {
+                                    self.graph[*idx].properties.insert(property.clone(), val);
+                                }
                             }
                             BoundValue::Edge(idx) => {
-                                self.graph[*idx].properties.insert(property.clone(), val);
+                                if matches!(val, CypherValue::Null) {
+                                    self.graph[*idx].properties.remove(property);
+                                } else {
+                                    self.graph[*idx].properties.insert(property.clone(), val);
+                                }
                             }
                         }
                     }
