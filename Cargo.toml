@@ -11,6 +11,6 @@ categories = ["data-structures"]
 
 [dependencies]
 petgraph = "0.8"
-cypher = { git = "https://github.com/sunsided/cypher", rev = "5ae680c7" }
+decypher = "0.2.0-alpha.4"
 thiserror = "2"
 itertools = "0.13"

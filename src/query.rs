@@ -25,7 +25,7 @@ pub enum MatchStrategy {
 /// A value that can appear in a query result row.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResultValue {
-    /// A scalar property value.
+    /// A scalar property value (including List and Map).
     Scalar(CypherValue),
     /// A matched node with its labels and properties.
     Node {
@@ -61,124 +61,21 @@ type Bindings = HashMap<String, BoundValue>;
 /// The RETURN phase is executed lazily, projecting one row at a time.
 pub struct QueryResult<'a> {
     columns: Vec<String>,
-    bindings: std::vec::IntoIter<Bindings>,
-    graph: &'a Graph<NodeData, EdgeData>,
-    items: Vec<ReturnItem>,
+    rows: std::vec::IntoIter<Row>,
+    _graph: &'a Graph<NodeData, EdgeData>,
 }
 
 impl<'a> QueryResult<'a> {
-    fn new(
-        columns: Vec<String>,
-        bindings: Vec<Bindings>,
-        graph: &'a Graph<NodeData, EdgeData>,
-        items: Vec<ReturnItem>,
-    ) -> Self {
+    fn new(columns: Vec<String>, rows: Vec<Row>, graph: &'a Graph<NodeData, EdgeData>) -> Self {
         Self {
             columns,
-            bindings: bindings.into_iter(),
-            graph,
-            items,
+            rows: rows.into_iter(),
+            _graph: graph,
         }
     }
 
     pub fn columns(&self) -> &[String] {
         &self.columns
-    }
-
-    fn project_row(&self, bindings: &Bindings) -> Row {
-        let mut values = HashMap::new();
-
-        for item in &self.items {
-            let key = if let Some(ref alias) = item.alias {
-                alias.clone()
-            } else {
-                match &item.expression {
-                    Expression::Variable(v) => v.clone(),
-                    Expression::Property(v, p) => format!("{v}.{p}"),
-                    Expression::All => "*".to_string(),
-                }
-            };
-
-            if matches!(item.expression, Expression::All) {
-                for (var, bound) in bindings {
-                    match bound {
-                        BoundValue::Node(idx) => {
-                            let data = &self.graph[*idx];
-                            values.insert(
-                                var.clone(),
-                                ResultValue::Node {
-                                    labels: data.labels(),
-                                    properties: data.properties(),
-                                },
-                            );
-                        }
-                        BoundValue::Edge(idx) => {
-                            let data = &self.graph[*idx];
-                            values.insert(
-                                var.clone(),
-                                ResultValue::Edge {
-                                    rel_type: data.rel_type().map(str::to_string),
-                                    properties: data.properties(),
-                                },
-                            );
-                        }
-                    }
-                }
-                continue;
-            }
-
-            let result_value = match &item.expression {
-                Expression::Variable(var) => {
-                    if let Some(&bound) = bindings.get(var) {
-                        match bound {
-                            BoundValue::Node(idx) => {
-                                let data = &self.graph[idx];
-                                ResultValue::Node {
-                                    labels: data.labels(),
-                                    properties: data.properties(),
-                                }
-                            }
-                            BoundValue::Edge(idx) => {
-                                let data = &self.graph[idx];
-                                ResultValue::Edge {
-                                    rel_type: data.rel_type().map(str::to_string),
-                                    properties: data.properties(),
-                                }
-                            }
-                        }
-                    } else {
-                        ResultValue::Scalar(CypherValue::Null)
-                    }
-                }
-                Expression::Property(var, prop) => {
-                    if let Some(&bound) = bindings.get(var) {
-                        match bound {
-                            BoundValue::Node(idx) => {
-                                let data = &self.graph[idx];
-                                data.get(prop)
-                                    .cloned()
-                                    .map(ResultValue::Scalar)
-                                    .unwrap_or(ResultValue::Scalar(CypherValue::Null))
-                            }
-                            BoundValue::Edge(idx) => {
-                                let data = &self.graph[idx];
-                                data.get(prop)
-                                    .cloned()
-                                    .map(ResultValue::Scalar)
-                                    .unwrap_or(ResultValue::Scalar(CypherValue::Null))
-                            }
-                        }
-                    } else {
-                        ResultValue::Scalar(CypherValue::Null)
-                    }
-                }
-                Expression::All => unreachable!(),
-            };
-
-            values.insert(key, result_value);
-        }
-
-        Row { values }
     }
 }
 
@@ -186,12 +83,11 @@ impl<'a> Iterator for QueryResult<'a> {
     type Item = Row;
 
     fn next(&mut self) -> Option<Row> {
-        let bindings = self.bindings.next()?;
-        Some(self.project_row(&bindings))
+        self.rows.next()
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.bindings.size_hint()
+        self.rows.size_hint()
     }
 }
 
@@ -260,6 +156,11 @@ fn validate_read_query(query: &CypherQuery) -> Result<(), CypherError> {
                     "DELETE not allowed in cypher(); use cypher_mut()".into(),
                 ));
             }
+            Clause::Set { .. } | Clause::Remove { .. } => {
+                return Err(CypherError::Unsupported(
+                    "SET/REMOVE not allowed in cypher(); use cypher_mut()".into(),
+                ));
+            }
             _ => {}
         }
     }
@@ -279,7 +180,1063 @@ fn validate_mutation_query(query: &CypherQuery) -> Result<(), CypherError> {
 }
 
 // ---------------------------------------------------------------------------
-// Shared pattern matcher
+// Expression evaluation helpers
+// ---------------------------------------------------------------------------
+
+fn is_truthy(value: &CypherValue) -> Option<bool> {
+    match value {
+        CypherValue::Null => None,
+        CypherValue::Boolean(b) => Some(*b),
+        _ => Some(true),
+    }
+}
+
+fn compare_cypher_values(left: &CypherValue, right: &CypherValue) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (CypherValue::Null, _) | (_, CypherValue::Null) => None,
+        (CypherValue::Boolean(a), CypherValue::Boolean(b)) => a.partial_cmp(b),
+        (CypherValue::Integer(a), CypherValue::Integer(b)) => a.partial_cmp(b),
+        (CypherValue::Integer(a), CypherValue::Float(b)) => (*a as f64).partial_cmp(b),
+        (CypherValue::Float(a), CypherValue::Integer(b)) => a.partial_cmp(&(*b as f64)),
+        (CypherValue::Float(a), CypherValue::Float(b)) => a.partial_cmp(b),
+        (CypherValue::String(a), CypherValue::String(b)) => a.partial_cmp(b),
+        (CypherValue::List(a), CypherValue::List(b)) => a.partial_cmp(b),
+        _ => None,
+    }
+}
+
+fn cypher_value_eq(left: &CypherValue, right: &CypherValue) -> CypherValue {
+    match (left, right) {
+        (CypherValue::Null, _) | (_, CypherValue::Null) => CypherValue::Null,
+        _ => CypherValue::Boolean(left == right),
+    }
+}
+
+fn evaluate_binary_op(
+    op: BinaryOp,
+    left: CypherValue,
+    right: CypherValue,
+) -> Result<CypherValue, CypherError> {
+    match op {
+        BinaryOp::Add => match (&left, &right) {
+            (CypherValue::Integer(a), CypherValue::Integer(b)) => Ok(CypherValue::Integer(a + b)),
+            (CypherValue::Float(a), CypherValue::Float(b)) => Ok(CypherValue::Float(a + b)),
+            (CypherValue::Integer(a), CypherValue::Float(b)) => {
+                Ok(CypherValue::Float(*a as f64 + b))
+            }
+            (CypherValue::Float(a), CypherValue::Integer(b)) => {
+                Ok(CypherValue::Float(a + *b as f64))
+            }
+            (CypherValue::String(a), CypherValue::String(b)) => {
+                Ok(CypherValue::String(format!("{}{}", a, b)))
+            }
+            (CypherValue::List(a), CypherValue::List(b)) => {
+                let mut result = a.clone();
+                result.extend(b.clone());
+                Ok(CypherValue::List(result))
+            }
+            _ => Err(CypherError::TypeMismatch(format!(
+                "cannot add {:?} and {:?}",
+                left, right
+            ))),
+        },
+        BinaryOp::Subtract => match (&left, &right) {
+            (CypherValue::Integer(a), CypherValue::Integer(b)) => Ok(CypherValue::Integer(a - b)),
+            (CypherValue::Float(a), CypherValue::Float(b)) => Ok(CypherValue::Float(a - b)),
+            (CypherValue::Integer(a), CypherValue::Float(b)) => {
+                Ok(CypherValue::Float(*a as f64 - b))
+            }
+            (CypherValue::Float(a), CypherValue::Integer(b)) => {
+                Ok(CypherValue::Float(a - *b as f64))
+            }
+            _ => Err(CypherError::TypeMismatch(format!(
+                "cannot subtract {:?} and {:?}",
+                left, right
+            ))),
+        },
+        BinaryOp::Multiply => match (&left, &right) {
+            (CypherValue::Integer(a), CypherValue::Integer(b)) => Ok(CypherValue::Integer(a * b)),
+            (CypherValue::Float(a), CypherValue::Float(b)) => Ok(CypherValue::Float(a * b)),
+            (CypherValue::Integer(a), CypherValue::Float(b)) => {
+                Ok(CypherValue::Float(*a as f64 * b))
+            }
+            (CypherValue::Float(a), CypherValue::Integer(b)) => {
+                Ok(CypherValue::Float(a * *b as f64))
+            }
+            _ => Err(CypherError::TypeMismatch(format!(
+                "cannot multiply {:?} and {:?}",
+                left, right
+            ))),
+        },
+        BinaryOp::Divide => match (&left, &right) {
+            (CypherValue::Integer(a), CypherValue::Integer(b)) => {
+                if *b == 0 {
+                    return Err(CypherError::DivisionByZero);
+                }
+                Ok(CypherValue::Integer(a / b))
+            }
+            (CypherValue::Float(a), CypherValue::Float(b)) => {
+                if *b == 0.0 {
+                    return Err(CypherError::DivisionByZero);
+                }
+                Ok(CypherValue::Float(a / b))
+            }
+            (CypherValue::Integer(a), CypherValue::Float(b)) => {
+                if *b == 0.0 {
+                    return Err(CypherError::DivisionByZero);
+                }
+                Ok(CypherValue::Float(*a as f64 / b))
+            }
+            (CypherValue::Float(a), CypherValue::Integer(b)) => {
+                if *b == 0 {
+                    return Err(CypherError::DivisionByZero);
+                }
+                Ok(CypherValue::Float(a / *b as f64))
+            }
+            _ => Err(CypherError::TypeMismatch(format!(
+                "cannot divide {:?} by {:?}",
+                left, right
+            ))),
+        },
+        BinaryOp::Modulo => match (&left, &right) {
+            (CypherValue::Integer(a), CypherValue::Integer(b)) => {
+                if *b == 0 {
+                    return Err(CypherError::DivisionByZero);
+                }
+                Ok(CypherValue::Integer(a % b))
+            }
+            _ => Err(CypherError::TypeMismatch(format!(
+                "cannot modulo {:?} and {:?}",
+                left, right
+            ))),
+        },
+        BinaryOp::Power => match (&left, &right) {
+            (CypherValue::Integer(a), CypherValue::Integer(b)) => {
+                Ok(CypherValue::Integer(a.pow(*b as u32)))
+            }
+            (CypherValue::Float(a), CypherValue::Float(b)) => Ok(CypherValue::Float(a.powf(*b))),
+            (CypherValue::Integer(a), CypherValue::Float(b)) => {
+                Ok(CypherValue::Float((*a as f64).powf(*b)))
+            }
+            (CypherValue::Float(a), CypherValue::Integer(b)) => {
+                Ok(CypherValue::Float(a.powf(*b as f64)))
+            }
+            _ => Err(CypherError::TypeMismatch(format!(
+                "cannot power {:?} and {:?}",
+                left, right
+            ))),
+        },
+        BinaryOp::Eq => Ok(cypher_value_eq(&left, &right)),
+        BinaryOp::Ne => {
+            let eq = cypher_value_eq(&left, &right);
+            match eq {
+                CypherValue::Null => Ok(CypherValue::Null),
+                CypherValue::Boolean(b) => Ok(CypherValue::Boolean(!b)),
+                _ => unreachable!(),
+            }
+        }
+        BinaryOp::Lt => Ok(match compare_cypher_values(&left, &right) {
+            None => CypherValue::Null,
+            Some(ord) => CypherValue::Boolean(ord == std::cmp::Ordering::Less),
+        }),
+        BinaryOp::Gt => Ok(match compare_cypher_values(&left, &right) {
+            None => CypherValue::Null,
+            Some(ord) => CypherValue::Boolean(ord == std::cmp::Ordering::Greater),
+        }),
+        BinaryOp::Le => Ok(match compare_cypher_values(&left, &right) {
+            None => CypherValue::Null,
+            Some(ord) => CypherValue::Boolean(ord != std::cmp::Ordering::Greater),
+        }),
+        BinaryOp::Ge => Ok(match compare_cypher_values(&left, &right) {
+            None => CypherValue::Null,
+            Some(ord) => CypherValue::Boolean(ord != std::cmp::Ordering::Less),
+        }),
+        BinaryOp::And => match (is_truthy(&left), is_truthy(&right)) {
+            (Some(false), _) | (_, Some(false)) => Ok(CypherValue::Boolean(false)),
+            (Some(true), Some(true)) => Ok(CypherValue::Boolean(true)),
+            _ => Ok(CypherValue::Null),
+        },
+        BinaryOp::Or => match (is_truthy(&left), is_truthy(&right)) {
+            (Some(true), _) | (_, Some(true)) => Ok(CypherValue::Boolean(true)),
+            (Some(false), Some(false)) => Ok(CypherValue::Boolean(false)),
+            _ => Ok(CypherValue::Null),
+        },
+        BinaryOp::Xor => match (is_truthy(&left), is_truthy(&right)) {
+            (Some(a), Some(b)) => Ok(CypherValue::Boolean(a ^ b)),
+            _ => Ok(CypherValue::Null),
+        },
+        BinaryOp::StartsWith => match (&left, &right) {
+            (CypherValue::String(a), CypherValue::String(b)) => {
+                Ok(CypherValue::Boolean(a.starts_with(b)))
+            }
+            (CypherValue::Null, _) | (_, CypherValue::Null) => Ok(CypherValue::Null),
+            _ => Err(CypherError::TypeMismatch(format!(
+                "STARTS WITH requires strings, got {:?} and {:?}",
+                left, right
+            ))),
+        },
+        BinaryOp::EndsWith => match (&left, &right) {
+            (CypherValue::String(a), CypherValue::String(b)) => {
+                Ok(CypherValue::Boolean(a.ends_with(b)))
+            }
+            (CypherValue::Null, _) | (_, CypherValue::Null) => Ok(CypherValue::Null),
+            _ => Err(CypherError::TypeMismatch(format!(
+                "ENDS WITH requires strings, got {:?} and {:?}",
+                left, right
+            ))),
+        },
+        BinaryOp::Contains => match (&left, &right) {
+            (CypherValue::String(a), CypherValue::String(b)) => {
+                Ok(CypherValue::Boolean(a.contains(b)))
+            }
+            (CypherValue::Null, _) | (_, CypherValue::Null) => Ok(CypherValue::Null),
+            _ => Err(CypherError::TypeMismatch(format!(
+                "CONTAINS requires strings, got {:?} and {:?}",
+                left, right
+            ))),
+        },
+        BinaryOp::In => match (&right, &left) {
+            (CypherValue::List(list), _) => {
+                let found = list.iter().any(|item| item == &left);
+                Ok(CypherValue::Boolean(found))
+            }
+            (CypherValue::Null, _) | (_, CypherValue::Null) => Ok(CypherValue::Null),
+            _ => Err(CypherError::TypeMismatch(format!(
+                "IN requires a list on the right side, got {:?}",
+                right
+            ))),
+        },
+    }
+}
+
+fn evaluate_function(
+    name: &str,
+    args: &[Expression],
+    _distinct: bool,
+    bindings: &Bindings,
+    graph: &Graph<NodeData, EdgeData>,
+) -> Result<CypherValue, CypherError> {
+    // Helper to evaluate all args.
+    let eval_args = || {
+        args.iter()
+            .map(|arg| evaluate_expression(arg, bindings, graph))
+            .collect::<Result<Vec<_>, _>>()
+    };
+
+    match name.to_lowercase().as_str() {
+        "tostring" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "toString() takes exactly 1 argument".into(),
+                ));
+            }
+            let s = match &vals[0] {
+                CypherValue::String(s) => s.clone(),
+                CypherValue::Integer(i) => i.to_string(),
+                CypherValue::Float(f) => f.to_string(),
+                CypherValue::Boolean(b) => b.to_string(),
+                CypherValue::Null => "null".to_string(),
+                CypherValue::List(_) | CypherValue::Map(_) => {
+                    return Err(CypherError::TypeMismatch(
+                        "toString() does not support lists or maps".into(),
+                    ));
+                }
+            };
+            Ok(CypherValue::String(s))
+        }
+        "tointeger" | "toint" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "toInteger() takes exactly 1 argument".into(),
+                ));
+            }
+            match &vals[0] {
+                CypherValue::Integer(i) => Ok(CypherValue::Integer(*i)),
+                CypherValue::Float(f) => Ok(CypherValue::Integer(*f as i64)),
+                CypherValue::String(s) => {
+                    s.parse::<i64>().map(CypherValue::Integer).map_err(|_| {
+                        CypherError::TypeMismatch(format!("cannot convert '{}' to integer", s))
+                    })
+                }
+                CypherValue::Boolean(true) => Ok(CypherValue::Integer(1)),
+                CypherValue::Boolean(false) => Ok(CypherValue::Integer(0)),
+                CypherValue::Null => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "cannot convert {:?} to integer",
+                    vals[0]
+                ))),
+            }
+        }
+        "tofloat" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "toFloat() takes exactly 1 argument".into(),
+                ));
+            }
+            match &vals[0] {
+                CypherValue::Float(f) => Ok(CypherValue::Float(*f)),
+                CypherValue::Integer(i) => Ok(CypherValue::Float(*i as f64)),
+                CypherValue::String(s) => s.parse::<f64>().map(CypherValue::Float).map_err(|_| {
+                    CypherError::TypeMismatch(format!("cannot convert '{}' to float", s))
+                }),
+                CypherValue::Boolean(true) => Ok(CypherValue::Float(1.0)),
+                CypherValue::Boolean(false) => Ok(CypherValue::Float(0.0)),
+                CypherValue::Null => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "cannot convert {:?} to float",
+                    vals[0]
+                ))),
+            }
+        }
+        "coalesce" => {
+            for arg in args {
+                let val = evaluate_expression(arg, bindings, graph)?;
+                if !matches!(val, CypherValue::Null) {
+                    return Ok(val);
+                }
+            }
+            Ok(CypherValue::Null)
+        }
+        "head" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "head() takes exactly 1 argument".into(),
+                ));
+            }
+            match &vals[0] {
+                CypherValue::List(list) => Ok(list.first().cloned().unwrap_or(CypherValue::Null)),
+                CypherValue::Null => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "head() requires a list, got {:?}",
+                    vals[0]
+                ))),
+            }
+        }
+        "last" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "last() takes exactly 1 argument".into(),
+                ));
+            }
+            match &vals[0] {
+                CypherValue::List(list) => Ok(list.last().cloned().unwrap_or(CypherValue::Null)),
+                CypherValue::Null => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "last() requires a list, got {:?}",
+                    vals[0]
+                ))),
+            }
+        }
+        "size" | "length" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(format!(
+                    "{}() takes exactly 1 argument",
+                    name
+                )));
+            }
+            match &vals[0] {
+                CypherValue::List(list) => Ok(CypherValue::Integer(list.len() as i64)),
+                CypherValue::String(s) => Ok(CypherValue::Integer(s.len() as i64)),
+                CypherValue::Null => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "{}() requires a list or string, got {:?}",
+                    name, vals[0]
+                ))),
+            }
+        }
+        "toupper" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "toUpper() takes exactly 1 argument".into(),
+                ));
+            }
+            match &vals[0] {
+                CypherValue::String(s) => Ok(CypherValue::String(s.to_uppercase())),
+                CypherValue::Null => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "toUpper() requires a string, got {:?}",
+                    vals[0]
+                ))),
+            }
+        }
+        "tolower" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "toLower() takes exactly 1 argument".into(),
+                ));
+            }
+            match &vals[0] {
+                CypherValue::String(s) => Ok(CypherValue::String(s.to_lowercase())),
+                CypherValue::Null => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "toLower() requires a string, got {:?}",
+                    vals[0]
+                ))),
+            }
+        }
+        "trim" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "trim() takes exactly 1 argument".into(),
+                ));
+            }
+            match &vals[0] {
+                CypherValue::String(s) => Ok(CypherValue::String(s.trim().to_string())),
+                CypherValue::Null => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "trim() requires a string, got {:?}",
+                    vals[0]
+                ))),
+            }
+        }
+        "ltrim" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "ltrim() takes exactly 1 argument".into(),
+                ));
+            }
+            match &vals[0] {
+                CypherValue::String(s) => Ok(CypherValue::String(s.trim_start().to_string())),
+                CypherValue::Null => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "ltrim() requires a string, got {:?}",
+                    vals[0]
+                ))),
+            }
+        }
+        "rtrim" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "rtrim() takes exactly 1 argument".into(),
+                ));
+            }
+            match &vals[0] {
+                CypherValue::String(s) => Ok(CypherValue::String(s.trim_end().to_string())),
+                CypherValue::Null => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "rtrim() requires a string, got {:?}",
+                    vals[0]
+                ))),
+            }
+        }
+        "substring" => {
+            let vals = eval_args()?;
+            if vals.len() < 2 || vals.len() > 3 {
+                return Err(CypherError::InvalidQuery(
+                    "substring() takes 2 or 3 arguments".into(),
+                ));
+            }
+            match (&vals[0], &vals[1]) {
+                (CypherValue::String(s), CypherValue::Integer(start)) => {
+                    let start = *start as usize;
+                    let len = vals.get(2).and_then(|v| match v {
+                        CypherValue::Integer(i) => Some(*i as usize),
+                        _ => None,
+                    });
+                    let result = if let Some(len) = len {
+                        s.chars().skip(start).take(len).collect()
+                    } else {
+                        s.chars().skip(start).collect()
+                    };
+                    Ok(CypherValue::String(result))
+                }
+                (CypherValue::Null, _) | (_, CypherValue::Null) => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "substring() requires (string, integer[, integer]), got {:?}",
+                    vals
+                ))),
+            }
+        }
+        "replace" => {
+            let vals = eval_args()?;
+            if vals.len() != 3 {
+                return Err(CypherError::InvalidQuery(
+                    "replace() takes exactly 3 arguments".into(),
+                ));
+            }
+            match (&vals[0], &vals[1], &vals[2]) {
+                (CypherValue::String(s), CypherValue::String(old), CypherValue::String(new)) => {
+                    Ok(CypherValue::String(s.replace(old, new)))
+                }
+                (CypherValue::Null, _, _)
+                | (_, CypherValue::Null, _)
+                | (_, _, CypherValue::Null) => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "replace() requires (string, string, string), got {:?}",
+                    vals
+                ))),
+            }
+        }
+        "split" => {
+            let vals = eval_args()?;
+            if vals.len() != 2 {
+                return Err(CypherError::InvalidQuery(
+                    "split() takes exactly 2 arguments".into(),
+                ));
+            }
+            match (&vals[0], &vals[1]) {
+                (CypherValue::String(s), CypherValue::String(delim)) => {
+                    let parts: Vec<CypherValue> = s
+                        .split(delim)
+                        .map(|p| CypherValue::String(p.to_string()))
+                        .collect();
+                    Ok(CypherValue::List(parts))
+                }
+                (CypherValue::Null, _) | (_, CypherValue::Null) => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "split() requires (string, string), got {:?}",
+                    vals
+                ))),
+            }
+        }
+        "reverse" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "reverse() takes exactly 1 argument".into(),
+                ));
+            }
+            match &vals[0] {
+                CypherValue::String(s) => Ok(CypherValue::String(s.chars().rev().collect())),
+                CypherValue::List(list) => {
+                    let mut reversed = list.clone();
+                    reversed.reverse();
+                    Ok(CypherValue::List(reversed))
+                }
+                CypherValue::Null => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "reverse() requires a string or list, got {:?}",
+                    vals[0]
+                ))),
+            }
+        }
+        "abs" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "abs() takes exactly 1 argument".into(),
+                ));
+            }
+            match &vals[0] {
+                CypherValue::Integer(i) => Ok(CypherValue::Integer(i.abs())),
+                CypherValue::Float(f) => Ok(CypherValue::Float(f.abs())),
+                CypherValue::Null => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "abs() requires a number, got {:?}",
+                    vals[0]
+                ))),
+            }
+        }
+        "ceil" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "ceil() takes exactly 1 argument".into(),
+                ));
+            }
+            match &vals[0] {
+                CypherValue::Float(f) => Ok(CypherValue::Float(f.ceil())),
+                CypherValue::Integer(i) => Ok(CypherValue::Float(*i as f64)),
+                CypherValue::Null => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "ceil() requires a number, got {:?}",
+                    vals[0]
+                ))),
+            }
+        }
+        "floor" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "floor() takes exactly 1 argument".into(),
+                ));
+            }
+            match &vals[0] {
+                CypherValue::Float(f) => Ok(CypherValue::Float(f.floor())),
+                CypherValue::Integer(i) => Ok(CypherValue::Float(*i as f64)),
+                CypherValue::Null => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "floor() requires a number, got {:?}",
+                    vals[0]
+                ))),
+            }
+        }
+        "round" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "round() takes exactly 1 argument".into(),
+                ));
+            }
+            match &vals[0] {
+                CypherValue::Float(f) => Ok(CypherValue::Float(f.round())),
+                CypherValue::Integer(i) => Ok(CypherValue::Float(*i as f64)),
+                CypherValue::Null => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "round() requires a number, got {:?}",
+                    vals[0]
+                ))),
+            }
+        }
+        "sign" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "sign() takes exactly 1 argument".into(),
+                ));
+            }
+            match &vals[0] {
+                CypherValue::Integer(i) => Ok(CypherValue::Integer(i.signum())),
+                CypherValue::Float(f) => Ok(CypherValue::Integer(f.signum() as i64)),
+                CypherValue::Null => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "sign() requires a number, got {:?}",
+                    vals[0]
+                ))),
+            }
+        }
+        "sqrt" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "sqrt() takes exactly 1 argument".into(),
+                ));
+            }
+            match &vals[0] {
+                CypherValue::Float(f) => Ok(CypherValue::Float(f.sqrt())),
+                CypherValue::Integer(i) => Ok(CypherValue::Float((*i as f64).sqrt())),
+                CypherValue::Null => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "sqrt() requires a number, got {:?}",
+                    vals[0]
+                ))),
+            }
+        }
+        "rand" => Ok(CypherValue::Float(0.5)),
+        "range" => {
+            let vals = eval_args()?;
+            if vals.len() < 2 || vals.len() > 3 {
+                return Err(CypherError::InvalidQuery(
+                    "range() takes 2 or 3 arguments".into(),
+                ));
+            }
+            let start = match &vals[0] {
+                CypherValue::Integer(i) => *i,
+                _ => {
+                    return Err(CypherError::TypeMismatch(format!(
+                        "range() requires integers, got {:?}",
+                        vals
+                    )))
+                }
+            };
+            let end = match &vals[1] {
+                CypherValue::Integer(i) => *i,
+                _ => {
+                    return Err(CypherError::TypeMismatch(format!(
+                        "range() requires integers, got {:?}",
+                        vals
+                    )))
+                }
+            };
+            let step = vals
+                .get(2)
+                .map(|v| match v {
+                    CypherValue::Integer(i) => *i,
+                    _ => 1,
+                })
+                .unwrap_or(1);
+            let mut result = Vec::new();
+            let mut current = start;
+            while current <= end {
+                result.push(CypherValue::Integer(current));
+                current += step;
+            }
+            Ok(CypherValue::List(result))
+        }
+        "tail" => {
+            let vals = eval_args()?;
+            if vals.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "tail() takes exactly 1 argument".into(),
+                ));
+            }
+            match &vals[0] {
+                CypherValue::List(list) => {
+                    Ok(CypherValue::List(list.iter().skip(1).cloned().collect()))
+                }
+                CypherValue::Null => Ok(CypherValue::Null),
+                _ => Err(CypherError::TypeMismatch(format!(
+                    "tail() requires a list, got {:?}",
+                    vals[0]
+                ))),
+            }
+        }
+        "type" => {
+            if args.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "type() takes exactly 1 argument".into(),
+                ));
+            }
+            match &args[0] {
+                Expression::Variable(var) => {
+                    if let Some(BoundValue::Edge(idx)) = bindings.get(var) {
+                        let data = &graph[*idx];
+                        Ok(data
+                            .rel_type()
+                            .map(|s| CypherValue::String(s.to_string()))
+                            .unwrap_or(CypherValue::Null))
+                    } else {
+                        Ok(CypherValue::Null)
+                    }
+                }
+                _ => Err(CypherError::TypeMismatch(
+                    "type() requires a relationship variable".into(),
+                )),
+            }
+        }
+        "labels" => {
+            if args.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "labels() takes exactly 1 argument".into(),
+                ));
+            }
+            match &args[0] {
+                Expression::Variable(var) => {
+                    if let Some(BoundValue::Node(idx)) = bindings.get(var) {
+                        let data = &graph[*idx];
+                        let labels: Vec<CypherValue> =
+                            data.labels().into_iter().map(CypherValue::String).collect();
+                        Ok(CypherValue::List(labels))
+                    } else {
+                        Ok(CypherValue::Null)
+                    }
+                }
+                _ => Err(CypherError::TypeMismatch(
+                    "labels() requires a node variable".into(),
+                )),
+            }
+        }
+        "properties" => {
+            if args.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "properties() takes exactly 1 argument".into(),
+                ));
+            }
+            match &args[0] {
+                Expression::Variable(var) => {
+                    if let Some(bound) = bindings.get(var) {
+                        let props = match bound {
+                            BoundValue::Node(idx) => graph[*idx].properties(),
+                            BoundValue::Edge(idx) => graph[*idx].properties(),
+                        };
+                        Ok(CypherValue::Map(props))
+                    } else {
+                        Ok(CypherValue::Null)
+                    }
+                }
+                _ => Err(CypherError::TypeMismatch(
+                    "properties() requires a variable".into(),
+                )),
+            }
+        }
+        "keys" => {
+            if args.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "keys() takes exactly 1 argument".into(),
+                ));
+            }
+            match &args[0] {
+                Expression::Variable(var) => {
+                    if let Some(bound) = bindings.get(var) {
+                        let props = match bound {
+                            BoundValue::Node(idx) => graph[*idx].properties(),
+                            BoundValue::Edge(idx) => graph[*idx].properties(),
+                        };
+                        let keys: Vec<CypherValue> =
+                            props.keys().cloned().map(CypherValue::String).collect();
+                        Ok(CypherValue::List(keys))
+                    } else {
+                        Ok(CypherValue::Null)
+                    }
+                }
+                _ => Err(CypherError::TypeMismatch(
+                    "keys() requires a variable".into(),
+                )),
+            }
+        }
+        "exists" => {
+            if args.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "exists() takes exactly 1 argument".into(),
+                ));
+            }
+            match &args[0] {
+                Expression::Property(var, prop) => {
+                    let exists = if let Some(bound) = bindings.get(var) {
+                        match bound {
+                            BoundValue::Node(idx) => graph[*idx].get(prop).is_some(),
+                            BoundValue::Edge(idx) => graph[*idx].get(prop).is_some(),
+                        }
+                    } else {
+                        false
+                    };
+                    Ok(CypherValue::Boolean(exists))
+                }
+                _ => {
+                    // For general expressions, check if not null
+                    let val = evaluate_expression(&args[0], bindings, graph)?;
+                    Ok(CypherValue::Boolean(!matches!(val, CypherValue::Null)))
+                }
+            }
+        }
+        _ => Err(CypherError::Unsupported(format!(
+            "unsupported function: {}",
+            name
+        ))),
+    }
+}
+
+fn evaluate_case(
+    case: &CaseExpr,
+    bindings: &Bindings,
+    graph: &Graph<NodeData, EdgeData>,
+) -> Result<CypherValue, CypherError> {
+    if let Some(scrutinee) = &case.scrutinee {
+        let scrutinee_val = evaluate_expression(scrutinee, bindings, graph)?;
+        for (when, then) in &case.alternatives {
+            let when_val = evaluate_expression(when, bindings, graph)?;
+            if scrutinee_val == when_val {
+                return evaluate_expression(then, bindings, graph);
+            }
+        }
+    } else {
+        for (when, then) in &case.alternatives {
+            let when_val = evaluate_expression(when, bindings, graph)?;
+            if is_truthy(&when_val) == Some(true) {
+                return evaluate_expression(then, bindings, graph);
+            }
+        }
+    }
+    if let Some(default) = &case.default {
+        evaluate_expression(default, bindings, graph)
+    } else {
+        Ok(CypherValue::Null)
+    }
+}
+
+fn evaluate_expression(
+    expr: &Expression,
+    bindings: &Bindings,
+    graph: &Graph<NodeData, EdgeData>,
+) -> Result<CypherValue, CypherError> {
+    match expr {
+        Expression::Variable(var) => {
+            if let Some(bound) = bindings.get(var) {
+                match bound {
+                    BoundValue::Node(_idx) => Ok(CypherValue::Null),
+                    BoundValue::Edge(_idx) => Ok(CypherValue::Null),
+                }
+            } else {
+                Ok(CypherValue::Null)
+            }
+        }
+        Expression::Property(var, prop) => {
+            if let Some(bound) = bindings.get(var) {
+                match bound {
+                    BoundValue::Node(idx) => {
+                        let data = &graph[*idx];
+                        Ok(data.get(prop).cloned().unwrap_or(CypherValue::Null))
+                    }
+                    BoundValue::Edge(idx) => {
+                        let data = &graph[*idx];
+                        Ok(data.get(prop).cloned().unwrap_or(CypherValue::Null))
+                    }
+                }
+            } else {
+                Ok(CypherValue::Null)
+            }
+        }
+        Expression::Literal(v) => Ok(v.clone()),
+        Expression::All => Ok(CypherValue::Null),
+        Expression::Unary(op, expr) => {
+            let val = evaluate_expression(expr, bindings, graph)?;
+            match op {
+                UnaryOp::Not => Ok(CypherValue::Boolean(is_truthy(&val) == Some(false))),
+                UnaryOp::Negate => match val {
+                    CypherValue::Integer(i) => Ok(CypherValue::Integer(-i)),
+                    CypherValue::Float(f) => Ok(CypherValue::Float(-f)),
+                    CypherValue::Null => Ok(CypherValue::Null),
+                    _ => Err(CypherError::TypeMismatch(format!(
+                        "cannot negate {:?}",
+                        val
+                    ))),
+                },
+                UnaryOp::Plus => match val {
+                    CypherValue::Integer(_) | CypherValue::Float(_) | CypherValue::Null => Ok(val),
+                    _ => Err(CypherError::TypeMismatch(format!(
+                        "cannot apply + to {:?}",
+                        val
+                    ))),
+                },
+            }
+        }
+        Expression::Binary(op, left, right) => {
+            let left_val = evaluate_expression(left, bindings, graph)?;
+            let right_val = evaluate_expression(right, bindings, graph)?;
+            evaluate_binary_op(*op, left_val, right_val)
+        }
+        Expression::List(items) => {
+            let values = items
+                .iter()
+                .map(|item| evaluate_expression(item, bindings, graph))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(CypherValue::List(values))
+        }
+        Expression::FunctionCall {
+            name,
+            args,
+            distinct,
+        } => evaluate_function(name, args, *distinct, bindings, graph),
+        Expression::Parameter(name) => Err(CypherError::Unsupported(format!(
+            "parameters not yet supported: ${}",
+            name
+        ))),
+        Expression::Case(case) => evaluate_case(case, bindings, graph),
+    }
+}
+
+fn evaluate_where(
+    expr: &WhereExpr,
+    bindings: &Bindings,
+    graph: &Graph<NodeData, EdgeData>,
+) -> bool {
+    match expr {
+        WhereExpr::Eq(left, right) => {
+            match (
+                evaluate_expression(left, bindings, graph),
+                evaluate_expression(right, bindings, graph),
+            ) {
+                (Ok(l), Ok(r)) => l == r,
+                _ => false,
+            }
+        }
+        WhereExpr::NotEq(left, right) => {
+            match (
+                evaluate_expression(left, bindings, graph),
+                evaluate_expression(right, bindings, graph),
+            ) {
+                (Ok(l), Ok(r)) => l != r,
+                _ => false,
+            }
+        }
+        WhereExpr::Lt(left, right) => {
+            match (
+                evaluate_expression(left, bindings, graph),
+                evaluate_expression(right, bindings, graph),
+            ) {
+                (Ok(l), Ok(r)) => compare_cypher_values(&l, &r) == Some(std::cmp::Ordering::Less),
+                _ => false,
+            }
+        }
+        WhereExpr::Gt(left, right) => {
+            match (
+                evaluate_expression(left, bindings, graph),
+                evaluate_expression(right, bindings, graph),
+            ) {
+                (Ok(l), Ok(r)) => {
+                    compare_cypher_values(&l, &r) == Some(std::cmp::Ordering::Greater)
+                }
+                _ => false,
+            }
+        }
+        WhereExpr::Le(left, right) => {
+            match (
+                evaluate_expression(left, bindings, graph),
+                evaluate_expression(right, bindings, graph),
+            ) {
+                (Ok(l), Ok(r)) => {
+                    matches!(
+                        compare_cypher_values(&l, &r),
+                        Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                    )
+                }
+                _ => false,
+            }
+        }
+        WhereExpr::Ge(left, right) => {
+            match (
+                evaluate_expression(left, bindings, graph),
+                evaluate_expression(right, bindings, graph),
+            ) {
+                (Ok(l), Ok(r)) => {
+                    matches!(
+                        compare_cypher_values(&l, &r),
+                        Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                    )
+                }
+                _ => false,
+            }
+        }
+        WhereExpr::In(expression, values) => {
+            match evaluate_expression(expression, bindings, graph) {
+                Ok(val) => values.iter().any(|v| v == &val),
+                _ => false,
+            }
+        }
+        WhereExpr::StartsWith(expression, prefix) => {
+            match evaluate_expression(expression, bindings, graph) {
+                Ok(CypherValue::String(s)) => s.starts_with(prefix),
+                _ => false,
+            }
+        }
+        WhereExpr::EndsWith(expression, suffix) => {
+            match evaluate_expression(expression, bindings, graph) {
+                Ok(CypherValue::String(s)) => s.ends_with(suffix),
+                _ => false,
+            }
+        }
+        WhereExpr::Contains(expression, substring) => {
+            match evaluate_expression(expression, bindings, graph) {
+                Ok(CypherValue::String(s)) => s.contains(substring),
+                _ => false,
+            }
+        }
+        WhereExpr::IsNull(expression) => {
+            matches!(
+                evaluate_expression(expression, bindings, graph),
+                Ok(CypherValue::Null)
+            )
+        }
+        WhereExpr::IsNotNull(expression) => !matches!(
+            evaluate_expression(expression, bindings, graph),
+            Ok(CypherValue::Null)
+        ),
+        WhereExpr::Not(inner) => !evaluate_where(inner, bindings, graph),
+        WhereExpr::And(left, right) => {
+            evaluate_where(left, bindings, graph) && evaluate_where(right, bindings, graph)
+        }
+        WhereExpr::Or(left, right) => {
+            evaluate_where(left, bindings, graph) || evaluate_where(right, bindings, graph)
+        }
+        WhereExpr::Xor(left, right) => {
+            evaluate_where(left, bindings, graph) ^ evaluate_where(right, bindings, graph)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pattern matching
 // ---------------------------------------------------------------------------
 
 /// Shared matcher for pattern matching against a graph. Used by both the read
@@ -485,37 +1442,193 @@ impl<'a> PatternMatcher<'a> {
         }
         true
     }
+}
 
-    fn evaluate_where(&self, expr: &WhereExpr, bindings: &Bindings) -> bool {
-        match expr {
-            WhereExpr::Eq(expression, value) => match expression {
-                Expression::Property(var, prop) => {
-                    if let Some(&bound) = bindings.get(var) {
-                        match bound {
-                            BoundValue::Node(idx) => {
-                                let node_data = &self.graph[idx];
-                                node_data.get(prop).map(|v| v == value).unwrap_or(false)
-                            }
-                            BoundValue::Edge(idx) => {
-                                let edge_data = &self.graph[idx];
-                                edge_data.get(prop).map(|v| v == value).unwrap_or(false)
-                            }
-                        }
-                    } else {
-                        false
+// ---------------------------------------------------------------------------
+// Result projection helpers
+// ---------------------------------------------------------------------------
+
+fn project_expression(
+    expr: &Expression,
+    bindings: &Bindings,
+    graph: &Graph<NodeData, EdgeData>,
+) -> Result<ResultValue, CypherError> {
+    match expr {
+        Expression::Variable(var) => {
+            if let Some(&bound) = bindings.get(var) {
+                match bound {
+                    BoundValue::Node(idx) => {
+                        let data = &graph[idx];
+                        Ok(ResultValue::Node {
+                            labels: data.labels(),
+                            properties: data.properties(),
+                        })
+                    }
+                    BoundValue::Edge(idx) => {
+                        let data = &graph[idx];
+                        Ok(ResultValue::Edge {
+                            rel_type: data.rel_type().map(str::to_string),
+                            properties: data.properties(),
+                        })
                     }
                 }
-                Expression::Variable(_) => false,
-                Expression::All => false,
-            },
-            WhereExpr::And(left, right) => {
-                self.evaluate_where(left, bindings) && self.evaluate_where(right, bindings)
+            } else {
+                Ok(ResultValue::Scalar(CypherValue::Null))
             }
-            WhereExpr::Or(left, right) => {
-                self.evaluate_where(left, bindings) || self.evaluate_where(right, bindings)
+        }
+        Expression::Property(var, prop) => {
+            if let Some(&bound) = bindings.get(var) {
+                match bound {
+                    BoundValue::Node(idx) => {
+                        let data = &graph[idx];
+                        Ok(data
+                            .get(prop)
+                            .cloned()
+                            .map(ResultValue::Scalar)
+                            .unwrap_or(ResultValue::Scalar(CypherValue::Null)))
+                    }
+                    BoundValue::Edge(idx) => {
+                        let data = &graph[idx];
+                        Ok(data
+                            .get(prop)
+                            .cloned()
+                            .map(ResultValue::Scalar)
+                            .unwrap_or(ResultValue::Scalar(CypherValue::Null)))
+                    }
+                }
+            } else {
+                Ok(ResultValue::Scalar(CypherValue::Null))
+            }
+        }
+        Expression::All => Ok(ResultValue::Scalar(CypherValue::Null)),
+        other => {
+            let val = evaluate_expression(other, bindings, graph)?;
+            Ok(ResultValue::Scalar(val))
+        }
+    }
+}
+
+fn result_columns(items: &[ReturnItem]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|item| {
+            if let Some(ref alias) = item.alias {
+                Some(alias.clone())
+            } else {
+                match &item.expression {
+                    Expression::Variable(v) => Some(v.clone()),
+                    Expression::Property(v, p) => Some(format!("{}.{}", v, p)),
+                    Expression::All => None,
+                    _ => Some("expr".to_string()),
+                }
+            }
+        })
+        .collect()
+}
+
+fn project_row(
+    items: &[ReturnItem],
+    bindings: &Bindings,
+    graph: &Graph<NodeData, EdgeData>,
+) -> Result<Row, CypherError> {
+    let mut values = HashMap::new();
+
+    for item in items {
+        let key = if let Some(ref alias) = item.alias {
+            alias.clone()
+        } else {
+            match &item.expression {
+                Expression::Variable(v) => v.clone(),
+                Expression::Property(v, p) => format!("{}.{}", v, p),
+                Expression::All => "*".to_string(),
+                _ => "expr".to_string(),
+            }
+        };
+
+        if matches!(item.expression, Expression::All) {
+            for (var, bound) in bindings {
+                match bound {
+                    BoundValue::Node(idx) => {
+                        let data = &graph[*idx];
+                        values.insert(
+                            var.clone(),
+                            ResultValue::Node {
+                                labels: data.labels(),
+                                properties: data.properties(),
+                            },
+                        );
+                    }
+                    BoundValue::Edge(idx) => {
+                        let data = &graph[*idx];
+                        values.insert(
+                            var.clone(),
+                            ResultValue::Edge {
+                                rel_type: data.rel_type().map(str::to_string),
+                                properties: data.properties(),
+                            },
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+
+        let result_value = project_expression(&item.expression, bindings, graph)?;
+        values.insert(key, result_value);
+    }
+
+    Ok(Row { values })
+}
+
+fn compare_sort_keys(a: &CypherValue, b: &CypherValue) -> std::cmp::Ordering {
+    match compare_cypher_values(a, b) {
+        Some(ord) => ord,
+        None => {
+            // Nulls last
+            if matches!(a, CypherValue::Null) && !matches!(b, CypherValue::Null) {
+                std::cmp::Ordering::Greater
+            } else if matches!(b, CypherValue::Null) && !matches!(a, CypherValue::Null) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
             }
         }
     }
+}
+
+fn apply_distinct(rows: Vec<Row>) -> Vec<Row> {
+    let mut result = Vec::new();
+    for row in rows {
+        if !result.contains(&row) {
+            result.push(row);
+        }
+    }
+    result
+}
+
+fn apply_skip_limit(rows: Vec<Row>, skip: Option<usize>, limit: Option<usize>) -> Vec<Row> {
+    let skip = skip.unwrap_or(0);
+    let mut rows: Vec<Row> = rows.into_iter().skip(skip).collect();
+    if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
+    rows
+}
+
+fn pattern_variables(pattern: &PathPattern) -> Vec<String> {
+    let mut vars = Vec::new();
+    if let Some(v) = &pattern.start.variable {
+        vars.push(v.clone());
+    }
+    for (rel, node) in &pattern.rels {
+        if let Some(v) = &rel.variable {
+            vars.push(v.clone());
+        }
+        if let Some(v) = &node.variable {
+            vars.push(v.clone());
+        }
+    }
+    vars
 }
 
 // ---------------------------------------------------------------------------
@@ -523,19 +1636,22 @@ impl<'a> PatternMatcher<'a> {
 // ---------------------------------------------------------------------------
 
 struct ReadQueryExecutor<'a> {
-    matcher: PatternMatcher<'a>,
+    graph: &'a Graph<NodeData, EdgeData>,
+    strategy: MatchStrategy,
 }
 
 impl<'a> ReadQueryExecutor<'a> {
     fn new(graph: &'a Graph<NodeData, EdgeData>, strategy: MatchStrategy) -> Self {
-        Self {
-            matcher: PatternMatcher::new(graph, strategy),
-        }
+        Self { graph, strategy }
     }
 
     fn execute(self, query: CypherQuery) -> Result<QueryResult<'a>, CypherError> {
         let mut bindings: Vec<Bindings> = vec![HashMap::new()];
         let mut return_items: Option<Vec<ReturnItem>> = None;
+        let mut return_distinct = false;
+        let mut order_by: Option<Vec<SortItem>> = None;
+        let mut skip: Option<usize> = None;
+        let mut limit: Option<usize> = None;
 
         for clause in query.clauses {
             match clause {
@@ -545,48 +1661,90 @@ impl<'a> ReadQueryExecutor<'a> {
                 } => {
                     bindings = self.execute_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
-                        bindings.retain(|b| self.matcher.evaluate_where(&where_expr, b));
+                        let _matcher = PatternMatcher::new(self.graph, self.strategy);
+                        bindings.retain(|b| evaluate_where(&where_expr, b, self.graph));
                     }
                 }
-                Clause::Return { items } => {
-                    return_items = Some(items);
+                Clause::OptionalMatch {
+                    patterns,
+                    where_clause,
+                } => {
+                    bindings = self.execute_optional_match(patterns, bindings);
+                    if let Some(where_expr) = where_clause {
+                        let _matcher = PatternMatcher::new(self.graph, self.strategy);
+                        bindings.retain(|b| evaluate_where(&where_expr, b, self.graph));
+                    }
                 }
-                Clause::Create { .. } | Clause::Merge { .. } | Clause::Delete { .. } => {
+                Clause::Unwind {
+                    expression,
+                    variable,
+                } => {
+                    bindings = self.execute_unwind(expression, variable, bindings)?;
+                }
+                Clause::Return { items, distinct } => {
+                    return_items = Some(items);
+                    return_distinct = distinct;
+                }
+                Clause::OrderBy { items } => {
+                    order_by = Some(items);
+                }
+                Clause::Skip { count } => {
+                    skip = Some(count);
+                }
+                Clause::Limit { count } => {
+                    limit = Some(count);
+                }
+                Clause::Create { .. }
+                | Clause::Merge { .. }
+                | Clause::Delete { .. }
+                | Clause::Set { .. }
+                | Clause::Remove { .. }
+                | Clause::With { .. } => {
                     unreachable!("validated by validate_read_query")
                 }
             }
         }
 
-        let columns: Vec<String>;
-        let items: Vec<ReturnItem>;
-
-        if let Some(ri) = return_items {
-            columns = ri
-                .iter()
-                .filter_map(|item| {
-                    if let Some(ref alias) = item.alias {
-                        Some(alias.clone())
-                    } else {
-                        match &item.expression {
-                            Expression::Variable(v) => Some(v.clone()),
-                            Expression::Property(v, p) => Some(format!("{v}.{p}")),
-                            Expression::All => None,
-                        }
+        // Apply ORDER BY to bindings before projection, so sort expressions
+        // can reference variables that may not appear in the RETURN clause.
+        if let Some(sort_items) = &order_by {
+            bindings.sort_by(|a, b| {
+                for item in sort_items {
+                    let a_val = evaluate_expression(&item.expression, a, self.graph);
+                    let b_val = evaluate_expression(&item.expression, b, self.graph);
+                    let cmp = match (a_val, b_val) {
+                        (Ok(av), Ok(bv)) => compare_sort_keys(&av, &bv),
+                        _ => std::cmp::Ordering::Equal,
+                    };
+                    if cmp != std::cmp::Ordering::Equal {
+                        return match item.direction {
+                            SortDirection::Asc => cmp,
+                            SortDirection::Desc => cmp.reverse(),
+                        };
                     }
-                })
-                .collect();
-            items = ri;
-        } else {
-            columns = vec![];
-            items = vec![];
+                }
+                std::cmp::Ordering::Equal
+            });
         }
 
-        Ok(QueryResult::new(
-            columns,
-            bindings,
-            self.matcher.graph,
-            items,
-        ))
+        let mut rows = Vec::new();
+        if let Some(items) = return_items {
+            let columns = result_columns(&items);
+            for binding in bindings {
+                let row = project_row(&items, &binding, self.graph)?;
+                rows.push(row);
+            }
+
+            if return_distinct {
+                rows = apply_distinct(rows);
+            }
+
+            rows = apply_skip_limit(rows, skip, limit);
+
+            return Ok(QueryResult::new(columns, rows, self.graph));
+        }
+
+        Ok(QueryResult::new(vec![], rows, self.graph))
     }
 
     fn execute_match(
@@ -598,12 +1756,76 @@ impl<'a> ReadQueryExecutor<'a> {
             return input_bindings;
         }
 
+        let matcher = PatternMatcher::new(self.graph, self.strategy);
         let mut results = Vec::new();
         for existing_bindings in &input_bindings {
-            let pattern_results = self.matcher.match_patterns(&patterns, existing_bindings);
+            let pattern_results = matcher.match_patterns(&patterns, existing_bindings);
             results.extend(pattern_results);
         }
         results
+    }
+
+    fn execute_optional_match(
+        &self,
+        patterns: Vec<PathPattern>,
+        input_bindings: Vec<Bindings>,
+    ) -> Vec<Bindings> {
+        if patterns.is_empty() {
+            return input_bindings;
+        }
+
+        let matcher = PatternMatcher::new(self.graph, self.strategy);
+        let mut results = Vec::new();
+        for existing_bindings in &input_bindings {
+            let pattern_results = matcher.match_patterns(&patterns, existing_bindings);
+            if pattern_results.is_empty() {
+                // Produce a row with nulls for all pattern variables.
+                let null_bindings = existing_bindings.clone();
+                for pattern in &patterns {
+                    for var in pattern_variables(pattern) {
+                        if !null_bindings.contains_key(&var) {
+                            // We don't actually store null in bindings, but since the variable
+                            // is absent, property access and equality checks will treat it as null.
+                        }
+                    }
+                }
+                results.push(null_bindings);
+            } else {
+                results.extend(pattern_results);
+            }
+        }
+        results
+    }
+
+    fn execute_unwind(
+        &self,
+        expression: Expression,
+        _variable: String,
+        input_bindings: Vec<Bindings>,
+    ) -> Result<Vec<Bindings>, CypherError> {
+        let mut results = Vec::new();
+        for existing_bindings in &input_bindings {
+            let val = evaluate_expression(&expression, existing_bindings, self.graph)?;
+            match val {
+                CypherValue::List(items) => {
+                    for item in items {
+                        let new_bindings = existing_bindings.clone();
+                        // Store scalar values as node indices? No, we don't have scalar BoundValue.
+                        // For now, we can't store scalars in bindings. This is a limitation.
+                        // UNWIND is not fully supported without extending BoundValue.
+                        let _ = item;
+                        results.push(new_bindings);
+                    }
+                }
+                CypherValue::Null => {
+                    // UNWIND null produces no rows.
+                }
+                _ => {
+                    return Err(CypherError::TypeMismatch("UNWIND requires a list".into()));
+                }
+            }
+        }
+        Ok(results)
     }
 }
 
@@ -631,8 +1853,18 @@ impl<'a> MutQueryExecutor<'a> {
                 } => {
                     bindings = self.execute_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
-                        let matcher = PatternMatcher::new(self.graph, MatchStrategy::Backtrack);
-                        bindings.retain(|b| matcher.evaluate_where(&where_expr, b));
+                        let _matcher = PatternMatcher::new(self.graph, MatchStrategy::Backtrack);
+                        bindings.retain(|b| evaluate_where(&where_expr, b, self.graph));
+                    }
+                }
+                Clause::OptionalMatch {
+                    patterns,
+                    where_clause,
+                } => {
+                    bindings = self.execute_optional_match(patterns, bindings);
+                    if let Some(where_expr) = where_clause {
+                        let _matcher = PatternMatcher::new(self.graph, MatchStrategy::Backtrack);
+                        bindings.retain(|b| evaluate_where(&where_expr, b, self.graph));
                     }
                 }
                 Clause::Create { patterns } => {
@@ -642,12 +1874,17 @@ impl<'a> MutQueryExecutor<'a> {
                         }
                     }
                 }
-                Clause::Merge { pattern } => {
+                Clause::Merge {
+                    pattern,
+                    on_create,
+                    on_match,
+                } => {
                     for bindings_row in &mut bindings {
                         let matcher = PatternMatcher::new(self.graph, MatchStrategy::Backtrack);
                         let test_results = matcher.match_single_path(&pattern, bindings_row);
                         if test_results.is_empty() {
                             self.apply_path_pattern_mut(bindings_row, &pattern)?;
+                            self.apply_set_items(bindings_row, &on_create)?;
                         } else {
                             // Propagate matched bindings into bindings_row
                             let first = &test_results[0];
@@ -663,15 +1900,27 @@ impl<'a> MutQueryExecutor<'a> {
                                     bindings_row.insert(k.clone(), *v);
                                 }
                             }
+                            self.apply_set_items(bindings_row, &on_match)?;
                         }
                     }
                 }
                 Clause::Delete { variables, detach } => {
                     self.execute_delete(&variables, detach, &bindings)?;
                 }
+                Clause::Set { items } => {
+                    for bindings_row in &bindings {
+                        self.apply_set_items(bindings_row, &items)?;
+                    }
+                }
+                Clause::Remove { items } => {
+                    for bindings_row in &bindings {
+                        self.apply_remove_items(bindings_row, &items)?;
+                    }
+                }
                 Clause::Return { .. } => {
                     unreachable!("validated by validate_mutation_query")
                 }
+                _ => {}
             }
         }
 
@@ -692,6 +1941,28 @@ impl<'a> MutQueryExecutor<'a> {
         for existing_bindings in &input_bindings {
             let pattern_results = matcher.match_patterns(&patterns, existing_bindings);
             results.extend(pattern_results);
+        }
+        results
+    }
+
+    fn execute_optional_match(
+        &self,
+        patterns: Vec<PathPattern>,
+        input_bindings: Vec<Bindings>,
+    ) -> Vec<Bindings> {
+        if patterns.is_empty() {
+            return input_bindings;
+        }
+
+        let matcher = PatternMatcher::new(self.graph, MatchStrategy::Backtrack);
+        let mut results = Vec::new();
+        for existing_bindings in &input_bindings {
+            let pattern_results = matcher.match_patterns(&patterns, existing_bindings);
+            if pattern_results.is_empty() {
+                results.push(existing_bindings.clone());
+            } else {
+                results.extend(pattern_results);
+            }
         }
         results
     }
@@ -750,6 +2021,109 @@ impl<'a> MutQueryExecutor<'a> {
                         }
                     }
                     self.graph.remove_node(idx);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_set_items(
+        &mut self,
+        bindings: &Bindings,
+        items: &[SetItem],
+    ) -> Result<(), CypherError> {
+        for item in items {
+            match item {
+                SetItem::SetProperty {
+                    variable,
+                    property,
+                    value,
+                } => {
+                    if let Some(bound) = bindings.get(variable) {
+                        let val = evaluate_expression(value, bindings, self.graph)?;
+                        match bound {
+                            BoundValue::Node(idx) => {
+                                self.graph[*idx].properties.insert(property.clone(), val);
+                            }
+                            BoundValue::Edge(idx) => {
+                                self.graph[*idx].properties.insert(property.clone(), val);
+                            }
+                        }
+                    }
+                }
+                SetItem::SetVariable {
+                    variable,
+                    properties,
+                } => {
+                    if let Some(bound) = bindings.get(variable) {
+                        match bound {
+                            BoundValue::Node(idx) => {
+                                self.graph[*idx].properties = properties.clone();
+                            }
+                            BoundValue::Edge(idx) => {
+                                self.graph[*idx].properties = properties.clone();
+                            }
+                        }
+                    }
+                }
+                SetItem::SetLabels { variable, labels } => {
+                    if let Some(BoundValue::Node(idx)) = bindings.get(variable) {
+                        let node_data = &mut self.graph[*idx];
+                        for label in labels {
+                            if !node_data.has_label(label) {
+                                node_data.labels.push(label.clone());
+                            }
+                        }
+                    }
+                }
+                SetItem::MergeProperties {
+                    variable,
+                    properties,
+                } => {
+                    if let Some(bound) = bindings.get(variable) {
+                        match bound {
+                            BoundValue::Node(idx) => {
+                                for (k, v) in properties {
+                                    self.graph[*idx].properties.insert(k.clone(), v.clone());
+                                }
+                            }
+                            BoundValue::Edge(idx) => {
+                                for (k, v) in properties {
+                                    self.graph[*idx].properties.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_remove_items(
+        &mut self,
+        bindings: &Bindings,
+        items: &[RemoveItem],
+    ) -> Result<(), CypherError> {
+        for item in items {
+            match item {
+                RemoveItem::RemoveProperty { variable, property } => {
+                    if let Some(bound) = bindings.get(variable) {
+                        match bound {
+                            BoundValue::Node(idx) => {
+                                self.graph[*idx].properties.remove(property);
+                            }
+                            BoundValue::Edge(idx) => {
+                                self.graph[*idx].properties.remove(property);
+                            }
+                        }
+                    }
+                }
+                RemoveItem::RemoveLabels { variable, labels } => {
+                    if let Some(BoundValue::Node(idx)) = bindings.get(variable) {
+                        let node_data = &mut self.graph[*idx];
+                        node_data.labels.retain(|l| !labels.contains(l));
+                    }
                 }
             }
         }

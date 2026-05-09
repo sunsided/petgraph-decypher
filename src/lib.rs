@@ -41,8 +41,9 @@ mod planner;
 pub mod query;
 
 pub use ast::{
-    Clause, CypherQuery, CypherValue, Expression, NodePattern, PathPattern, RelDirection,
-    RelPattern, ReturnItem, WhereExpr,
+    BinaryOp, CaseExpr, Clause, CypherQuery, CypherValue, Expression, NodePattern, PathPattern,
+    RelDirection, RelPattern, RelationshipLength, ReturnItem, SetItem, SortDirection, SortItem,
+    UnaryOp, WhereExpr,
 };
 pub use error::CypherError;
 pub use query::{MatchStrategy, PetgraphCypher, QueryResult, ResultValue, Row};

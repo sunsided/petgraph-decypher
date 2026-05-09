@@ -382,3 +382,474 @@ fn query_match_multiple_patterns_cartesian() {
     // 2 persons × 2 persons = 4 combinations
     assert_eq!(rows.len(), 4);
 }
+
+// ---------------------------------------------------------------------------
+// WHERE comparison operators
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_where_lt_gt() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice", age: 30})
+           CREATE (b:Person {name: "Bob", age: 25})
+           CREATE (c:Person {name: "Charlie", age: 35})"#,
+    )
+    .unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (n:Person) WHERE n.age > 25 RETURN n.name AS name"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn query_where_not_eq() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice"})
+           CREATE (b:Person {name: "Bob"})"#,
+    )
+    .unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (n:Person) WHERE n.name <> "Alice" RETURN n.name AS name"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+    if let ResultValue::Scalar(CypherValue::String(name)) = rows[0].values.get("name").unwrap() {
+        assert_eq!(name, "Bob");
+    } else {
+        panic!("expected string value");
+    }
+}
+
+#[test]
+fn query_where_le_ge() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {age: 30})
+           CREATE (b:Person {age: 25})
+           CREATE (c:Person {age: 35})"#,
+    )
+    .unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (n:Person) WHERE n.age >= 25 AND n.age <= 30 RETURN n"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// WHERE string operators
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_where_starts_with() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice"})
+           CREATE (b:Person {name: "Bob"})"#,
+    )
+    .unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (n:Person) WHERE n.name STARTS WITH "Al" RETURN n.name AS name"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn query_where_ends_with() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice"})
+           CREATE (b:Person {name: "Bob"})"#,
+    )
+    .unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (n:Person) WHERE n.name ENDS WITH "ce" RETURN n.name AS name"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn query_where_contains() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice"})
+           CREATE (b:Person {name: "Bob"})"#,
+    )
+    .unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (n:Person) WHERE n.name CONTAINS "li" RETURN n.name AS name"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// WHERE null checks
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_where_is_null() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice"})
+           CREATE (b:Person {age: 25})"#,
+    )
+    .unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (n:Person) WHERE n.name IS NULL RETURN n"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn query_where_is_not_null() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice"})
+           CREATE (b:Person {age: 25})"#,
+    )
+    .unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (n:Person) WHERE n.name IS NOT NULL RETURN n.name AS name"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// WHERE IN
+// ---------------------------------------------------------------------------
+
+// NOTE: Upstream cypher HIR bug — list literals are lowered to `Literal(Null)`,
+// so `IN ["Alice", "Bob"]` cannot be evaluated. Re-enable when upstream is fixed.
+// #[test]
+// fn query_where_in() {
+//     let g = build_graph_from_cypher(
+//         r#"CREATE (a:Person {name: "Alice"})
+//            CREATE (b:Person {name: "Bob"})
+//            CREATE (c:Person {name: "Charlie"})"#,
+//     )
+//     .unwrap();
+//
+//     let result = g
+//         .cypher(r#"MATCH (n:Person) WHERE n.name IN ["Alice", "Bob"] RETURN n.name AS name"#)
+//         .unwrap();
+//     let rows: Vec<_> = collect_rows(result);
+//     assert_eq!(rows.len(), 2);
+// }
+
+// ---------------------------------------------------------------------------
+// WHERE NOT
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_where_not() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice"})
+           CREATE (b:Person {name: "Bob"})"#,
+    )
+    .unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (n:Person) WHERE NOT n.name = "Alice" RETURN n.name AS name"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+    if let ResultValue::Scalar(CypherValue::String(name)) = rows[0].values.get("name").unwrap() {
+        assert_eq!(name, "Bob");
+    } else {
+        panic!("expected string value");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ORDER BY
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_order_by_asc() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice", age: 30})
+           CREATE (b:Person {name: "Bob", age: 25})
+           CREATE (c:Person {name: "Charlie", age: 35})"#,
+    )
+    .unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (n:Person) RETURN n.name AS name ORDER BY n.age"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 3);
+    if let ResultValue::Scalar(CypherValue::String(name)) = rows[0].values.get("name").unwrap() {
+        assert_eq!(name, "Bob");
+    } else {
+        panic!("expected string value");
+    }
+}
+
+#[test]
+fn query_order_by_desc() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice", age: 30})
+           CREATE (b:Person {name: "Bob", age: 25})
+           CREATE (c:Person {name: "Charlie", age: 35})"#,
+    )
+    .unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (n:Person) RETURN n.name AS name ORDER BY n.age DESC"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 3);
+    if let ResultValue::Scalar(CypherValue::String(name)) = rows[0].values.get("name").unwrap() {
+        assert_eq!(name, "Charlie");
+    } else {
+        panic!("expected string value");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LIMIT / SKIP
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_limit() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice"})
+           CREATE (b:Person {name: "Bob"})
+           CREATE (c:Person {name: "Charlie"})"#,
+    )
+    .unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (n:Person) RETURN n.name AS name LIMIT 2"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn query_skip() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice"})
+           CREATE (b:Person {name: "Bob"})
+           CREATE (c:Person {name: "Charlie"})"#,
+    )
+    .unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (n:Person) RETURN n.name AS name SKIP 1"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn query_skip_and_limit() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice"})
+           CREATE (b:Person {name: "Bob"})
+           CREATE (c:Person {name: "Charlie"})
+           CREATE (d:Person {name: "David"})"#,
+    )
+    .unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (n:Person) RETURN n.name AS name SKIP 1 LIMIT 2"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// DISTINCT
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_distinct() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {age: 30})
+           CREATE (b:Person {age: 30})
+           CREATE (c:Person {age: 25})"#,
+    )
+    .unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (n:Person) RETURN DISTINCT n.age AS age"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Functions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_function_tostring() {
+    let g = build_graph_from_cypher(r#"CREATE (n:Person {age: 30})"#).unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (n:Person) RETURN toString(n.age) AS s"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+    if let ResultValue::Scalar(CypherValue::String(s)) = rows[0].values.get("s").unwrap() {
+        assert_eq!(s, "30");
+    } else {
+        panic!("expected string value");
+    }
+}
+
+#[test]
+fn query_function_to_upper() {
+    let g = build_graph_from_cypher(r#"CREATE (n:Person {name: "Alice"})"#).unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (n:Person) RETURN toUpper(n.name) AS name"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+    if let ResultValue::Scalar(CypherValue::String(name)) = rows[0].values.get("name").unwrap() {
+        assert_eq!(name, "ALICE");
+    } else {
+        panic!("expected string value");
+    }
+}
+
+#[test]
+fn query_function_size() {
+    let g = build_graph_from_cypher(r#"CREATE (n:Person {name: "Alice"})"#).unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (n:Person) RETURN size(n.name) AS len"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+    if let ResultValue::Scalar(CypherValue::Integer(len)) = rows[0].values.get("len").unwrap() {
+        assert_eq!(*len, 5);
+    } else {
+        panic!("expected integer value");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OPTIONAL MATCH
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_optional_match() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,
+    )
+    .unwrap();
+
+    let result = g
+        .cypher(r#"MATCH (a:Person {name: "Alice"}) OPTIONAL MATCH (a)-[:HATES]->(b) RETURN a.name AS a_name, b.name AS b_name"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// SET / REMOVE
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_mut_set_property() {
+    let mut g = build_graph_from_cypher(r#"CREATE (n:Person {name: "Alice"})"#).unwrap();
+
+    g.cypher_mut(r#"MATCH (n:Person) SET n.age = 30"#).unwrap();
+    let result = g.cypher(r#"MATCH (n:Person) RETURN n.age AS age"#).unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+    if let ResultValue::Scalar(CypherValue::Integer(age)) = rows[0].values.get("age").unwrap() {
+        assert_eq!(*age, 30);
+    } else {
+        panic!("expected integer value");
+    }
+}
+
+#[test]
+fn query_mut_remove_property() {
+    let mut g = build_graph_from_cypher(r#"CREATE (n:Person {name: "Alice", age: 30})"#).unwrap();
+
+    g.cypher_mut(r#"MATCH (n:Person) REMOVE n.age"#).unwrap();
+    let result = g.cypher(r#"MATCH (n:Person) RETURN n.age AS age"#).unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+    if let ResultValue::Scalar(CypherValue::Null) = rows[0].values.get("age").unwrap() {
+        // expected
+    } else {
+        panic!("expected null value");
+    }
+}
+
+// NOTE: Upstream cypher parser bug — `SET n:Label` and `REMOVE n:Label` produce
+// `SetLabels` / `RemoveLabels` with an empty variable name, so the executor
+// cannot find the target node. Re-enable when upstream is fixed.
+// #[test]
+// fn query_mut_set_labels() {
+//     let mut g = build_graph_from_cypher(r#"CREATE (n:Person {name: "Alice"})"#).unwrap();
+//     g.cypher_mut(r#"MATCH (n:Person) SET n:Employee"#).unwrap();
+//     let result = g.cypher(r#"MATCH (n:Employee) RETURN n.name AS name"#).unwrap();
+//     let rows: Vec<_> = collect_rows(result);
+//     assert_eq!(rows.len(), 1);
+// }
+
+// #[test]
+// fn query_mut_remove_labels() {
+//     let mut g = build_graph_from_cypher(r#"CREATE (n:Person:Employee {name: "Alice"})"#).unwrap();
+//     g.cypher_mut(r#"MATCH (n) REMOVE n:Employee"#).unwrap();
+//     let result = g.cypher(r#"MATCH (n:Employee) RETURN n"#).unwrap();
+//     let rows: Vec<_> = collect_rows(result);
+//     assert!(rows.is_empty());
+// }
+
+// ---------------------------------------------------------------------------
+// MERGE ON CREATE / ON MATCH
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_mut_merge_on_create() {
+    let mut g: Graph<petgraph_cypher::NodeData, petgraph_cypher::EdgeData> = Graph::new();
+
+    g.cypher_mut(r#"MERGE (n:Person {name: "Alice"}) ON CREATE SET n.created = true"#)
+        .unwrap();
+    let result = g
+        .cypher(r#"MATCH (n:Person) RETURN n.created AS created"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+    if let ResultValue::Scalar(CypherValue::Boolean(created)) =
+        rows[0].values.get("created").unwrap()
+    {
+        assert!(created);
+    } else {
+        panic!("expected boolean value");
+    }
+}
+
+#[test]
+fn query_mut_merge_on_match() {
+    let mut g = build_graph_from_cypher(r#"CREATE (n:Person {name: "Alice"})"#).unwrap();
+
+    g.cypher_mut(r#"MERGE (n:Person {name: "Alice"}) ON MATCH SET n.seen = true"#)
+        .unwrap();
+    let result = g
+        .cypher(r#"MATCH (n:Person) RETURN n.seen AS seen"#)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+    if let ResultValue::Scalar(CypherValue::Boolean(seen)) = rows[0].values.get("seen").unwrap() {
+        assert!(seen);
+    } else {
+        panic!("expected boolean value");
+    }
+}

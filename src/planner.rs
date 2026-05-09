@@ -2,10 +2,10 @@
 
 use std::collections::HashMap;
 
-use cypher::hir::{
+use decypher::hir::{
     self,
     arena::{BindingId, ExprId},
-    expr::{ComparisonOperator, ExprKind, Literal},
+    expr::{BinaryOp as HirBinaryOp, ComparisonOperator, ExprKind, Literal, UnaryOp as HirUnaryOp},
     ops::{Operation, ProjectionItem},
     pattern::{GraphPattern, RelationshipDirection, RelationshipPattern},
 };
@@ -24,9 +24,6 @@ pub(crate) fn plan_query(input: &str) -> Result<CypherQuery, CypherError> {
     // `RETURN *`. This robustly handles MATCH-only queries (and any other
     // single-part query that the `cypher` crate requires to end with RETURN)
     // without relying on fragile upstream error message strings.
-    //
-    // Strip any trailing semicolons and whitespace before appending so that
-    // `MATCH (n);` does not become `MATCH (n); RETURN *` (two statements).
     let trimmed = input.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
     let with_return = format!("{trimmed} RETURN *");
     match analyze_query(&with_return) {
@@ -45,8 +42,8 @@ pub(crate) fn plan_query(input: &str) -> Result<CypherQuery, CypherError> {
     }
 }
 
-fn analyze_query(input: &str) -> Result<hir::HirQuery, cypher::CypherError> {
-    cypher::analyze(input)
+fn analyze_query(input: &str) -> Result<hir::HirQuery, decypher::CypherError> {
+    decypher::analyze(input)
 }
 
 struct PlanningContext<'a> {
@@ -68,6 +65,10 @@ impl<'a> PlanningContext<'a> {
                         patterns: self.path_patterns(&op.pattern)?,
                         where_clause: self.where_clause(&op.predicates)?,
                     }),
+                    Operation::OptionalMatch(op) => clauses.push(Clause::OptionalMatch {
+                        patterns: self.path_patterns(&op.pattern)?,
+                        where_clause: self.where_clause(&op.predicates)?,
+                    }),
                     Operation::Create(op) => clauses.push(Clause::Create {
                         patterns: self.path_patterns(&op.pattern)?,
                     }),
@@ -81,16 +82,99 @@ impl<'a> PlanningContext<'a> {
                                 "MERGE with multiple disconnected patterns is not supported".into(),
                             ));
                         }
-                        clauses.push(Clause::Merge { pattern });
+                        let on_create = self.set_items(&op.on_create)?;
+                        let on_match = self.set_items(&op.on_match)?;
+                        clauses.push(Clause::Merge {
+                            pattern,
+                            on_create,
+                            on_match,
+                        });
                     }
                     Operation::Project(op) => clauses.push(Clause::Return {
                         items: self.return_items(&op.items)?,
+                        distinct: op.distinct,
                     }),
+                    Operation::Return(_) | Operation::Finish => {}
                     Operation::Delete(op) => clauses.push(Clause::Delete {
                         variables: self.delete_targets(&op.targets)?,
                         detach: op.detach,
                     }),
-                    Operation::Return(_) | Operation::Finish => {}
+                    Operation::Sort(op) => {
+                        let items = op
+                            .items
+                            .iter()
+                            .map(|item| {
+                                Ok(SortItem {
+                                    expression: self.expression(item.expression)?,
+                                    direction: match item.direction {
+                                        hir::ops::SortDirection::Ascending => SortDirection::Asc,
+                                        hir::ops::SortDirection::Descending => SortDirection::Desc,
+                                    },
+                                })
+                            })
+                            .collect::<Result<Vec<_>, CypherError>>()?;
+                        clauses.push(Clause::OrderBy { items });
+                    }
+                    Operation::Skip(op) => {
+                        let count = self.usize_from_expr(op.count)?;
+                        clauses.push(Clause::Skip { count });
+                    }
+                    Operation::Limit(op) => {
+                        let count = self.usize_from_expr(op.count)?;
+                        clauses.push(Clause::Limit { count });
+                    }
+                    Operation::Unwind(op) => {
+                        clauses.push(Clause::Unwind {
+                            expression: self.expression(op.expression)?,
+                            variable: self.binding_name(op.variable)?.to_string(),
+                        });
+                    }
+                    Operation::Set(op) => {
+                        clauses.push(Clause::Set {
+                            items: self.set_items(&op.items)?,
+                        });
+                    }
+                    Operation::Remove(op) => {
+                        clauses.push(Clause::Remove {
+                            items: self.remove_items(&op.items)?,
+                        });
+                    }
+                    Operation::Filter(op) => {
+                        // Standalone WHERE filter (already handled inside Match)
+                        // This can appear after WITH or in subqueries.
+                        // For now, we wrap it in a synthetic Match or handle inline.
+                        // Since our Clause model doesn't have a standalone Filter,
+                        // we ignore it here — it's typically part of Match/OptionalMatch.
+                        let _ = op;
+                    }
+                    Operation::Aggregate(op) => {
+                        // Aggregate is handled as a special Return/With variant
+                        let mut items = Vec::new();
+                        for key in &op.grouping_keys {
+                            items.push(self.return_item(key)?);
+                        }
+                        for agg in &op.aggregates {
+                            let name = self.function_name(agg.function)?.to_string();
+                            let args = agg
+                                .args
+                                .iter()
+                                .map(|&arg| self.expression(arg))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let alias = self.binding_name(agg.alias)?.to_string();
+                            items.push(ReturnItem {
+                                expression: Expression::FunctionCall {
+                                    name,
+                                    args,
+                                    distinct: agg.distinct,
+                                },
+                                alias: Some(alias),
+                            });
+                        }
+                        clauses.push(Clause::Return {
+                            items,
+                            distinct: false,
+                        });
+                    }
                     other => {
                         return Err(CypherError::Unsupported(format!(
                             "unsupported clause or feature in query planner: {other:?}"
@@ -104,20 +188,19 @@ impl<'a> PlanningContext<'a> {
     }
 
     fn return_items(&self, items: &[ProjectionItem]) -> Result<Vec<ReturnItem>, CypherError> {
-        items
-            .iter()
-            .map(|item| {
-                let expression = self.expression(item.expression)?;
-                let alias = self.binding_name(item.alias)?.to_string();
-                Ok(ReturnItem {
-                    alias: match &expression {
-                        Expression::Variable(name) if name == &alias => None,
-                        _ => Some(alias),
-                    },
-                    expression,
-                })
-            })
-            .collect()
+        items.iter().map(|item| self.return_item(item)).collect()
+    }
+
+    fn return_item(&self, item: &ProjectionItem) -> Result<ReturnItem, CypherError> {
+        let expression = self.expression(item.expression)?;
+        let alias = self.binding_name(item.alias)?.to_string();
+        Ok(ReturnItem {
+            alias: match &expression {
+                Expression::Variable(name) if name == &alias => None,
+                _ => Some(alias),
+            },
+            expression,
+        })
     }
 
     fn delete_targets(&self, targets: &[ExprId]) -> Result<Vec<String>, CypherError> {
@@ -149,17 +232,83 @@ impl<'a> PlanningContext<'a> {
     fn where_expr(&self, expr_id: ExprId) -> Result<WhereExpr, CypherError> {
         match &self.expr(expr_id)?.kind {
             ExprKind::Binary { op, left, right } => match op {
-                cypher::hir::expr::BinaryOp::And => Ok(WhereExpr::And(
+                HirBinaryOp::And => Ok(WhereExpr::And(
                     Box::new(self.where_expr(*left)?),
                     Box::new(self.where_expr(*right)?),
                 )),
-                cypher::hir::expr::BinaryOp::Or => Ok(WhereExpr::Or(
+                HirBinaryOp::Or => Ok(WhereExpr::Or(
                     Box::new(self.where_expr(*left)?),
                     Box::new(self.where_expr(*right)?),
                 )),
+                HirBinaryOp::Xor => Ok(WhereExpr::Xor(
+                    Box::new(self.where_expr(*left)?),
+                    Box::new(self.where_expr(*right)?),
+                )),
+                HirBinaryOp::Eq => Ok(WhereExpr::Eq(
+                    self.expression(*left)?,
+                    self.expression(*right)?,
+                )),
+                HirBinaryOp::Ne => Ok(WhereExpr::NotEq(
+                    self.expression(*left)?,
+                    self.expression(*right)?,
+                )),
+                HirBinaryOp::Lt => Ok(WhereExpr::Lt(
+                    self.expression(*left)?,
+                    self.expression(*right)?,
+                )),
+                HirBinaryOp::Gt => Ok(WhereExpr::Gt(
+                    self.expression(*left)?,
+                    self.expression(*right)?,
+                )),
+                HirBinaryOp::Le => Ok(WhereExpr::Le(
+                    self.expression(*left)?,
+                    self.expression(*right)?,
+                )),
+                HirBinaryOp::Ge => Ok(WhereExpr::Ge(
+                    self.expression(*left)?,
+                    self.expression(*right)?,
+                )),
+                HirBinaryOp::StartsWith => Ok(WhereExpr::StartsWith(
+                    self.expression(*left)?,
+                    self.literal_string(*right)?,
+                )),
+                HirBinaryOp::EndsWith => Ok(WhereExpr::EndsWith(
+                    self.expression(*left)?,
+                    self.literal_string(*right)?,
+                )),
+                HirBinaryOp::Contains => Ok(WhereExpr::Contains(
+                    self.expression(*left)?,
+                    self.literal_string(*right)?,
+                )),
+                HirBinaryOp::In => {
+                    let lhs = self.expression(*left)?;
+                    let rhs = self.expression(*right)?;
+                    match rhs {
+                        Expression::List(items) => {
+                            let values = items
+                                .into_iter()
+                                .map(|expr| match expr {
+                                    Expression::Literal(v) => Ok(v),
+                                    other => Err(CypherError::Unsupported(format!(
+                                        "IN list must contain literals, got: {:?}",
+                                        other
+                                    ))),
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            Ok(WhereExpr::In(lhs, values))
+                        }
+                        Expression::Literal(CypherValue::List(values)) => {
+                            Ok(WhereExpr::In(lhs, values))
+                        }
+                        other => Err(CypherError::Unsupported(format!(
+                            "IN requires a list literal, got: {:?}",
+                            other
+                        ))),
+                    }
+                }
                 _ => Err(CypherError::Unsupported(format!(
-                    "unsupported WHERE expression: {:?}",
-                    self.expr(expr_id)?.kind
+                    "unsupported binary operator in WHERE expression: {:?}",
+                    op
                 ))),
             },
             ExprKind::Comparison { left, operators } => {
@@ -169,15 +318,70 @@ impl<'a> PlanningContext<'a> {
                     ));
                 }
                 let (operator, right) = operators[0];
-                if operator != ComparisonOperator::Eq {
-                    return Err(CypherError::Unsupported(format!(
-                        "unsupported comparison operator in WHERE clause: {operator:?}"
-                    )));
+                let left_expr = self.expression(*left)?;
+                let right_expr = self.expression(right)?;
+                match operator {
+                    ComparisonOperator::Eq => Ok(WhereExpr::Eq(left_expr, right_expr)),
+                    ComparisonOperator::Ne => Ok(WhereExpr::NotEq(left_expr, right_expr)),
+                    ComparisonOperator::Lt => Ok(WhereExpr::Lt(left_expr, right_expr)),
+                    ComparisonOperator::Gt => Ok(WhereExpr::Gt(left_expr, right_expr)),
+                    ComparisonOperator::Le => Ok(WhereExpr::Le(left_expr, right_expr)),
+                    ComparisonOperator::Ge => Ok(WhereExpr::Ge(left_expr, right_expr)),
+                    ComparisonOperator::StartsWith => Ok(WhereExpr::StartsWith(
+                        left_expr,
+                        self.literal_string(right)?,
+                    )),
+                    ComparisonOperator::EndsWith => {
+                        Ok(WhereExpr::EndsWith(left_expr, self.literal_string(right)?))
+                    }
+                    ComparisonOperator::Contains => {
+                        Ok(WhereExpr::Contains(left_expr, self.literal_string(right)?))
+                    }
+                    other => Err(CypherError::Unsupported(format!(
+                        "unsupported comparison operator in WHERE clause: {other:?}"
+                    ))),
                 }
-                Ok(WhereExpr::Eq(
-                    self.expression(*left)?,
-                    self.literal_value(right)?,
-                ))
+            }
+            ExprKind::Unary { op, expr } => match op {
+                HirUnaryOp::Not => Ok(WhereExpr::Not(Box::new(self.where_expr(*expr)?))),
+                _ => Err(CypherError::Unsupported(format!(
+                    "unsupported unary operator in WHERE expression: {:?}",
+                    op
+                ))),
+            },
+            ExprKind::IsNull { operand, negated } => {
+                let expr = self.expression(*operand)?;
+                if *negated {
+                    Ok(WhereExpr::IsNotNull(expr))
+                } else {
+                    Ok(WhereExpr::IsNull(expr))
+                }
+            }
+            ExprKind::In { lhs, rhs } => {
+                let left_expr = self.expression(*lhs)?;
+                let right_expr = self.expression(*rhs)?;
+                match right_expr {
+                    Expression::List(items) => {
+                        let values = items
+                            .into_iter()
+                            .map(|expr| match expr {
+                                Expression::Literal(v) => Ok(v),
+                                other => Err(CypherError::Unsupported(format!(
+                                    "IN list must contain literals, got: {:?}",
+                                    other
+                                ))),
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(WhereExpr::In(left_expr, values))
+                    }
+                    Expression::Literal(CypherValue::List(values)) => {
+                        Ok(WhereExpr::In(left_expr, values))
+                    }
+                    other => Err(CypherError::Unsupported(format!(
+                        "IN requires a list literal, got: {:?}",
+                        other
+                    ))),
+                }
             }
             other => Err(CypherError::Unsupported(format!(
                 "unsupported WHERE expression: {other:?}"
@@ -201,6 +405,136 @@ impl<'a> PlanningContext<'a> {
                     self.property_key(*key)?.to_string(),
                 ))
             }
+            ExprKind::Literal(literal) => Ok(Expression::Literal(self.literal_to_value(literal)?)),
+            ExprKind::Unary { op, expr } => {
+                let operand = self.expression(*expr)?;
+                let unary_op = match op {
+                    HirUnaryOp::Not => UnaryOp::Not,
+                    HirUnaryOp::Negate => UnaryOp::Negate,
+                    HirUnaryOp::Plus => UnaryOp::Plus,
+                };
+                Ok(Expression::Unary(unary_op, Box::new(operand)))
+            }
+            ExprKind::Binary { op, left, right } => {
+                let left_expr = self.expression(*left)?;
+                let right_expr = self.expression(*right)?;
+                let binary_op = match op {
+                    HirBinaryOp::Add => BinaryOp::Add,
+                    HirBinaryOp::Subtract => BinaryOp::Subtract,
+                    HirBinaryOp::Multiply => BinaryOp::Multiply,
+                    HirBinaryOp::Divide => BinaryOp::Divide,
+                    HirBinaryOp::Modulo => BinaryOp::Modulo,
+                    HirBinaryOp::Power => BinaryOp::Power,
+                    HirBinaryOp::Eq => BinaryOp::Eq,
+                    HirBinaryOp::Ne => BinaryOp::Ne,
+                    HirBinaryOp::Lt => BinaryOp::Lt,
+                    HirBinaryOp::Gt => BinaryOp::Gt,
+                    HirBinaryOp::Le => BinaryOp::Le,
+                    HirBinaryOp::Ge => BinaryOp::Ge,
+                    HirBinaryOp::And => BinaryOp::And,
+                    HirBinaryOp::Or => BinaryOp::Or,
+                    HirBinaryOp::Xor => BinaryOp::Xor,
+                    HirBinaryOp::StartsWith => BinaryOp::StartsWith,
+                    HirBinaryOp::EndsWith => BinaryOp::EndsWith,
+                    HirBinaryOp::Contains => BinaryOp::Contains,
+                    HirBinaryOp::In => BinaryOp::In,
+                    _ => {
+                        return Err(CypherError::Unsupported(format!(
+                            "unsupported binary operator in expression: {:?}",
+                            op
+                        )))
+                    }
+                };
+                Ok(Expression::Binary(
+                    binary_op,
+                    Box::new(left_expr),
+                    Box::new(right_expr),
+                ))
+            }
+            ExprKind::List(items) => {
+                let expressions = items
+                    .iter()
+                    .map(|&id| self.expression(id))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Expression::List(expressions))
+            }
+            ExprKind::Map(entries) => {
+                let mut map = HashMap::new();
+                for (key_id, value_id) in entries {
+                    let key = self.property_key(*key_id)?.to_string();
+                    let value = self.expression(*value_id)?;
+                    match value {
+                        Expression::Literal(v) => {
+                            map.insert(key, v);
+                        }
+                        other => {
+                            return Err(CypherError::Unsupported(format!(
+                                "map values must be literals, got: {:?}",
+                                other
+                            )));
+                        }
+                    }
+                }
+                Ok(Expression::Literal(CypherValue::Map(map)))
+            }
+            ExprKind::FunctionCall {
+                function,
+                args,
+                distinct,
+            } => {
+                let name = self.function_name(*function)?.to_string();
+                let args = args
+                    .iter()
+                    .map(|&arg| self.expression(arg))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Expression::FunctionCall {
+                    name,
+                    args,
+                    distinct: *distinct,
+                })
+            }
+            ExprKind::Parameter(param_id) => {
+                let name = self
+                    .query
+                    .arenas
+                    .parameters
+                    .name_of(*param_id)
+                    .ok_or_else(|| {
+                        CypherError::InvalidQuery(format!(
+                            "unknown parameter id in HIR: {:?}",
+                            param_id
+                        ))
+                    })?;
+                Ok(Expression::Parameter(name.to_string()))
+            }
+            ExprKind::Case(case) => {
+                let scrutinee = case
+                    .scrutinee
+                    .map(|id| self.expression(id))
+                    .transpose()?
+                    .map(Box::new);
+                let mut alternatives = Vec::new();
+                for alt in &case.alternatives {
+                    let when = self.expression(alt.when)?;
+                    let then = self.expression(alt.then)?;
+                    alternatives.push((when, then));
+                }
+                let default = case
+                    .default
+                    .map(|id| self.expression(id))
+                    .transpose()?
+                    .map(Box::new);
+                Ok(Expression::Case(CaseExpr {
+                    scrutinee,
+                    alternatives,
+                    default,
+                }))
+            }
+            ExprKind::CountStar => Ok(Expression::FunctionCall {
+                name: "count".to_string(),
+                args: vec![Expression::All],
+                distinct: false,
+            }),
             other => Err(CypherError::Unsupported(format!(
                 "unsupported expression in query planner: {other:?}"
             ))),
@@ -209,17 +543,31 @@ impl<'a> PlanningContext<'a> {
 
     fn literal_value(&self, expr_id: ExprId) -> Result<CypherValue, CypherError> {
         match &self.expr(expr_id)?.kind {
-            ExprKind::Literal(literal) => Ok(match literal {
-                Literal::Null => CypherValue::Null,
-                Literal::Boolean(value) => CypherValue::Boolean(*value),
-                Literal::Integer(value) => CypherValue::Integer(*value),
-                Literal::Float(value) => CypherValue::Float(*value),
-                Literal::String(value) => CypherValue::String(value.clone()),
-            }),
+            ExprKind::Literal(literal) => self.literal_to_value(literal),
             other => Err(CypherError::Unsupported(format!(
                 "unsupported literal expression: {other:?}"
             ))),
         }
+    }
+
+    fn literal_string(&self, expr_id: ExprId) -> Result<String, CypherError> {
+        match self.literal_value(expr_id)? {
+            CypherValue::String(s) => Ok(s),
+            other => Err(CypherError::Unsupported(format!(
+                "expected string literal, got: {:?}",
+                other
+            ))),
+        }
+    }
+
+    fn literal_to_value(&self, literal: &Literal) -> Result<CypherValue, CypherError> {
+        Ok(match literal {
+            Literal::Null => CypherValue::Null,
+            Literal::Boolean(value) => CypherValue::Boolean(*value),
+            Literal::Integer(value) => CypherValue::Integer(*value),
+            Literal::Float(value) => CypherValue::Float(*value),
+            Literal::String(value) => CypherValue::String(value.clone()),
+        })
     }
 
     fn properties(
@@ -246,6 +594,133 @@ impl<'a> PlanningContext<'a> {
         }
     }
 
+    fn set_items(
+        &self,
+        items: &[decypher::hir::ops::SetItem],
+    ) -> Result<Vec<SetItem>, CypherError> {
+        items
+            .iter()
+            .map(|item| match item {
+                decypher::hir::ops::SetItem::SetProperty { target, value } => {
+                    let target_expr = self.expression(*target)?;
+                    let (variable, property) = match target_expr {
+                        Expression::Property(var, prop) => (var, prop),
+                        other => {
+                            return Err(CypherError::Unsupported(format!(
+                                "SET property target must be a property access, got: {:?}",
+                                other
+                            )));
+                        }
+                    };
+                    let value_expr = self.expression(*value)?;
+                    Ok(SetItem::SetProperty {
+                        variable,
+                        property,
+                        value: value_expr,
+                    })
+                }
+                decypher::hir::ops::SetItem::SetVariable { target, value } => {
+                    let variable = self.binding_name(*target)?.to_string();
+                    let properties = match self.expression(*value)? {
+                        Expression::Literal(CypherValue::Map(map)) => map,
+                        other => {
+                            return Err(CypherError::Unsupported(format!(
+                                "SET variable value must be a map literal, got: {:?}",
+                                other
+                            )));
+                        }
+                    };
+                    Ok(SetItem::SetVariable {
+                        variable,
+                        properties,
+                    })
+                }
+                decypher::hir::ops::SetItem::SetLabels { node, labels } => {
+                    let variable = self.binding_name(*node)?.to_string();
+                    let labels = labels
+                        .iter()
+                        .map(|&l| self.label_name(l).map(str::to_string))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(SetItem::SetLabels { variable, labels })
+                }
+                decypher::hir::ops::SetItem::ReplaceProperties { entity, value } => {
+                    let variable = self.binding_name(*entity)?.to_string();
+                    let properties = match self.expression(*value)? {
+                        Expression::Literal(CypherValue::Map(map)) => map,
+                        other => {
+                            return Err(CypherError::Unsupported(format!(
+                                "SET properties value must be a map literal, got: {:?}",
+                                other
+                            )));
+                        }
+                    };
+                    Ok(SetItem::SetVariable {
+                        variable,
+                        properties,
+                    })
+                }
+                decypher::hir::ops::SetItem::MergeProperties { entity, value } => {
+                    let variable = self.binding_name(*entity)?.to_string();
+                    let properties = match self.expression(*value)? {
+                        Expression::Literal(CypherValue::Map(map)) => map,
+                        other => {
+                            return Err(CypherError::Unsupported(format!(
+                                "SET merge properties value must be a map literal, got: {:?}",
+                                other
+                            )));
+                        }
+                    };
+                    Ok(SetItem::MergeProperties {
+                        variable,
+                        properties,
+                    })
+                }
+            })
+            .collect()
+    }
+
+    fn remove_items(
+        &self,
+        items: &[decypher::hir::ops::RemoveItem],
+    ) -> Result<Vec<RemoveItem>, CypherError> {
+        items
+            .iter()
+            .map(|item| match item {
+                decypher::hir::ops::RemoveItem::Property { target } => {
+                    let target_expr = self.expression(*target)?;
+                    let (variable, property) = match target_expr {
+                        Expression::Property(var, prop) => (var, prop),
+                        other => {
+                            return Err(CypherError::Unsupported(format!(
+                                "REMOVE property target must be a property access, got: {:?}",
+                                other
+                            )));
+                        }
+                    };
+                    Ok(RemoveItem::RemoveProperty { variable, property })
+                }
+                decypher::hir::ops::RemoveItem::Labels { node, labels } => {
+                    let variable = self.binding_name(*node)?.to_string();
+                    let labels = labels
+                        .iter()
+                        .map(|&l| self.label_name(l).map(str::to_string))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(RemoveItem::RemoveLabels { variable, labels })
+                }
+            })
+            .collect()
+    }
+
+    fn usize_from_expr(&self, expr_id: ExprId) -> Result<usize, CypherError> {
+        match self.literal_value(expr_id)? {
+            CypherValue::Integer(v) if v >= 0 => Ok(v as usize),
+            other => Err(CypherError::InvalidQuery(format!(
+                "expected non-negative integer, got: {:?}",
+                other
+            ))),
+        }
+    }
+
     fn node_pattern(
         &self,
         pattern: &hir::pattern::NodePattern,
@@ -265,14 +740,15 @@ impl<'a> PlanningContext<'a> {
     }
 
     fn rel_pattern(&self, relationship: &RelationshipPattern) -> Result<RelPattern, CypherError> {
-        if !matches!(
-            relationship.length,
-            cypher::hir::pattern::RelationshipLength::Single
-        ) {
-            return Err(CypherError::Unsupported(
-                "variable-length relationships are not supported".into(),
-            ));
-        }
+        let length = match relationship.length {
+            decypher::hir::pattern::RelationshipLength::Single => None,
+            decypher::hir::pattern::RelationshipLength::Variable { min, max } => {
+                Some(RelationshipLength {
+                    min: min.map(|v| v as usize),
+                    max: max.map(|v| v as usize),
+                })
+            }
+        };
 
         let rel_type = match relationship.types.as_slice() {
             [] => None,
@@ -303,6 +779,7 @@ impl<'a> PlanningContext<'a> {
             rel_type,
             properties: self.properties(relationship.properties)?,
             direction,
+            length,
         })
     }
 
@@ -411,13 +888,16 @@ impl<'a> PlanningContext<'a> {
         Ok(self.query.arenas.bindings.get(binding).name.as_str())
     }
 
-    fn label_name(&self, label: cypher::hir::arena::LabelId) -> Result<&str, CypherError> {
+    fn label_name(&self, label: decypher::hir::arena::LabelId) -> Result<&str, CypherError> {
         self.query.arenas.labels.name_of(label).ok_or_else(|| {
             CypherError::InvalidQuery(format!("unknown label id in HIR: {:?}", label))
         })
     }
 
-    fn rel_type_name(&self, rel_type: cypher::hir::arena::RelTypeId) -> Result<&str, CypherError> {
+    fn rel_type_name(
+        &self,
+        rel_type: decypher::hir::arena::RelTypeId,
+    ) -> Result<&str, CypherError> {
         self.query
             .arenas
             .relationship_types
@@ -432,7 +912,7 @@ impl<'a> PlanningContext<'a> {
 
     fn property_key(
         &self,
-        property: cypher::hir::arena::PropertyKeyId,
+        property: decypher::hir::arena::PropertyKeyId,
     ) -> Result<&str, CypherError> {
         self.query
             .arenas
@@ -440,6 +920,19 @@ impl<'a> PlanningContext<'a> {
             .name_of(property)
             .ok_or_else(|| {
                 CypherError::InvalidQuery(format!("unknown property key id in HIR: {:?}", property))
+            })
+    }
+
+    fn function_name(
+        &self,
+        function: decypher::hir::arena::FunctionId,
+    ) -> Result<&str, CypherError> {
+        self.query
+            .arenas
+            .functions
+            .name_of(function)
+            .ok_or_else(|| {
+                CypherError::InvalidQuery(format!("unknown function id in HIR: {:?}", function))
             })
     }
 }

@@ -26,7 +26,7 @@ pub(crate) fn build_graph(query: CypherQuery) -> Result<Graph<NodeData, EdgeData
                     apply_path_pattern(&mut graph, &mut var_map, &pattern);
                 }
             }
-            Clause::Merge { pattern } => {
+            Clause::Merge { pattern, .. } => {
                 apply_path_pattern(&mut graph, &mut var_map, &pattern);
             }
             // MATCH, RETURN, DELETE do not create nodes/edges when building a
