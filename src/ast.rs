@@ -41,11 +41,13 @@ impl std::fmt::Display for CypherValue {
             }
             CypherValue::Map(entries) => {
                 write!(f, "{{")?;
-                for (i, (k, v)) in entries.iter().enumerate() {
+                let mut keys: Vec<_> = entries.keys().collect();
+                keys.sort();
+                for (i, k) in keys.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}: {}", k, v)?;
+                    write!(f, "{}: {}", k, entries.get(*k).unwrap())?;
                 }
                 write!(f, "}}")
             }

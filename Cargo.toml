@@ -1,10 +1,10 @@
 [package]
-name = "petgraph-cypher"
+name = "petgraph-decypher"
 version = "0.1.0"
 edition = "2024"
 description = "Build petgraph graphs from OpenCypher queries"
 license = "EUPL-1.2 OR MIT OR Apache-2.0"
-repository = "https://github.com/sunsided/petgraph-cypher"
+repository = "https://github.com/sunsided/petgraph-decypher"
 readme = "README.md"
 keywords = ["petgraph", "cypher", "opencypher", "graph"]
 categories = ["data-structures"]

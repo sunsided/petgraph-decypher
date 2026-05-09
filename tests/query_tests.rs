@@ -1,7 +1,7 @@
 //! Integration tests for the query execution engine.
 
 use petgraph::Graph;
-use petgraph_cypher::{
+use petgraph_decypher::{
     CypherValue, PetgraphCypher, QueryResult, ResultValue, Row, build_graph_from_cypher,
 };
 
@@ -202,7 +202,7 @@ fn query_columns() {
 
 #[test]
 fn query_empty_graph() {
-    let g: Graph<petgraph_cypher::NodeData, petgraph_cypher::EdgeData> = Graph::new();
+    let g: Graph<petgraph_decypher::NodeData, petgraph_decypher::EdgeData> = Graph::new();
 
     let result = g.cypher("MATCH (n) RETURN n").unwrap();
     let rows: Vec<_> = collect_rows(result);
@@ -215,7 +215,7 @@ fn query_empty_graph() {
 
 #[test]
 fn query_mut_create_single_node() {
-    let mut g: Graph<petgraph_cypher::NodeData, petgraph_cypher::EdgeData> = Graph::new();
+    let mut g: Graph<petgraph_decypher::NodeData, petgraph_decypher::EdgeData> = Graph::new();
 
     g.cypher_mut(r#"CREATE (n:Person {name: "Alice"})"#)
         .unwrap();
@@ -224,7 +224,7 @@ fn query_mut_create_single_node() {
 
 #[test]
 fn query_mut_create_two_nodes_with_edge() {
-    let mut g: Graph<petgraph_cypher::NodeData, petgraph_cypher::EdgeData> = Graph::new();
+    let mut g: Graph<petgraph_decypher::NodeData, petgraph_decypher::EdgeData> = Graph::new();
 
     g.cypher_mut(r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#)
         .unwrap();
@@ -234,7 +234,7 @@ fn query_mut_create_two_nodes_with_edge() {
 
 #[test]
 fn query_mut_create_multiple_clauses() {
-    let mut g: Graph<petgraph_cypher::NodeData, petgraph_cypher::EdgeData> = Graph::new();
+    let mut g: Graph<petgraph_decypher::NodeData, petgraph_decypher::EdgeData> = Graph::new();
 
     g.cypher_mut(r#"CREATE (a:Person {name: "Alice"})"#)
         .unwrap();
@@ -280,7 +280,7 @@ fn query_mut_detach_delete() {
 
 #[test]
 fn query_mut_merge_creates_if_not_found() {
-    let mut g: Graph<petgraph_cypher::NodeData, petgraph_cypher::EdgeData> = Graph::new();
+    let mut g: Graph<petgraph_decypher::NodeData, petgraph_decypher::EdgeData> = Graph::new();
 
     g.cypher_mut(r#"MERGE (n:Person {name: "Alice"})"#).unwrap();
     assert_eq!(g.node_count(), 1);
@@ -302,7 +302,7 @@ fn query_mut_merge_does_not_duplicate() {
 
 #[test]
 fn query_cypher_rejects_create() {
-    let g: Graph<petgraph_cypher::NodeData, petgraph_cypher::EdgeData> = Graph::new();
+    let g: Graph<petgraph_decypher::NodeData, petgraph_decypher::EdgeData> = Graph::new();
 
     let result = g.cypher("CREATE (n:Person) RETURN n");
     assert!(result.is_err());
@@ -310,7 +310,7 @@ fn query_cypher_rejects_create() {
 
 #[test]
 fn query_cypher_rejects_delete() {
-    let g: Graph<petgraph_cypher::NodeData, petgraph_cypher::EdgeData> = Graph::new();
+    let g: Graph<petgraph_decypher::NodeData, petgraph_decypher::EdgeData> = Graph::new();
 
     let result = g.cypher("MATCH (n) DELETE n");
     assert!(result.is_err());
@@ -318,7 +318,7 @@ fn query_cypher_rejects_delete() {
 
 #[test]
 fn query_cypher_mut_rejects_return_clause() {
-    let mut g: Graph<petgraph_cypher::NodeData, petgraph_cypher::EdgeData> = Graph::new();
+    let mut g: Graph<petgraph_decypher::NodeData, petgraph_decypher::EdgeData> = Graph::new();
 
     let result = g.cypher_mut("CREATE (n:Person {name: \"Alice\"}) RETURN n");
     assert!(result.is_err());
@@ -330,7 +330,7 @@ fn query_cypher_mut_rejects_return_clause() {
 
 #[test]
 fn query_with_strategy_backtrack() {
-    use petgraph_cypher::MatchStrategy;
+    use petgraph_decypher::MatchStrategy;
 
     let g = build_graph_from_cypher(
         r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,
@@ -349,7 +349,7 @@ fn query_with_strategy_backtrack() {
 
 #[test]
 fn query_with_strategy_fast() {
-    use petgraph_cypher::MatchStrategy;
+    use petgraph_decypher::MatchStrategy;
 
     let g = build_graph_from_cypher(
         r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,
@@ -818,7 +818,7 @@ fn query_mut_remove_property() {
 
 #[test]
 fn query_mut_merge_on_create() {
-    let mut g: Graph<petgraph_cypher::NodeData, petgraph_cypher::EdgeData> = Graph::new();
+    let mut g: Graph<petgraph_decypher::NodeData, petgraph_decypher::EdgeData> = Graph::new();
 
     g.cypher_mut(r#"MERGE (n:Person {name: "Alice"}) ON CREATE SET n.created = true"#)
         .unwrap();

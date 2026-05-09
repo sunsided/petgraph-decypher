@@ -312,6 +312,11 @@ fn evaluate_binary_op(
         },
         BinaryOp::Power => match (&left, &right) {
             (CypherValue::Integer(a), CypherValue::Integer(b)) => {
+                if *b < 0 {
+                    return Err(CypherError::TypeMismatch(
+                        "negative integer exponents are not supported for integer base; use a float base".into(),
+                    ));
+                }
                 Ok(CypherValue::Integer(a.pow(*b as u32)))
             }
             (CypherValue::Float(a), CypherValue::Float(b)) => Ok(CypherValue::Float(a.powf(*b))),
@@ -823,7 +828,9 @@ fn evaluate_function(
                 ))),
             }
         }
-        "rand" => Ok(CypherValue::Float(0.5)),
+        "rand" => Err(CypherError::Unsupported(
+            "rand() is not yet implemented".into(),
+        )),
         "range" => {
             let vals = eval_args()?;
             if vals.len() < 2 || vals.len() > 3 {
@@ -849,18 +856,34 @@ fn evaluate_function(
                     )));
                 }
             };
-            let step = vals
-                .get(2)
-                .map(|v| match v {
+            let step = match vals.get(2) {
+                Some(v) => match v {
                     CypherValue::Integer(i) => *i,
-                    _ => 1,
-                })
-                .unwrap_or(1);
+                    _ => {
+                        return Err(CypherError::TypeMismatch(
+                            "range() step must be an integer".into(),
+                        ));
+                    }
+                },
+                None => 1,
+            };
+            if step == 0 {
+                return Err(CypherError::InvalidQuery(
+                    "range() step cannot be zero".into(),
+                ));
+            }
             let mut result = Vec::new();
             let mut current = start;
-            while current <= end {
-                result.push(CypherValue::Integer(current));
-                current += step;
+            if step > 0 {
+                while current <= end {
+                    result.push(CypherValue::Integer(current));
+                    current += step;
+                }
+            } else {
+                while current >= end {
+                    result.push(CypherValue::Integer(current));
+                    current += step;
+                }
             }
             Ok(CypherValue::List(result))
         }
@@ -1508,21 +1531,28 @@ fn project_expression(
     }
 }
 
+fn column_name(item: &ReturnItem, expr_counter: &mut usize) -> Option<String> {
+    if let Some(ref alias) = item.alias {
+        Some(alias.clone())
+    } else {
+        match &item.expression {
+            Expression::Variable(v) => Some(v.clone()),
+            Expression::Property(v, p) => Some(format!("{}.{}", v, p)),
+            Expression::All => None,
+            _ => {
+                let name = format!("expr{}", *expr_counter);
+                *expr_counter += 1;
+                Some(name)
+            }
+        }
+    }
+}
+
 fn result_columns(items: &[ReturnItem]) -> Vec<String> {
+    let mut expr_counter = 0;
     items
         .iter()
-        .filter_map(|item| {
-            if let Some(ref alias) = item.alias {
-                Some(alias.clone())
-            } else {
-                match &item.expression {
-                    Expression::Variable(v) => Some(v.clone()),
-                    Expression::Property(v, p) => Some(format!("{}.{}", v, p)),
-                    Expression::All => None,
-                    _ => Some("expr".to_string()),
-                }
-            }
-        })
+        .filter_map(|item| column_name(item, &mut expr_counter))
         .collect()
 }
 
@@ -1532,18 +1562,10 @@ fn project_row(
     graph: &Graph<NodeData, EdgeData>,
 ) -> Result<Row, CypherError> {
     let mut values = HashMap::new();
+    let mut expr_counter = 0;
 
     for item in items {
-        let key = if let Some(ref alias) = item.alias {
-            alias.clone()
-        } else {
-            match &item.expression {
-                Expression::Variable(v) => v.clone(),
-                Expression::Property(v, p) => format!("{}.{}", v, p),
-                Expression::All => "*".to_string(),
-                _ => "expr".to_string(),
-            }
-        };
+        let key = column_name(item, &mut expr_counter).unwrap_or_else(|| "*".to_string());
 
         if matches!(item.expression, Expression::All) {
             for (var, bound) in bindings {
@@ -1596,10 +1618,29 @@ fn compare_sort_keys(a: &CypherValue, b: &CypherValue) -> std::cmp::Ordering {
     }
 }
 
+fn row_canonical_key(row: &Row) -> String {
+    let mut pairs: Vec<_> = row
+        .values
+        .iter()
+        .map(|(k, v)| (k.clone(), format!("{:?}", v)))
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut result = String::new();
+    for (k, v) in pairs {
+        result.push_str(&k);
+        result.push('=');
+        result.push_str(&v);
+        result.push(';');
+    }
+    result
+}
+
 fn apply_distinct(rows: Vec<Row>) -> Vec<Row> {
     let mut result = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for row in rows {
-        if !result.contains(&row) {
+        let key = row_canonical_key(&row);
+        if seen.insert(key) {
             result.push(row);
         }
     }
@@ -1661,7 +1702,6 @@ impl<'a> ReadQueryExecutor<'a> {
                 } => {
                     bindings = self.execute_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
-                        let _matcher = PatternMatcher::new(self.graph, self.strategy);
                         bindings.retain(|b| evaluate_where(&where_expr, b, self.graph));
                     }
                 }
@@ -1671,7 +1711,6 @@ impl<'a> ReadQueryExecutor<'a> {
                 } => {
                     bindings = self.execute_optional_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
-                        let _matcher = PatternMatcher::new(self.graph, self.strategy);
                         bindings.retain(|b| evaluate_where(&where_expr, b, self.graph));
                     }
                 }
@@ -1708,14 +1747,21 @@ impl<'a> ReadQueryExecutor<'a> {
         // Apply ORDER BY to bindings before projection, so sort expressions
         // can reference variables that may not appear in the RETURN clause.
         if let Some(sort_items) = &order_by {
-            bindings.sort_by(|a, b| {
+            let mut sort_keys: Vec<Vec<CypherValue>> = Vec::with_capacity(bindings.len());
+            for binding in &bindings {
+                let mut keys = Vec::with_capacity(sort_items.len());
                 for item in sort_items {
-                    let a_val = evaluate_expression(&item.expression, a, self.graph);
-                    let b_val = evaluate_expression(&item.expression, b, self.graph);
-                    let cmp = match (a_val, b_val) {
-                        (Ok(av), Ok(bv)) => compare_sort_keys(&av, &bv),
-                        _ => std::cmp::Ordering::Equal,
-                    };
+                    let val = evaluate_expression(&item.expression, binding, self.graph)?;
+                    keys.push(val);
+                }
+                sort_keys.push(keys);
+            }
+            let mut indexed: Vec<_> = bindings.into_iter().zip(sort_keys).collect();
+            indexed.sort_by(|(_, a_keys), (_, b_keys)| {
+                for ((a_val, b_val), item) in
+                    a_keys.iter().zip(b_keys.iter()).zip(sort_items.iter())
+                {
+                    let cmp = compare_sort_keys(a_val, b_val);
                     if cmp != std::cmp::Ordering::Equal {
                         return match item.direction {
                             SortDirection::Asc => cmp,
@@ -1725,6 +1771,7 @@ impl<'a> ReadQueryExecutor<'a> {
                 }
                 std::cmp::Ordering::Equal
             });
+            bindings = indexed.into_iter().map(|(b, _)| b).collect();
         }
 
         let mut rows = Vec::new();
@@ -1799,33 +1846,13 @@ impl<'a> ReadQueryExecutor<'a> {
 
     fn execute_unwind(
         &self,
-        expression: Expression,
+        _expression: Expression,
         _variable: String,
-        input_bindings: Vec<Bindings>,
+        _input_bindings: Vec<Bindings>,
     ) -> Result<Vec<Bindings>, CypherError> {
-        let mut results = Vec::new();
-        for existing_bindings in &input_bindings {
-            let val = evaluate_expression(&expression, existing_bindings, self.graph)?;
-            match val {
-                CypherValue::List(items) => {
-                    for item in items {
-                        let new_bindings = existing_bindings.clone();
-                        // Store scalar values as node indices? No, we don't have scalar BoundValue.
-                        // For now, we can't store scalars in bindings. This is a limitation.
-                        // UNWIND is not fully supported without extending BoundValue.
-                        let _ = item;
-                        results.push(new_bindings);
-                    }
-                }
-                CypherValue::Null => {
-                    // UNWIND null produces no rows.
-                }
-                _ => {
-                    return Err(CypherError::TypeMismatch("UNWIND requires a list".into()));
-                }
-            }
-        }
-        Ok(results)
+        Err(CypherError::Unsupported(
+            "UNWIND is not yet fully supported".into(),
+        ))
     }
 }
 
@@ -1853,7 +1880,6 @@ impl<'a> MutQueryExecutor<'a> {
                 } => {
                     bindings = self.execute_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
-                        let _matcher = PatternMatcher::new(self.graph, MatchStrategy::Backtrack);
                         bindings.retain(|b| evaluate_where(&where_expr, b, self.graph));
                     }
                 }
@@ -1863,7 +1889,6 @@ impl<'a> MutQueryExecutor<'a> {
                 } => {
                     bindings = self.execute_optional_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
-                        let _matcher = PatternMatcher::new(self.graph, MatchStrategy::Backtrack);
                         bindings.retain(|b| evaluate_where(&where_expr, b, self.graph));
                     }
                 }
@@ -1920,7 +1945,16 @@ impl<'a> MutQueryExecutor<'a> {
                 Clause::Return { .. } => {
                     unreachable!("validated by validate_mutation_query")
                 }
-                _ => {}
+                Clause::OrderBy { .. }
+                | Clause::Skip { .. }
+                | Clause::Limit { .. }
+                | Clause::Unwind { .. }
+                | Clause::With { .. } => {
+                    return Err(CypherError::Unsupported(format!(
+                        "clause {:?} is not supported in mutation queries",
+                        std::mem::discriminant(&clause)
+                    )));
+                }
             }
         }
 

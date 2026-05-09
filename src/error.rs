@@ -1,4 +1,4 @@
-//! Error types for petgraph-cypher.
+//! Error types for petgraph-decypher.
 
 use thiserror::Error;
 

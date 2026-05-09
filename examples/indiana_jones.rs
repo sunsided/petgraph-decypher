@@ -1,7 +1,7 @@
 //! Indiana Jones example — replicates the decypher crate's example using
-//! petgraph-cypher's graph builder and query engine.
+//! petgraph-decypher's graph builder and query engine.
 
-use petgraph_cypher::{CypherValue, PetgraphCypher, ResultValue, build_graph_from_cypher};
+use petgraph_decypher::{CypherValue, PetgraphCypher, ResultValue, build_graph_from_cypher};
 
 fn main() {
     let graph = build_indiana_jones_graph();
@@ -31,7 +31,7 @@ fn main() {
 }
 
 fn build_indiana_jones_graph()
--> petgraph::Graph<petgraph_cypher::NodeData, petgraph_cypher::EdgeData> {
+-> petgraph::Graph<petgraph_decypher::NodeData, petgraph_decypher::EdgeData> {
     build_graph_from_cypher(
         r#"
         // Actors (Person)
@@ -121,7 +121,7 @@ fn build_indiana_jones_graph()
 }
 
 fn run_query(
-    graph: &petgraph::Graph<petgraph_cypher::NodeData, petgraph_cypher::EdgeData>,
+    graph: &petgraph::Graph<petgraph_decypher::NodeData, petgraph_decypher::EdgeData>,
     query: &str,
 ) {
     println!("\n--- Query: {} ---", query);

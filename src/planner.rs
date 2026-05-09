@@ -139,13 +139,11 @@ impl<'a> PlanningContext<'a> {
                             items: self.remove_items(&op.items)?,
                         });
                     }
-                    Operation::Filter(op) => {
-                        // Standalone WHERE filter (already handled inside Match)
-                        // This can appear after WITH or in subqueries.
-                        // For now, we wrap it in a synthetic Match or handle inline.
-                        // Since our Clause model doesn't have a standalone Filter,
-                        // we ignore it here — it's typically part of Match/OptionalMatch.
-                        let _ = op;
+                    Operation::Filter(_op) => {
+                        return Err(CypherError::Unsupported(
+                            "standalone FILTER/WHERE after WITH or UNWIND is not yet supported"
+                                .into(),
+                        ));
                     }
                     Operation::Aggregate(op) => {
                         // Aggregate is handled as a special Return/With variant
@@ -530,11 +528,9 @@ impl<'a> PlanningContext<'a> {
                     default,
                 }))
             }
-            ExprKind::CountStar => Ok(Expression::FunctionCall {
-                name: "count".to_string(),
-                args: vec![Expression::All],
-                distinct: false,
-            }),
+            ExprKind::CountStar => Err(CypherError::Unsupported(
+                "COUNT(*) and aggregate functions are not yet supported".into(),
+            )),
             other => Err(CypherError::Unsupported(format!(
                 "unsupported expression in query planner: {other:?}"
             ))),
@@ -742,11 +738,10 @@ impl<'a> PlanningContext<'a> {
     fn rel_pattern(&self, relationship: &RelationshipPattern) -> Result<RelPattern, CypherError> {
         let length = match relationship.length {
             decypher::hir::pattern::RelationshipLength::Single => None,
-            decypher::hir::pattern::RelationshipLength::Variable { min, max } => {
-                Some(RelationshipLength {
-                    min: min.map(|v| v as usize),
-                    max: max.map(|v| v as usize),
-                })
+            decypher::hir::pattern::RelationshipLength::Variable { .. } => {
+                return Err(CypherError::Unsupported(
+                    "variable-length relationships are not yet supported".into(),
+                ));
             }
         };
 

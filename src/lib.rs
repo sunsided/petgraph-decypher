@@ -1,4 +1,4 @@
-//! `petgraph-cypher` – build [`petgraph`] graphs from OpenCypher queries.
+//! `petgraph-decypher` – build [`petgraph`] graphs from OpenCypher queries.
 //!
 //! # Overview
 //!
@@ -23,7 +23,7 @@
 //! # Example
 //!
 //! ```rust
-//! use petgraph_cypher::build_graph_from_cypher;
+//! use petgraph_decypher::build_graph_from_cypher;
 //!
 //! let graph = build_graph_from_cypher(
 //!     r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,
@@ -187,7 +187,7 @@ impl CypherEdge for EdgeData {
 /// # Example
 ///
 /// ```rust
-/// use petgraph_cypher::parse_cypher;
+/// use petgraph_decypher::parse_cypher;
 ///
 /// let query = parse_cypher("CREATE (n:Person {name: \"Alice\"})").unwrap();
 /// assert_eq!(query.clauses.len(), 1);
@@ -210,7 +210,7 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, CypherError> {
 /// # Example
 ///
 /// ```rust
-/// use petgraph_cypher::{build_graph_from_cypher, CypherValue};
+/// use petgraph_decypher::{build_graph_from_cypher, CypherValue};
 ///
 /// let graph = build_graph_from_cypher(
 ///     r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,

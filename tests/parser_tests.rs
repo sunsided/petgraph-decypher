@@ -1,6 +1,6 @@
 //! Integration tests for the Cypher parser.
 
-use petgraph_cypher::{
+use petgraph_decypher::{
     CypherError, CypherValue, Expression, RelDirection, WhereExpr, ast::Clause, parse_cypher,
 };
 
