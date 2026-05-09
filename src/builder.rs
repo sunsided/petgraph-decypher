@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 
-use petgraph::graph::NodeIndex;
 use petgraph::Graph;
+use petgraph::graph::NodeIndex;
 
 use crate::ast::*;
 use crate::error::CypherError;
@@ -26,7 +26,7 @@ pub(crate) fn build_graph(query: CypherQuery) -> Result<Graph<NodeData, EdgeData
                     apply_path_pattern(&mut graph, &mut var_map, &pattern);
                 }
             }
-            Clause::Merge { pattern } => {
+            Clause::Merge { pattern, .. } => {
                 apply_path_pattern(&mut graph, &mut var_map, &pattern);
             }
             // MATCH, RETURN, DELETE do not create nodes/edges when building a
@@ -82,10 +82,10 @@ fn get_or_add_node(
     var_map: &mut HashMap<String, NodeIndex>,
     pattern: &NodePattern,
 ) -> NodeIndex {
-    if let Some(var) = &pattern.variable {
-        if let Some(&idx) = var_map.get(var) {
-            return idx;
-        }
+    if let Some(var) = &pattern.variable
+        && let Some(&idx) = var_map.get(var)
+    {
+        return idx;
     }
 
     let data = NodeData::from_cypher(

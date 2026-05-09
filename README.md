@@ -1,15 +1,22 @@
-# petgraph-cypher
+# petgraph-decypher
 
 Build [`petgraph`](https://crates.io/crates/petgraph) graphs from
-[OpenCypher](https://opencypher.org/) queries.
+[openCypher](https://opencypher.org/)-compatible queries.
+
+<div align="center">
+  <img src="https://raw.githubusercontent.com/sunsided/petgraph-decypher/refs/heads/main/.readme/banner.png" alt="petgraph-decypher crate hero picture" />
+</div>
+
+This project is independent and is not affiliated with, endorsed by, or sponsored by Neo4j, Inc.
+Cypher® and Neo4j® are registered trademarks of Neo4j, Inc.
 
 ## Overview
 
-`petgraph-cypher` provides a function that parses a Cypher query string and
+`petgraph-decypher` provides a function that parses a Cypher query string and
 materialises the `CREATE` / `MERGE` operations into a `petgraph::Graph`.
 
 ```rust
-use petgraph_cypher::build_graph_from_cypher;
+use petgraph_decypher::build_graph_from_cypher;
 
 let graph = build_graph_from_cypher(
     r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,
@@ -39,17 +46,17 @@ assert_eq!(graph.edge_count(), 1);
 
 ```rust
 // Parse only – returns the HIR-backed query plan
-let query = petgraph_cypher::parse_cypher("CREATE (n:Person {name: \"Alice\"})")
+let query = petgraph_decypher::parse_cypher("CREATE (n:Person {name: \"Alice\"})")
     .unwrap();
 
 // Parse + build graph – executes CREATE/MERGE clauses
-let graph = petgraph_cypher::build_graph_from_cypher(
+let graph = petgraph_decypher::build_graph_from_cypher(
     "CREATE (a)-[:KNOWS]->(b)"
 )
 .unwrap();
 
 // Read-only query execution via PetgraphCypher trait
-use petgraph_cypher::PetgraphCypher;
+use petgraph_decypher::PetgraphCypher;
 let result = graph.cypher("MATCH (n) RETURN n").unwrap();
 
 // Mutating query execution via PetgraphCypher trait
@@ -88,5 +95,5 @@ pub struct EdgeData {
 
 ## License
 
-Licensed under either of [MIT](LICENSE-MIT) or
+Licensed under either of [EUPL-1.2](LICENSE-EUPL), [MIT](LICENSE-MIT) or
 [Apache-2.0](LICENSE-APACHE) at your option.

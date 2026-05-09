@@ -1,7 +1,7 @@
 //! Integration tests for the Cypher parser.
 
-use petgraph_cypher::{
-    ast::Clause, parse_cypher, CypherError, CypherValue, Expression, RelDirection, WhereExpr,
+use petgraph_decypher::{
+    CypherError, CypherValue, Expression, RelDirection, WhereExpr, ast::Clause, parse_cypher,
 };
 
 #[test]
@@ -121,7 +121,10 @@ fn parse_match_with_where() {
         panic!("expected Eq expression");
     };
     assert_eq!(*expr, Expression::Property("n".into(), "name".into()));
-    assert_eq!(*val, CypherValue::String("Alice".into()));
+    assert_eq!(
+        *val,
+        Expression::Literal(CypherValue::String("Alice".into()))
+    );
 }
 
 #[test]
@@ -134,7 +137,7 @@ fn parse_merge_clause() {
 #[test]
 fn parse_return_clause() {
     let q = parse_cypher("MATCH (n) RETURN n, n.name AS name").unwrap();
-    let Clause::Return { items } = &q.clauses[1] else {
+    let Clause::Return { items, .. } = &q.clauses[1] else {
         panic!("expected Return clause");
     };
     assert_eq!(items.len(), 2);

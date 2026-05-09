@@ -1,16 +1,24 @@
 [package]
-name = "petgraph-cypher"
+name = "petgraph-decypher"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Build petgraph graphs from OpenCypher queries"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/sunsided/petgraph-cypher"
+license = "EUPL-1.2 OR MIT OR Apache-2.0"
+repository = "https://github.com/sunsided/petgraph-decypher"
+authors = ["Markus Mayer <widemeadows@gmail.com>"]
 readme = "README.md"
 keywords = ["petgraph", "cypher", "opencypher", "graph"]
 categories = ["data-structures"]
 
+[features]
+default = ["rng-rand"]
+rng-rand = ["dep:rand"]
+rng-fastrand = ["dep:fastrand"]
+
 [dependencies]
 petgraph = "0.8"
-cypher = { git = "https://github.com/sunsided/cypher", rev = "5ae680c7" }
+decypher = "0.2.0-alpha.4"
 thiserror = "2"
 itertools = "0.13"
+rand = { version = "0.9", optional = true }
+fastrand = { version = "2", optional = true }
