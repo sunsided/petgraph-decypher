@@ -25,6 +25,7 @@ tasks:
         msg: cargo is not installed. Please install Rust via https://rustup.rs
     cmds:
       - cargo clippy --fix --allow-staged
+      - task: fmt
 
   test:
     desc: Run all tests

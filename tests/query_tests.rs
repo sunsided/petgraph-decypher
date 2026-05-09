@@ -2,7 +2,7 @@
 
 use petgraph::Graph;
 use petgraph_cypher::{
-    build_graph_from_cypher, CypherValue, PetgraphCypher, QueryResult, ResultValue, Row,
+    CypherValue, PetgraphCypher, QueryResult, ResultValue, Row, build_graph_from_cypher,
 };
 
 fn collect_rows(result: QueryResult<'_>) -> Vec<Row> {

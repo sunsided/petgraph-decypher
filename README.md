@@ -88,5 +88,5 @@ pub struct EdgeData {
 
 ## License
 
-Licensed under either of [MIT](LICENSE-MIT) or
+Licensed under either of [EUPL-1.2](LICENSE_EUPL), [MIT](LICENSE-MIT) or
 [Apache-2.0](LICENSE-APACHE) at your option.

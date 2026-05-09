@@ -1,7 +1,7 @@
 //! Integration tests for the Cypher parser.
 
 use petgraph_cypher::{
-    ast::Clause, parse_cypher, CypherError, CypherValue, Expression, RelDirection, WhereExpr,
+    CypherError, CypherValue, Expression, RelDirection, WhereExpr, ast::Clause, parse_cypher,
 };
 
 #[test]

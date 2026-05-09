@@ -442,7 +442,7 @@ impl<'a> PlanningContext<'a> {
                         return Err(CypherError::Unsupported(format!(
                             "unsupported binary operator in expression: {:?}",
                             op
-                        )))
+                        )));
                     }
                 };
                 Ok(Expression::Binary(

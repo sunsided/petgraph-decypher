@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 
 use itertools::Itertools;
+use petgraph::Graph;
 use petgraph::graph::{EdgeIndex, EdgeReference, NodeIndex};
 use petgraph::visit::EdgeRef;
-use petgraph::Graph;
 
 use crate::ast::*;
 use crate::error::CypherError;
@@ -837,7 +837,7 @@ fn evaluate_function(
                     return Err(CypherError::TypeMismatch(format!(
                         "range() requires integers, got {:?}",
                         vals
-                    )))
+                    )));
                 }
             };
             let end = match &vals[1] {
@@ -846,7 +846,7 @@ fn evaluate_function(
                     return Err(CypherError::TypeMismatch(format!(
                         "range() requires integers, got {:?}",
                         vals
-                    )))
+                    )));
                 }
             };
             let step = vals
@@ -1396,13 +1396,13 @@ impl<'a> PatternMatcher<'a> {
         pattern: &NodePattern,
         base_bindings: &Bindings,
     ) -> Vec<NodeIndex> {
-        if let Some(var) = &pattern.variable {
-            if let Some(&BoundValue::Node(idx)) = base_bindings.get(var) {
-                if self.node_matches_pattern(idx, pattern) {
-                    return vec![idx];
-                }
-                return vec![];
+        if let Some(var) = &pattern.variable
+            && let Some(&BoundValue::Node(idx)) = base_bindings.get(var)
+        {
+            if self.node_matches_pattern(idx, pattern) {
+                return vec![idx];
             }
+            return vec![];
         }
 
         self.graph
@@ -1430,10 +1430,10 @@ impl<'a> PatternMatcher<'a> {
 
     fn edge_matches_rel(edge_ref: &EdgeReference<'_, EdgeData>, rel: &RelPattern) -> bool {
         let edge_data = edge_ref.weight();
-        if let Some(ref rel_type) = rel.rel_type {
-            if !edge_data.has_rel_type(rel_type) {
-                return false;
-            }
+        if let Some(ref rel_type) = rel.rel_type
+            && !edge_data.has_rel_type(rel_type)
+        {
+            return false;
         }
         for (key, value) in &rel.properties {
             if edge_data.get(key) != Some(value) {
@@ -2176,16 +2176,16 @@ impl<'a> MutQueryExecutor<'a> {
         var_map: &mut Bindings,
         pattern: &NodePattern,
     ) -> Result<NodeIndex, CypherError> {
-        if let Some(var) = &pattern.variable {
-            if let Some(&existing) = var_map.get(var) {
-                match existing {
-                    BoundValue::Node(idx) => return Ok(idx),
-                    BoundValue::Edge(_) => {
-                        return Err(CypherError::InvalidQuery(format!(
-                            "Variable '{}' is bound to an edge, cannot use as node",
-                            var
-                        )));
-                    }
+        if let Some(var) = &pattern.variable
+            && let Some(&existing) = var_map.get(var)
+        {
+            match existing {
+                BoundValue::Node(idx) => return Ok(idx),
+                BoundValue::Edge(_) => {
+                    return Err(CypherError::InvalidQuery(format!(
+                        "Variable '{}' is bound to an edge, cannot use as node",
+                        var
+                    )));
                 }
             }
         }

@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 
-use petgraph::graph::NodeIndex;
 use petgraph::Graph;
+use petgraph::graph::NodeIndex;
 
 use crate::ast::*;
 use crate::error::CypherError;
@@ -82,10 +82,10 @@ fn get_or_add_node(
     var_map: &mut HashMap<String, NodeIndex>,
     pattern: &NodePattern,
 ) -> NodeIndex {
-    if let Some(var) = &pattern.variable {
-        if let Some(&idx) = var_map.get(var) {
-            return idx;
-        }
+    if let Some(var) = &pattern.variable
+        && let Some(&idx) = var_map.get(var)
+    {
+        return idx;
     }
 
     let data = NodeData::from_cypher(
