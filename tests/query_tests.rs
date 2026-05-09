@@ -117,7 +117,7 @@ fn query_match_all_nodes_with_custom_weights() {
         .iter()
         .map(|row| match row.values.get("name").unwrap() {
             ResultValue::Scalar(CypherValue::String(name)) => name.clone(),
-            _ => panic!("expected string value"),
+            _ => panic!("expected string value for name field"),
         })
         .collect::<Vec<_>>();
     names.sort();
@@ -142,12 +142,12 @@ fn query_match_relationship_with_custom_weights() {
     if let ResultValue::Scalar(CypherValue::Integer(since)) = rows[0].values.get("since").unwrap() {
         assert_eq!(*since, 2020);
     } else {
-        panic!("expected integer value");
+        panic!("expected integer value for since field");
     }
     if let ResultValue::Scalar(CypherValue::String(name)) = rows[0].values.get("name").unwrap() {
         assert_eq!(name, "Bob");
     } else {
-        panic!("expected string value");
+        panic!("expected string value for name field");
     }
 }
 
