@@ -4,7 +4,7 @@ Build [`petgraph`](https://crates.io/crates/petgraph) graphs from
 [openCypher](https://opencypher.org/)-compatible queries.
 
 <div align="center">
-  <img src="https://raw.githubusercontent.com/sunsided/petgraph-decypher/refs/heads/main/.readme/banner.png" alt="Cypher crate hero picture" />
+  <img src="https://raw.githubusercontent.com/sunsided/petgraph-decypher/refs/heads/main/.readme/banner.png" alt="petgraph-decypher crate hero picture" />
 </div>
 
 This project is independent and is not affiliated with, endorsed by, or sponsored by Neo4j, Inc.
@@ -95,5 +95,5 @@ pub struct EdgeData {
 
 ## License
 
-Licensed under either of [EUPL-1.2](LICENSE_EUPL), [MIT](LICENSE-MIT) or
+Licensed under either of [EUPL-1.2](LICENSE-EUPL), [MIT](LICENSE-MIT) or
 [Apache-2.0](LICENSE-APACHE) at your option.

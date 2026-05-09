@@ -57,8 +57,8 @@ type Bindings = HashMap<String, BoundValue>;
 
 /// An iterator over query result rows.
 ///
-/// The MATCH phase is executed eagerly to collect all bindings.
-/// The RETURN phase is executed lazily, projecting one row at a time.
+/// Both the MATCH and RETURN projection phases are executed eagerly.
+/// The returned iterator streams over the fully materialized result rows.
 pub struct QueryResult<'a> {
     columns: Vec<String>,
     rows: std::vec::IntoIter<Row>,
@@ -276,7 +276,7 @@ fn evaluate_binary_op(
                 if *b == 0 {
                     return Err(CypherError::DivisionByZero);
                 }
-                Ok(CypherValue::Integer(a / b))
+                Ok(CypherValue::Float(*a as f64 / *b as f64))
             }
             (CypherValue::Float(a), CypherValue::Float(b)) => {
                 if *b == 0.0 {
@@ -1734,22 +1734,6 @@ fn apply_skip_limit(rows: Vec<Row>, skip: Option<usize>, limit: Option<usize>) -
     rows
 }
 
-fn pattern_variables(pattern: &PathPattern) -> Vec<String> {
-    let mut vars = Vec::new();
-    if let Some(v) = &pattern.start.variable {
-        vars.push(v.clone());
-    }
-    for (rel, node) in &pattern.rels {
-        if let Some(v) = &rel.variable {
-            vars.push(v.clone());
-        }
-        if let Some(v) = &node.variable {
-            vars.push(v.clone());
-        }
-    }
-    vars
-}
-
 // ---------------------------------------------------------------------------
 // Read-only executor
 // ---------------------------------------------------------------------------
@@ -1904,17 +1888,9 @@ impl<'a> ReadQueryExecutor<'a> {
         for existing_bindings in &input_bindings {
             let pattern_results = matcher.match_patterns(&patterns, existing_bindings);
             if pattern_results.is_empty() {
-                // Produce a row with nulls for all pattern variables.
-                let null_bindings = existing_bindings.clone();
-                for pattern in &patterns {
-                    for var in pattern_variables(pattern) {
-                        if !null_bindings.contains_key(&var) {
-                            // We don't actually store null in bindings, but since the variable
-                            // is absent, property access and equality checks will treat it as null.
-                        }
-                    }
-                }
-                results.push(null_bindings);
+                // Missing bindings already behave like NULL in the evaluator/projector,
+                // so we just propagate the existing bindings without additions.
+                results.push(existing_bindings.clone());
             } else {
                 results.extend(pattern_results);
             }
