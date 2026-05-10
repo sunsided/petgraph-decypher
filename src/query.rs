@@ -59,6 +59,60 @@ type Bindings = HashMap<String, BoundValue>;
 /// For example, query text `$name` is resolved from the `"name"` key.
 pub type Parameters = HashMap<String, CypherValue>;
 
+/// A parsed and validated read-only Cypher query that can be executed multiple times.
+#[derive(Debug, Clone)]
+pub struct PreparedQuery {
+    query: CypherQuery,
+}
+
+impl PreparedQuery {
+    /// Parse and validate a read-only Cypher query once for repeated execution.
+    pub fn parse(query: &str) -> Result<Self, CypherError> {
+        let query = crate::parse_cypher(query)?;
+        validate_read_query(&query)?;
+        Ok(Self { query })
+    }
+
+    /// Execute the prepared query with default strategy and no parameters.
+    pub fn execute<'g, N: CypherNode, E: CypherEdge>(
+        &self,
+        graph: &'g Graph<N, E>,
+    ) -> Result<QueryResult<'g, N, E>, CypherError> {
+        let params = Parameters::new();
+        self.execute_with_strategy_params(graph, MatchStrategy::default(), &params)
+    }
+
+    /// Execute the prepared query with default strategy and parameters.
+    pub fn execute_params<'g, N: CypherNode, E: CypherEdge>(
+        &self,
+        graph: &'g Graph<N, E>,
+        parameters: &Parameters,
+    ) -> Result<QueryResult<'g, N, E>, CypherError> {
+        self.execute_with_strategy_params(graph, MatchStrategy::default(), parameters)
+    }
+
+    /// Execute the prepared query with a specific match strategy and no parameters.
+    pub fn execute_with_strategy<'g, N: CypherNode, E: CypherEdge>(
+        &self,
+        graph: &'g Graph<N, E>,
+        strategy: MatchStrategy,
+    ) -> Result<QueryResult<'g, N, E>, CypherError> {
+        let params = Parameters::new();
+        self.execute_with_strategy_params(graph, strategy, &params)
+    }
+
+    /// Execute the prepared query with a specific match strategy and parameters.
+    pub fn execute_with_strategy_params<'g, N: CypherNode, E: CypherEdge>(
+        &self,
+        graph: &'g Graph<N, E>,
+        strategy: MatchStrategy,
+        parameters: &Parameters,
+    ) -> Result<QueryResult<'g, N, E>, CypherError> {
+        validate_read_query_parameters(&self.query, parameters)?;
+        ReadQueryExecutor::new(graph, strategy, parameters).execute(self.query.clone())
+    }
+}
+
 /// An iterator over query result rows.
 ///
 /// Both the MATCH and RETURN projection phases are executed eagerly.
