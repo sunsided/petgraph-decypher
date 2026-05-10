@@ -55,6 +55,8 @@ enum BoundValue {
 /// A set of variable bindings from pattern matching.
 type Bindings = HashMap<String, BoundValue>;
 /// Query parameters mapped by name (without the leading `$`).
+///
+/// For example, query text `$name` is resolved from the `"name"` key.
 pub type Parameters = HashMap<String, CypherValue>;
 
 /// An iterator over query result rows.
@@ -224,8 +226,6 @@ impl PetgraphCypher for Graph<NodeData, EdgeData> {
     fn cypher_mut(&mut self, query: &str) -> Result<(), CypherError> {
         let ast = crate::parse_cypher(query)?;
         validate_mutation_query(&ast)?;
-        let parameters = Parameters::new();
-        ensure_parameters_present(&ast, &parameters)?;
         MutQueryExecutor::new(self).execute(ast)
     }
 
