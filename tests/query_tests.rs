@@ -2,9 +2,8 @@
 
 use petgraph::Graph;
 use petgraph_decypher::{
-    CypherEdge, CypherError, CypherNode, CypherProperties, CypherValue, Parameters,
-    PetgraphCypher, QueryResult, ResultValue, Row, build_graph_from_cypher,
-    build_graph_from_cypher_typed,
+    CypherEdge, CypherError, CypherNode, CypherProperties, CypherValue, Parameters, PetgraphCypher,
+    QueryResult, ResultValue, Row, build_graph_from_cypher, build_graph_from_cypher_typed,
 };
 use std::collections::HashMap;
 
@@ -921,7 +920,10 @@ fn query_function_argument_parameter() {
     params.insert("name".into(), CypherValue::String("Alice".into()));
 
     let result = g
-        .cypher_params(r#"MATCH (n:Person) RETURN toUpper($name) AS upper LIMIT 1"#, &params)
+        .cypher_params(
+            r#"MATCH (n:Person) RETURN toUpper($name) AS upper LIMIT 1"#,
+            &params,
+        )
         .unwrap();
     let rows: Vec<_> = collect_rows(result);
     assert_eq!(rows.len(), 1);

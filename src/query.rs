@@ -347,7 +347,10 @@ fn ensure_expression_parameters(
     }
 }
 
-fn ensure_where_parameters(where_expr: &WhereExpr, parameters: &Parameters) -> Result<(), CypherError> {
+fn ensure_where_parameters(
+    where_expr: &WhereExpr,
+    parameters: &Parameters,
+) -> Result<(), CypherError> {
     match where_expr {
         WhereExpr::Eq(left, right)
         | WhereExpr::NotEq(left, right)
@@ -375,13 +378,16 @@ fn ensure_where_parameters(where_expr: &WhereExpr, parameters: &Parameters) -> R
 fn ensure_set_item_parameters(item: &SetItem, parameters: &Parameters) -> Result<(), CypherError> {
     match item {
         SetItem::SetProperty { value, .. } => ensure_expression_parameters(value, parameters),
-        SetItem::SetVariable { .. } | SetItem::SetLabels { .. } | SetItem::MergeProperties { .. } => {
-            Ok(())
-        }
+        SetItem::SetVariable { .. }
+        | SetItem::SetLabels { .. }
+        | SetItem::MergeProperties { .. } => Ok(()),
     }
 }
 
-fn ensure_parameters_present(query: &CypherQuery, parameters: &Parameters) -> Result<(), CypherError> {
+fn ensure_parameters_present(
+    query: &CypherQuery,
+    parameters: &Parameters,
+) -> Result<(), CypherError> {
     for clause in &query.clauses {
         match clause {
             Clause::Match { where_clause, .. } | Clause::OptionalMatch { where_clause, .. } => {
@@ -426,7 +432,9 @@ fn ensure_parameters_present(query: &CypherQuery, parameters: &Parameters) -> Re
                 }
             }
             Clause::Merge {
-                on_create, on_match, ..
+                on_create,
+                on_match,
+                ..
             } => {
                 for item in on_create {
                     ensure_set_item_parameters(item, parameters)?;
@@ -435,7 +443,11 @@ fn ensure_parameters_present(query: &CypherQuery, parameters: &Parameters) -> Re
                     ensure_set_item_parameters(item, parameters)?;
                 }
             }
-            Clause::Create { .. } | Clause::Delete { .. } | Clause::Remove { .. } | Clause::Skip { .. } | Clause::Limit { .. } => {}
+            Clause::Create { .. }
+            | Clause::Delete { .. }
+            | Clause::Remove { .. }
+            | Clause::Skip { .. }
+            | Clause::Limit { .. } => {}
         }
     }
     Ok(())
@@ -2037,8 +2049,9 @@ impl<'g, 'p, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'g, 'p, N, E> {
                 } => {
                     bindings = self.execute_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
-                        bindings
-                            .retain(|b| evaluate_where(&where_expr, b, self.graph, self.parameters));
+                        bindings.retain(|b| {
+                            evaluate_where(&where_expr, b, self.graph, self.parameters)
+                        });
                     }
                 }
                 Clause::OptionalMatch {
@@ -2047,8 +2060,9 @@ impl<'g, 'p, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'g, 'p, N, E> {
                 } => {
                     bindings = self.execute_optional_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
-                        bindings
-                            .retain(|b| evaluate_where(&where_expr, b, self.graph, self.parameters));
+                        bindings.retain(|b| {
+                            evaluate_where(&where_expr, b, self.graph, self.parameters)
+                        });
                     }
                 }
                 Clause::Unwind {
@@ -2088,8 +2102,12 @@ impl<'g, 'p, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'g, 'p, N, E> {
             for binding in &bindings {
                 let mut keys = Vec::with_capacity(sort_items.len());
                 for item in sort_items {
-                    let val =
-                        evaluate_expression(&item.expression, binding, self.graph, self.parameters)?;
+                    let val = evaluate_expression(
+                        &item.expression,
+                        binding,
+                        self.graph,
+                        self.parameters,
+                    )?;
                     keys.push(val);
                 }
                 sort_keys.push(keys);
