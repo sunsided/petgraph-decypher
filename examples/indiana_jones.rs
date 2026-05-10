@@ -4,13 +4,17 @@
 use petgraph_decypher::{CypherValue, PetgraphCypher, ResultValue, build_graph_from_cypher};
 
 fn main() {
-    let graph = build_indiana_jones_graph();
+    let mut graph = build_indiana_jones_graph();
     println!("=== Indiana Jones Graph ===");
     println!(
         "Loaded {} nodes and {} edges",
         graph.node_count(),
         graph.edge_count()
     );
+
+    graph
+        .cypher_mut(r#"MATCH (r:Role {name: "Indiana Jones"}) SET r.nickname = "Indy""#)
+        .expect("failed to update graph via cypher_mut");
 
     run_query(&graph, "MATCH (p:Person) RETURN p.name AS name");
 
@@ -27,6 +31,16 @@ fn main() {
     run_query(
         &graph,
         "MATCH (r:Role)-[:SEEKS]->(a:Artifact) RETURN r.name AS role, a.name AS artifact",
+    );
+
+    run_query(
+        &graph,
+        "MATCH (m:Movie) RETURN DISTINCT toUpper(m.name) AS movie ORDER BY movie",
+    );
+
+    run_query(
+        &graph,
+        "MATCH (r:Role) OPTIONAL MATCH (r)-[:SEEKS]->(a:Artifact) RETURN r.name AS role, r.nickname AS nickname, a.name AS artifact ORDER BY role",
     );
 }
 
