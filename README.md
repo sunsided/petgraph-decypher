@@ -40,7 +40,7 @@ assert_eq!(graph.edge_count(), 1);
 | Read queries: `MATCH`, `WHERE`, `RETURN`, `OPTIONAL MATCH` | ✅ |
 | Projection features: `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT` | ✅ |
 | Mutation queries: `CREATE`, `MERGE`, `SET`, `REMOVE`, `[DETACH] DELETE` | ✅ |
-| Scalar functions (for example `size`, `toString`, `toUpper`, `toLower`, `trim`) | ✅ |
+| Scalar functions (e.g. `size`, `toString`, `toUpper`, `toLower`, `trim`) | ✅ |
 | Multiple clauses / semicolon-separated statements | ✅ |
 | Multi-label nodes and undirected relationships | ✅ |
 | String, integer, float, bool, null, list, map values | ✅ |
@@ -141,7 +141,7 @@ For a complete working reference, see:
 Today, you can already compose Cypher selection with petgraph algorithms in user code:
 
 1. Build/load the graph.
-2. Use Cypher to select the slice of interest (for example, nodes/relationships by label/property).
+2. Use Cypher to select the slice of interest (e.g. nodes/relationships by label/property).
 3. Run a petgraph algorithm on that selection.
 4. Map algorithm output back to original node properties.
 
