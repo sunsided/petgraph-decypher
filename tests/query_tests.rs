@@ -1068,7 +1068,9 @@ fn query_mut_rejects_parameters_with_clear_error() {
         .unwrap_err();
     assert_eq!(
         err,
-        CypherError::Unsupported("query parameters are not supported in cypher_mut(): $name".into())
+        CypherError::Unsupported(
+            "query parameters are not supported in cypher_mut(): $name".into()
+        )
     );
 }
 

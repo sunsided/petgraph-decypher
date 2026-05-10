@@ -115,8 +115,7 @@ pub trait PetgraphCypher {
             self.cypher(query)
         } else {
             Err(CypherError::Unsupported(
-                "parameterized queries are not supported by this PetgraphCypher implementor"
-                    .into(),
+                "parameterized queries are not supported by this PetgraphCypher implementor".into(),
             ))
         }
     }
@@ -145,8 +144,7 @@ pub trait PetgraphCypher {
             self.cypher_with_strategy(query, strategy)
         } else {
             Err(CypherError::Unsupported(
-                "parameterized queries are not supported by this PetgraphCypher implementor"
-                    .into(),
+                "parameterized queries are not supported by this PetgraphCypher implementor".into(),
             ))
         }
     }
@@ -519,9 +517,9 @@ fn ensure_where_has_no_parameters(where_expr: &WhereExpr) -> Result<(), CypherEr
 fn ensure_set_item_has_no_parameters(item: &SetItem) -> Result<(), CypherError> {
     match item {
         SetItem::SetProperty { value, .. } => ensure_expression_has_no_parameters(value),
-        SetItem::SetVariable { .. } | SetItem::SetLabels { .. } | SetItem::MergeProperties { .. } => {
-            Ok(())
-        }
+        SetItem::SetVariable { .. }
+        | SetItem::SetLabels { .. }
+        | SetItem::MergeProperties { .. } => Ok(()),
     }
 }
 
