@@ -110,7 +110,16 @@ pub trait PetgraphCypher {
         &self,
         query: &str,
         parameters: &Parameters,
-    ) -> Result<QueryResult<'_>, CypherError>;
+    ) -> Result<QueryResult<'_>, CypherError> {
+        if parameters.is_empty() {
+            self.cypher(query)
+        } else {
+            Err(CypherError::Unsupported(
+                "parameterized queries are not supported by this PetgraphCypher implementor"
+                    .into(),
+            ))
+        }
+    }
 
     /// Execute a mutating Cypher query.
     ///
@@ -131,7 +140,16 @@ pub trait PetgraphCypher {
         query: &str,
         strategy: MatchStrategy,
         parameters: &Parameters,
-    ) -> Result<QueryResult<'_>, CypherError>;
+    ) -> Result<QueryResult<'_>, CypherError> {
+        if parameters.is_empty() {
+            self.cypher_with_strategy(query, strategy)
+        } else {
+            Err(CypherError::Unsupported(
+                "parameterized queries are not supported by this PetgraphCypher implementor"
+                    .into(),
+            ))
+        }
+    }
 }
 
 /// Extension trait for executing read-only Cypher queries on a
@@ -150,7 +168,16 @@ pub trait PetgraphCypherRead<N: CypherNode, E: CypherEdge> {
         &self,
         query: &str,
         parameters: &Parameters,
-    ) -> Result<QueryResult<'_, N, E>, CypherError>;
+    ) -> Result<QueryResult<'_, N, E>, CypherError> {
+        if parameters.is_empty() {
+            self.cypher(query)
+        } else {
+            Err(CypherError::Unsupported(
+                "parameterized queries are not supported by this PetgraphCypherRead implementor"
+                    .into(),
+            ))
+        }
+    }
 
     /// Execute a read-only Cypher query with a specific match strategy.
     fn cypher_with_strategy(
@@ -165,7 +192,16 @@ pub trait PetgraphCypherRead<N: CypherNode, E: CypherEdge> {
         query: &str,
         strategy: MatchStrategy,
         parameters: &Parameters,
-    ) -> Result<QueryResult<'_, N, E>, CypherError>;
+    ) -> Result<QueryResult<'_, N, E>, CypherError> {
+        if parameters.is_empty() {
+            self.cypher_with_strategy(query, strategy)
+        } else {
+            Err(CypherError::Unsupported(
+                "parameterized queries are not supported by this PetgraphCypherRead implementor"
+                    .into(),
+            ))
+        }
+    }
 }
 
 impl<N: CypherNode, E: CypherEdge> PetgraphCypherRead<N, E> for Graph<N, E> {
@@ -199,7 +235,7 @@ impl<N: CypherNode, E: CypherEdge> PetgraphCypherRead<N, E> for Graph<N, E> {
     ) -> Result<QueryResult<'_, N, E>, CypherError> {
         let ast = crate::parse_cypher(query)?;
         validate_read_query(&ast)?;
-        ensure_parameters_present(&ast, parameters)?;
+        ensure_read_parameters_present(&ast, parameters)?;
         ReadQueryExecutor::new(self, strategy, parameters).execute(ast)
     }
 }
@@ -226,6 +262,7 @@ impl PetgraphCypher for Graph<NodeData, EdgeData> {
     fn cypher_mut(&mut self, query: &str) -> Result<(), CypherError> {
         let ast = crate::parse_cypher(query)?;
         validate_mutation_query(&ast)?;
+        ensure_mutation_query_has_no_parameters(&ast)?;
         MutQueryExecutor::new(self).execute(ast)
     }
 
@@ -246,7 +283,7 @@ impl PetgraphCypher for Graph<NodeData, EdgeData> {
     ) -> Result<QueryResult<'_>, CypherError> {
         let ast = crate::parse_cypher(query)?;
         validate_read_query(&ast)?;
-        ensure_parameters_present(&ast, parameters)?;
+        ensure_read_parameters_present(&ast, parameters)?;
         ReadQueryExecutor::new(self, strategy, parameters).execute(ast)
     }
 }
@@ -375,16 +412,7 @@ fn ensure_where_parameters(
     }
 }
 
-fn ensure_set_item_parameters(item: &SetItem, parameters: &Parameters) -> Result<(), CypherError> {
-    match item {
-        SetItem::SetProperty { value, .. } => ensure_expression_parameters(value, parameters),
-        SetItem::SetVariable { .. }
-        | SetItem::SetLabels { .. }
-        | SetItem::MergeProperties { .. } => Ok(()),
-    }
-}
-
-fn ensure_parameters_present(
+fn ensure_read_parameters_present(
     query: &CypherQuery,
     parameters: &Parameters,
 ) -> Result<(), CypherError> {
@@ -400,24 +428,6 @@ fn ensure_parameters_present(
                     ensure_expression_parameters(&item.expression, parameters)?;
                 }
             }
-            Clause::With {
-                items,
-                where_clause,
-                order_by,
-                ..
-            } => {
-                for item in items {
-                    ensure_expression_parameters(&item.expression, parameters)?;
-                }
-                if let Some(where_expr) = where_clause {
-                    ensure_where_parameters(where_expr, parameters)?;
-                }
-                if let Some(order_by) = order_by {
-                    for item in order_by {
-                        ensure_expression_parameters(&item.expression, parameters)?;
-                    }
-                }
-            }
             Clause::Unwind { expression, .. } => {
                 ensure_expression_parameters(expression, parameters)?;
             }
@@ -426,9 +436,106 @@ fn ensure_parameters_present(
                     ensure_expression_parameters(&item.expression, parameters)?;
                 }
             }
+            Clause::Create { .. }
+            | Clause::With { .. }
+            | Clause::Set { .. }
+            | Clause::Merge { .. }
+            | Clause::Delete { .. }
+            | Clause::Remove { .. }
+            | Clause::Skip { .. }
+            | Clause::Limit { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn ensure_expression_has_no_parameters(expression: &Expression) -> Result<(), CypherError> {
+    match expression {
+        Expression::Unary(_, inner) => ensure_expression_has_no_parameters(inner),
+        Expression::Binary(_, left, right) => {
+            ensure_expression_has_no_parameters(left)?;
+            ensure_expression_has_no_parameters(right)
+        }
+        Expression::List(items) => {
+            for item in items {
+                ensure_expression_has_no_parameters(item)?;
+            }
+            Ok(())
+        }
+        Expression::FunctionCall { args, .. } => {
+            for arg in args {
+                ensure_expression_has_no_parameters(arg)?;
+            }
+            Ok(())
+        }
+        Expression::Parameter(name) => Err(CypherError::Unsupported(format!(
+            "query parameters are not supported in cypher_mut(): ${name}"
+        ))),
+        Expression::Case(case) => {
+            if let Some(scrutinee) = &case.scrutinee {
+                ensure_expression_has_no_parameters(scrutinee)?;
+            }
+            for (when, then) in &case.alternatives {
+                ensure_expression_has_no_parameters(when)?;
+                ensure_expression_has_no_parameters(then)?;
+            }
+            if let Some(default) = &case.default {
+                ensure_expression_has_no_parameters(default)?;
+            }
+            Ok(())
+        }
+        Expression::Variable(_)
+        | Expression::Property(_, _)
+        | Expression::All
+        | Expression::Literal(_) => Ok(()),
+    }
+}
+
+fn ensure_where_has_no_parameters(where_expr: &WhereExpr) -> Result<(), CypherError> {
+    match where_expr {
+        WhereExpr::Eq(left, right)
+        | WhereExpr::NotEq(left, right)
+        | WhereExpr::Lt(left, right)
+        | WhereExpr::Gt(left, right)
+        | WhereExpr::Le(left, right)
+        | WhereExpr::Ge(left, right) => {
+            ensure_expression_has_no_parameters(left)?;
+            ensure_expression_has_no_parameters(right)
+        }
+        WhereExpr::In(expression, _)
+        | WhereExpr::StartsWith(expression, _)
+        | WhereExpr::EndsWith(expression, _)
+        | WhereExpr::Contains(expression, _)
+        | WhereExpr::IsNull(expression)
+        | WhereExpr::IsNotNull(expression) => ensure_expression_has_no_parameters(expression),
+        WhereExpr::Not(inner) => ensure_where_has_no_parameters(inner),
+        WhereExpr::And(left, right) | WhereExpr::Or(left, right) | WhereExpr::Xor(left, right) => {
+            ensure_where_has_no_parameters(left)?;
+            ensure_where_has_no_parameters(right)
+        }
+    }
+}
+
+fn ensure_set_item_has_no_parameters(item: &SetItem) -> Result<(), CypherError> {
+    match item {
+        SetItem::SetProperty { value, .. } => ensure_expression_has_no_parameters(value),
+        SetItem::SetVariable { .. } | SetItem::SetLabels { .. } | SetItem::MergeProperties { .. } => {
+            Ok(())
+        }
+    }
+}
+
+fn ensure_mutation_query_has_no_parameters(query: &CypherQuery) -> Result<(), CypherError> {
+    for clause in &query.clauses {
+        match clause {
+            Clause::Match { where_clause, .. } | Clause::OptionalMatch { where_clause, .. } => {
+                if let Some(where_expr) = where_clause {
+                    ensure_where_has_no_parameters(where_expr)?;
+                }
+            }
             Clause::Set { items } => {
                 for item in items {
-                    ensure_set_item_parameters(item, parameters)?;
+                    ensure_set_item_has_no_parameters(item)?;
                 }
             }
             Clause::Merge {
@@ -437,15 +544,19 @@ fn ensure_parameters_present(
                 ..
             } => {
                 for item in on_create {
-                    ensure_set_item_parameters(item, parameters)?;
+                    ensure_set_item_has_no_parameters(item)?;
                 }
                 for item in on_match {
-                    ensure_set_item_parameters(item, parameters)?;
+                    ensure_set_item_has_no_parameters(item)?;
                 }
             }
+            Clause::Unwind { expression, .. } => ensure_expression_has_no_parameters(expression)?,
             Clause::Create { .. }
             | Clause::Delete { .. }
             | Clause::Remove { .. }
+            | Clause::Return { .. }
+            | Clause::With { .. }
+            | Clause::OrderBy { .. }
             | Clause::Skip { .. }
             | Clause::Limit { .. } => {}
         }
@@ -2219,7 +2330,7 @@ impl<'a> MutQueryExecutor<'a> {
 
     fn execute(mut self, query: CypherQuery) -> Result<(), CypherError> {
         let mut bindings: Vec<Bindings> = vec![HashMap::new()];
-        let parameters = Parameters::new();
+        let no_parameters = Parameters::new();
 
         for clause in query.clauses {
             match clause {
@@ -2230,7 +2341,7 @@ impl<'a> MutQueryExecutor<'a> {
                     bindings = self.execute_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
                         bindings
-                            .retain(|b| evaluate_where(&where_expr, b, self.graph, &parameters));
+                            .retain(|b| evaluate_where(&where_expr, b, self.graph, &no_parameters));
                     }
                 }
                 Clause::OptionalMatch {
@@ -2240,7 +2351,7 @@ impl<'a> MutQueryExecutor<'a> {
                     bindings = self.execute_optional_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
                         bindings
-                            .retain(|b| evaluate_where(&where_expr, b, self.graph, &parameters));
+                            .retain(|b| evaluate_where(&where_expr, b, self.graph, &no_parameters));
                     }
                 }
                 Clause::Create { patterns } => {
@@ -2260,7 +2371,7 @@ impl<'a> MutQueryExecutor<'a> {
                         let test_results = matcher.match_single_path(&pattern, bindings_row);
                         if test_results.is_empty() {
                             self.apply_path_pattern_mut(bindings_row, &pattern)?;
-                            self.apply_set_items(bindings_row, &on_create, &parameters)?;
+                            self.apply_set_items(bindings_row, &on_create, &no_parameters)?;
                         } else {
                             // Propagate matched bindings into bindings_row
                             let first = &test_results[0];
@@ -2276,7 +2387,7 @@ impl<'a> MutQueryExecutor<'a> {
                                     bindings_row.insert(k.clone(), *v);
                                 }
                             }
-                            self.apply_set_items(bindings_row, &on_match, &parameters)?;
+                            self.apply_set_items(bindings_row, &on_match, &no_parameters)?;
                         }
                     }
                 }
@@ -2285,7 +2396,7 @@ impl<'a> MutQueryExecutor<'a> {
                 }
                 Clause::Set { items } => {
                     for bindings_row in &bindings {
-                        self.apply_set_items(bindings_row, &items, &parameters)?;
+                        self.apply_set_items(bindings_row, &items, &no_parameters)?;
                     }
                 }
                 Clause::Remove { items } => {
