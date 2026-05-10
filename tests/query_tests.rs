@@ -2,8 +2,9 @@
 
 use petgraph::Graph;
 use petgraph_decypher::{
-    CypherEdge, CypherNode, CypherProperties, CypherValue, PetgraphCypher, QueryResult,
-    ResultValue, Row, build_graph_from_cypher, build_graph_from_cypher_typed,
+    CypherEdge, CypherError, CypherNode, CypherProperties, CypherValue, MatchStrategy, NodeData,
+    Parameters, PetgraphCypher, QueryResult, ResultValue, Row, build_graph_from_cypher,
+    build_graph_from_cypher_typed,
 };
 use std::collections::HashMap;
 
@@ -79,6 +80,52 @@ impl CypherEdge for CustomEdge {
             rel_type,
             properties,
         }
+    }
+}
+
+/// Fixture used to verify trait default-method backward compatibility.
+struct CompatibilityWrapper {
+    graph: Graph<NodeData, petgraph_decypher::EdgeData>,
+}
+
+impl PetgraphCypher for CompatibilityWrapper {
+    fn cypher(&self, query: &str) -> Result<QueryResult<'_>, CypherError> {
+        self.graph.cypher(query)
+    }
+
+    fn cypher_mut(&mut self, query: &str) -> Result<(), CypherError> {
+        self.graph.cypher_mut(query)
+    }
+
+    fn cypher_with_strategy(
+        &self,
+        query: &str,
+        strategy: MatchStrategy,
+    ) -> Result<QueryResult<'_>, CypherError> {
+        self.graph.cypher_with_strategy(query, strategy)
+    }
+}
+
+impl petgraph_decypher::query::PetgraphCypherRead<NodeData, petgraph_decypher::EdgeData>
+    for CompatibilityWrapper
+{
+    fn cypher(
+        &self,
+        query: &str,
+    ) -> Result<QueryResult<'_, NodeData, petgraph_decypher::EdgeData>, CypherError> {
+        petgraph_decypher::query::PetgraphCypherRead::cypher(&self.graph, query)
+    }
+
+    fn cypher_with_strategy(
+        &self,
+        query: &str,
+        strategy: MatchStrategy,
+    ) -> Result<QueryResult<'_, NodeData, petgraph_decypher::EdgeData>, CypherError> {
+        petgraph_decypher::query::PetgraphCypherRead::cypher_with_strategy(
+            &self.graph,
+            query,
+            strategy,
+        )
     }
 }
 
@@ -236,6 +283,32 @@ fn query_where_with_and() {
         .unwrap();
     let rows: Vec<_> = collect_rows(result);
     assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn query_where_with_parameters() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice", age: 30})
+           CREATE (b:Person {name: "Bob", age: 25})"#,
+    )
+    .unwrap();
+
+    let mut params = Parameters::new();
+    params.insert("name".into(), CypherValue::String("Alice".into()));
+    params.insert("min_age".into(), CypherValue::Integer(30));
+
+    let result = g
+        .cypher_params(
+            "MATCH (n:Person) WHERE n.name = $name AND n.age >= $min_age RETURN n.name AS name",
+            &params,
+        )
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values.get("name"),
+        Some(&ResultValue::Scalar(CypherValue::String("Alice".into())))
+    );
 }
 
 #[test]
@@ -487,6 +560,33 @@ fn query_with_strategy_fast() {
         .unwrap();
     let rows: Vec<_> = collect_rows(result);
     assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn query_parameter_trait_defaults_are_source_compatible() {
+    let wrapper = CompatibilityWrapper {
+        graph: build_graph_from_cypher(r#"CREATE (n:Person {name: "Alice"})"#).unwrap(),
+    };
+
+    let empty_params = Parameters::new();
+    let result = wrapper
+        .cypher_params("MATCH (n:Person) RETURN n.name AS name", &empty_params)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+
+    let mut params = Parameters::new();
+    params.insert("name".into(), CypherValue::String("Alice".into()));
+    let err = match wrapper.cypher_params("MATCH (n:Person) RETURN n.name AS name", &params) {
+        Ok(_) => panic!("expected unsupported error for non-empty parameter map"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        CypherError::Unsupported(
+            "parameterized queries are not supported by this PetgraphCypher implementor".into()
+        )
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -865,6 +965,64 @@ fn query_function_size() {
     }
 }
 
+#[test]
+fn query_return_parameter_value() {
+    let g = build_graph_from_cypher(r#"CREATE (n:Person {name: "Alice"})"#).unwrap();
+
+    let mut params = Parameters::new();
+    params.insert("requested_name".into(), CypherValue::String("Alice".into()));
+
+    let result = g
+        .cypher_params(
+            r#"MATCH (n:Person) RETURN $requested_name AS name LIMIT 1"#,
+            &params,
+        )
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values.get("name"),
+        Some(&ResultValue::Scalar(CypherValue::String("Alice".into())))
+    );
+}
+
+#[test]
+fn query_function_argument_parameter() {
+    let g = build_graph_from_cypher(r#"CREATE (n:Person {name: "Alice"})"#).unwrap();
+
+    let mut params = Parameters::new();
+    params.insert("name".into(), CypherValue::String("Alice".into()));
+
+    let result = g
+        .cypher_params(
+            r#"MATCH (n:Person) RETURN toUpper($name) AS upper LIMIT 1"#,
+            &params,
+        )
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values.get("upper"),
+        Some(&ResultValue::Scalar(CypherValue::String("ALICE".into())))
+    );
+}
+
+#[test]
+fn query_missing_parameter_returns_error() {
+    let g = build_graph_from_cypher(r#"CREATE (n:Person {name: "Alice"})"#).unwrap();
+    let params = Parameters::new();
+
+    let err = match g.cypher_params("MATCH (n:Person) WHERE n.name = $name RETURN n", &params) {
+        Ok(_) => panic!("expected missing parameter error"),
+        Err(err) => err,
+    };
+
+    assert_eq!(
+        err,
+        CypherError::InvalidQuery("missing query parameter: $name".into())
+    );
+}
+
 // ---------------------------------------------------------------------------
 // OPTIONAL MATCH
 // ---------------------------------------------------------------------------
@@ -900,6 +1058,21 @@ fn query_mut_set_property() {
     } else {
         panic!("expected integer value");
     }
+}
+
+#[test]
+fn query_mut_rejects_parameters_with_clear_error() {
+    let mut g = build_graph_from_cypher(r#"CREATE (n:Person {name: "Alice"})"#).unwrap();
+
+    let err = g
+        .cypher_mut(r#"MATCH (n:Person) WHERE n.name = $name SET n.seen = true"#)
+        .unwrap_err();
+    assert_eq!(
+        err,
+        CypherError::Unsupported(
+            "query parameters are not supported in cypher_mut(): $name".into()
+        )
+    );
 }
 
 #[test]
