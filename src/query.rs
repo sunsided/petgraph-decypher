@@ -233,7 +233,7 @@ impl<N: CypherNode, E: CypherEdge> PetgraphCypherRead<N, E> for Graph<N, E> {
     ) -> Result<QueryResult<'_, N, E>, CypherError> {
         let ast = crate::parse_cypher(query)?;
         validate_read_query(&ast)?;
-        ensure_read_parameters_present(&ast, parameters)?;
+        validate_read_query_parameters(&ast, parameters)?;
         ReadQueryExecutor::new(self, strategy, parameters).execute(ast)
     }
 }
@@ -260,7 +260,7 @@ impl PetgraphCypher for Graph<NodeData, EdgeData> {
     fn cypher_mut(&mut self, query: &str) -> Result<(), CypherError> {
         let ast = crate::parse_cypher(query)?;
         validate_mutation_query(&ast)?;
-        ensure_mutation_query_has_no_parameters(&ast)?;
+        validate_mutation_query_parameters(&ast)?;
         MutQueryExecutor::new(self).execute(ast)
     }
 
@@ -281,7 +281,7 @@ impl PetgraphCypher for Graph<NodeData, EdgeData> {
     ) -> Result<QueryResult<'_>, CypherError> {
         let ast = crate::parse_cypher(query)?;
         validate_read_query(&ast)?;
-        ensure_read_parameters_present(&ast, parameters)?;
+        validate_read_query_parameters(&ast, parameters)?;
         ReadQueryExecutor::new(self, strategy, parameters).execute(ast)
     }
 }
@@ -410,7 +410,7 @@ fn ensure_where_parameters(
     }
 }
 
-fn ensure_read_parameters_present(
+fn validate_read_query_parameters(
     query: &CypherQuery,
     parameters: &Parameters,
 ) -> Result<(), CypherError> {
@@ -523,7 +523,7 @@ fn ensure_set_item_has_no_parameters(item: &SetItem) -> Result<(), CypherError> 
     }
 }
 
-fn ensure_mutation_query_has_no_parameters(query: &CypherQuery) -> Result<(), CypherError> {
+fn validate_mutation_query_parameters(query: &CypherQuery) -> Result<(), CypherError> {
     for clause in &query.clauses {
         match clause {
             Clause::Match { where_clause, .. } | Clause::OptionalMatch { where_clause, .. } => {

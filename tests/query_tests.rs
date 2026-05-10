@@ -83,6 +83,7 @@ impl CypherEdge for CustomEdge {
     }
 }
 
+/// Fixture used to verify trait default-method backward compatibility.
 struct CompatibilityWrapper {
     graph: Graph<NodeData, petgraph_decypher::EdgeData>,
 }
