@@ -1,6 +1,6 @@
 # petgraph-decypher
 
-Cypher front-end for [`petgraph`](https://crates.io/crates/petgraph):
+Cypher-compatible front-end for [`petgraph`](https://crates.io/crates/petgraph):
 build, query, and mutate graphs with
 [openCypher](https://opencypher.org/)-compatible queries.
 
