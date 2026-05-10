@@ -2,8 +2,9 @@
 
 use petgraph::Graph;
 use petgraph_decypher::{
-    CypherEdge, CypherNode, CypherProperties, CypherValue, PetgraphCypher, QueryResult,
-    ResultValue, Row, build_graph_from_cypher, build_graph_from_cypher_typed,
+    CypherEdge, CypherError, CypherNode, CypherProperties, CypherValue, Parameters,
+    PetgraphCypher, QueryResult, ResultValue, Row, build_graph_from_cypher,
+    build_graph_from_cypher_typed,
 };
 use std::collections::HashMap;
 
@@ -236,6 +237,32 @@ fn query_where_with_and() {
         .unwrap();
     let rows: Vec<_> = collect_rows(result);
     assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn query_where_with_parameters() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice", age: 30})
+           CREATE (b:Person {name: "Bob", age: 25})"#,
+    )
+    .unwrap();
+
+    let mut params = Parameters::new();
+    params.insert("name".into(), CypherValue::String("Alice".into()));
+    params.insert("min_age".into(), CypherValue::Integer(30));
+
+    let result = g
+        .cypher_params(
+            "MATCH (n:Person) WHERE n.name = $name AND n.age >= $min_age RETURN n.name AS name",
+            &params,
+        )
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values.get("name"),
+        Some(&ResultValue::Scalar(CypherValue::String("Alice".into())))
+    );
 }
 
 #[test]
@@ -863,6 +890,61 @@ fn query_function_size() {
     } else {
         panic!("expected integer value");
     }
+}
+
+#[test]
+fn query_return_parameter_value() {
+    let g = build_graph_from_cypher(r#"CREATE (n:Person {name: "Alice"})"#).unwrap();
+
+    let mut params = Parameters::new();
+    params.insert("requested_name".into(), CypherValue::String("Alice".into()));
+
+    let result = g
+        .cypher_params(
+            r#"MATCH (n:Person) RETURN $requested_name AS name LIMIT 1"#,
+            &params,
+        )
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values.get("name"),
+        Some(&ResultValue::Scalar(CypherValue::String("Alice".into())))
+    );
+}
+
+#[test]
+fn query_function_argument_parameter() {
+    let g = build_graph_from_cypher(r#"CREATE (n:Person {name: "Alice"})"#).unwrap();
+
+    let mut params = Parameters::new();
+    params.insert("name".into(), CypherValue::String("Alice".into()));
+
+    let result = g
+        .cypher_params(r#"MATCH (n:Person) RETURN toUpper($name) AS upper LIMIT 1"#, &params)
+        .unwrap();
+    let rows: Vec<_> = collect_rows(result);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values.get("upper"),
+        Some(&ResultValue::Scalar(CypherValue::String("ALICE".into())))
+    );
+}
+
+#[test]
+fn query_missing_parameter_returns_error() {
+    let g = build_graph_from_cypher(r#"CREATE (n:Person {name: "Alice"})"#).unwrap();
+    let params = Parameters::new();
+
+    let err = match g.cypher_params("MATCH (n:Person) WHERE n.name = $name RETURN n", &params) {
+        Ok(_) => panic!("expected missing parameter error"),
+        Err(err) => err,
+    };
+
+    assert_eq!(
+        err,
+        CypherError::InvalidQuery("missing query parameter: $name".into())
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -54,6 +54,8 @@ enum BoundValue {
 
 /// A set of variable bindings from pattern matching.
 type Bindings = HashMap<String, BoundValue>;
+/// Query parameters mapped by name (without the leading `$`).
+pub type Parameters = HashMap<String, CypherValue>;
 
 /// An iterator over query result rows.
 ///
@@ -101,6 +103,13 @@ pub trait PetgraphCypher {
     /// Uses the default `Backtrack` match strategy.
     fn cypher(&self, query: &str) -> Result<QueryResult<'_>, CypherError>;
 
+    /// Execute a read-only Cypher query and stream the results using parameters.
+    fn cypher_params(
+        &self,
+        query: &str,
+        parameters: &Parameters,
+    ) -> Result<QueryResult<'_>, CypherError>;
+
     /// Execute a mutating Cypher query.
     ///
     /// Supports `MATCH`, `WHERE`, `CREATE`, `MERGE`, and `DELETE` clauses.
@@ -112,6 +121,14 @@ pub trait PetgraphCypher {
         &self,
         query: &str,
         strategy: MatchStrategy,
+    ) -> Result<QueryResult<'_>, CypherError>;
+
+    /// Execute a read-only Cypher query with a specific match strategy and parameters.
+    fn cypher_with_strategy_params(
+        &self,
+        query: &str,
+        strategy: MatchStrategy,
+        parameters: &Parameters,
     ) -> Result<QueryResult<'_>, CypherError>;
 }
 
@@ -126,17 +143,41 @@ pub trait PetgraphCypherRead<N: CypherNode, E: CypherEdge> {
     /// Uses the default `Backtrack` match strategy.
     fn cypher(&self, query: &str) -> Result<QueryResult<'_, N, E>, CypherError>;
 
+    /// Execute a read-only Cypher query and stream the results using parameters.
+    fn cypher_params(
+        &self,
+        query: &str,
+        parameters: &Parameters,
+    ) -> Result<QueryResult<'_, N, E>, CypherError>;
+
     /// Execute a read-only Cypher query with a specific match strategy.
     fn cypher_with_strategy(
         &self,
         query: &str,
         strategy: MatchStrategy,
     ) -> Result<QueryResult<'_, N, E>, CypherError>;
+
+    /// Execute a read-only Cypher query with a specific match strategy and parameters.
+    fn cypher_with_strategy_params(
+        &self,
+        query: &str,
+        strategy: MatchStrategy,
+        parameters: &Parameters,
+    ) -> Result<QueryResult<'_, N, E>, CypherError>;
 }
 
 impl<N: CypherNode, E: CypherEdge> PetgraphCypherRead<N, E> for Graph<N, E> {
     fn cypher(&self, query: &str) -> Result<QueryResult<'_, N, E>, CypherError> {
-        self.cypher_with_strategy(query, MatchStrategy::default())
+        let params = Parameters::new();
+        self.cypher_with_strategy_params(query, MatchStrategy::default(), &params)
+    }
+
+    fn cypher_params(
+        &self,
+        query: &str,
+        parameters: &Parameters,
+    ) -> Result<QueryResult<'_, N, E>, CypherError> {
+        self.cypher_with_strategy_params(query, MatchStrategy::default(), parameters)
     }
 
     fn cypher_with_strategy(
@@ -144,20 +185,47 @@ impl<N: CypherNode, E: CypherEdge> PetgraphCypherRead<N, E> for Graph<N, E> {
         query: &str,
         strategy: MatchStrategy,
     ) -> Result<QueryResult<'_, N, E>, CypherError> {
+        let params = Parameters::new();
+        self.cypher_with_strategy_params(query, strategy, &params)
+    }
+
+    fn cypher_with_strategy_params(
+        &self,
+        query: &str,
+        strategy: MatchStrategy,
+        parameters: &Parameters,
+    ) -> Result<QueryResult<'_, N, E>, CypherError> {
         let ast = crate::parse_cypher(query)?;
         validate_read_query(&ast)?;
-        ReadQueryExecutor::new(self, strategy).execute(ast)
+        ensure_parameters_present(&ast, parameters)?;
+        ReadQueryExecutor::new(self, strategy, parameters).execute(ast)
     }
 }
 
 impl PetgraphCypher for Graph<NodeData, EdgeData> {
     fn cypher(&self, query: &str) -> Result<QueryResult<'_>, CypherError> {
-        PetgraphCypher::cypher_with_strategy(self, query, MatchStrategy::default())
+        let params = Parameters::new();
+        PetgraphCypher::cypher_with_strategy_params(self, query, MatchStrategy::default(), &params)
+    }
+
+    fn cypher_params(
+        &self,
+        query: &str,
+        parameters: &Parameters,
+    ) -> Result<QueryResult<'_>, CypherError> {
+        PetgraphCypher::cypher_with_strategy_params(
+            self,
+            query,
+            MatchStrategy::default(),
+            parameters,
+        )
     }
 
     fn cypher_mut(&mut self, query: &str) -> Result<(), CypherError> {
         let ast = crate::parse_cypher(query)?;
         validate_mutation_query(&ast)?;
+        let parameters = Parameters::new();
+        ensure_parameters_present(&ast, &parameters)?;
         MutQueryExecutor::new(self).execute(ast)
     }
 
@@ -166,9 +234,20 @@ impl PetgraphCypher for Graph<NodeData, EdgeData> {
         query: &str,
         strategy: MatchStrategy,
     ) -> Result<QueryResult<'_>, CypherError> {
+        let params = Parameters::new();
+        PetgraphCypher::cypher_with_strategy_params(self, query, strategy, &params)
+    }
+
+    fn cypher_with_strategy_params(
+        &self,
+        query: &str,
+        strategy: MatchStrategy,
+        parameters: &Parameters,
+    ) -> Result<QueryResult<'_>, CypherError> {
         let ast = crate::parse_cypher(query)?;
         validate_read_query(&ast)?;
-        ReadQueryExecutor::new(self, strategy).execute(ast)
+        ensure_parameters_present(&ast, parameters)?;
+        ReadQueryExecutor::new(self, strategy, parameters).execute(ast)
     }
 }
 
@@ -212,6 +291,151 @@ fn validate_mutation_query(query: &CypherQuery) -> Result<(), CypherError> {
             return Err(CypherError::Unsupported(
                 "RETURN not allowed in cypher_mut(); use cypher() for reads".into(),
             ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_expression_parameters(
+    expression: &Expression,
+    parameters: &Parameters,
+) -> Result<(), CypherError> {
+    match expression {
+        Expression::Unary(_, inner) => ensure_expression_parameters(inner, parameters),
+        Expression::Binary(_, left, right) => {
+            ensure_expression_parameters(left, parameters)?;
+            ensure_expression_parameters(right, parameters)
+        }
+        Expression::List(items) => {
+            for item in items {
+                ensure_expression_parameters(item, parameters)?;
+            }
+            Ok(())
+        }
+        Expression::FunctionCall { args, .. } => {
+            for arg in args {
+                ensure_expression_parameters(arg, parameters)?;
+            }
+            Ok(())
+        }
+        Expression::Parameter(name) => {
+            if parameters.contains_key(name) {
+                Ok(())
+            } else {
+                Err(CypherError::InvalidQuery(format!(
+                    "missing query parameter: ${name}"
+                )))
+            }
+        }
+        Expression::Case(case) => {
+            if let Some(scrutinee) = &case.scrutinee {
+                ensure_expression_parameters(scrutinee, parameters)?;
+            }
+            for (when, then) in &case.alternatives {
+                ensure_expression_parameters(when, parameters)?;
+                ensure_expression_parameters(then, parameters)?;
+            }
+            if let Some(default) = &case.default {
+                ensure_expression_parameters(default, parameters)?;
+            }
+            Ok(())
+        }
+        Expression::Variable(_)
+        | Expression::Property(_, _)
+        | Expression::All
+        | Expression::Literal(_) => Ok(()),
+    }
+}
+
+fn ensure_where_parameters(where_expr: &WhereExpr, parameters: &Parameters) -> Result<(), CypherError> {
+    match where_expr {
+        WhereExpr::Eq(left, right)
+        | WhereExpr::NotEq(left, right)
+        | WhereExpr::Lt(left, right)
+        | WhereExpr::Gt(left, right)
+        | WhereExpr::Le(left, right)
+        | WhereExpr::Ge(left, right) => {
+            ensure_expression_parameters(left, parameters)?;
+            ensure_expression_parameters(right, parameters)
+        }
+        WhereExpr::In(expression, _)
+        | WhereExpr::StartsWith(expression, _)
+        | WhereExpr::EndsWith(expression, _)
+        | WhereExpr::Contains(expression, _)
+        | WhereExpr::IsNull(expression)
+        | WhereExpr::IsNotNull(expression) => ensure_expression_parameters(expression, parameters),
+        WhereExpr::Not(inner) => ensure_where_parameters(inner, parameters),
+        WhereExpr::And(left, right) | WhereExpr::Or(left, right) | WhereExpr::Xor(left, right) => {
+            ensure_where_parameters(left, parameters)?;
+            ensure_where_parameters(right, parameters)
+        }
+    }
+}
+
+fn ensure_set_item_parameters(item: &SetItem, parameters: &Parameters) -> Result<(), CypherError> {
+    match item {
+        SetItem::SetProperty { value, .. } => ensure_expression_parameters(value, parameters),
+        SetItem::SetVariable { .. } | SetItem::SetLabels { .. } | SetItem::MergeProperties { .. } => {
+            Ok(())
+        }
+    }
+}
+
+fn ensure_parameters_present(query: &CypherQuery, parameters: &Parameters) -> Result<(), CypherError> {
+    for clause in &query.clauses {
+        match clause {
+            Clause::Match { where_clause, .. } | Clause::OptionalMatch { where_clause, .. } => {
+                if let Some(where_expr) = where_clause {
+                    ensure_where_parameters(where_expr, parameters)?;
+                }
+            }
+            Clause::Return { items, .. } => {
+                for item in items {
+                    ensure_expression_parameters(&item.expression, parameters)?;
+                }
+            }
+            Clause::With {
+                items,
+                where_clause,
+                order_by,
+                ..
+            } => {
+                for item in items {
+                    ensure_expression_parameters(&item.expression, parameters)?;
+                }
+                if let Some(where_expr) = where_clause {
+                    ensure_where_parameters(where_expr, parameters)?;
+                }
+                if let Some(order_by) = order_by {
+                    for item in order_by {
+                        ensure_expression_parameters(&item.expression, parameters)?;
+                    }
+                }
+            }
+            Clause::Unwind { expression, .. } => {
+                ensure_expression_parameters(expression, parameters)?;
+            }
+            Clause::OrderBy { items } => {
+                for item in items {
+                    ensure_expression_parameters(&item.expression, parameters)?;
+                }
+            }
+            Clause::Set { items } => {
+                for item in items {
+                    ensure_set_item_parameters(item, parameters)?;
+                }
+            }
+            Clause::Merge {
+                on_create, on_match, ..
+            } => {
+                for item in on_create {
+                    ensure_set_item_parameters(item, parameters)?;
+                }
+                for item in on_match {
+                    ensure_set_item_parameters(item, parameters)?;
+                }
+            }
+            Clause::Create { .. } | Clause::Delete { .. } | Clause::Remove { .. } | Clause::Skip { .. } | Clause::Limit { .. } => {}
         }
     }
     Ok(())
@@ -463,11 +687,12 @@ fn evaluate_function(
     _distinct: bool,
     bindings: &Bindings,
     graph: &Graph<impl CypherNode, impl CypherEdge>,
+    parameters: &Parameters,
 ) -> Result<CypherValue, CypherError> {
     // Helper to evaluate all args.
     let eval_args = || {
         args.iter()
-            .map(|arg| evaluate_expression(arg, bindings, graph))
+            .map(|arg| evaluate_expression(arg, bindings, graph, parameters))
             .collect::<Result<Vec<_>, _>>()
     };
 
@@ -541,7 +766,7 @@ fn evaluate_function(
         }
         "coalesce" => {
             for arg in args {
-                let val = evaluate_expression(arg, bindings, graph)?;
+                let val = evaluate_expression(arg, bindings, graph, parameters)?;
                 if !matches!(val, CypherValue::Null) {
                     return Ok(val);
                 }
@@ -1080,7 +1305,7 @@ fn evaluate_function(
                 }
                 _ => {
                     // For general expressions, check if not null
-                    let val = evaluate_expression(&args[0], bindings, graph)?;
+                    let val = evaluate_expression(&args[0], bindings, graph, parameters)?;
                     Ok(CypherValue::Boolean(!matches!(val, CypherValue::Null)))
                 }
             }
@@ -1096,25 +1321,26 @@ fn evaluate_case(
     case: &CaseExpr,
     bindings: &Bindings,
     graph: &Graph<impl CypherNode, impl CypherEdge>,
+    parameters: &Parameters,
 ) -> Result<CypherValue, CypherError> {
     if let Some(scrutinee) = &case.scrutinee {
-        let scrutinee_val = evaluate_expression(scrutinee, bindings, graph)?;
+        let scrutinee_val = evaluate_expression(scrutinee, bindings, graph, parameters)?;
         for (when, then) in &case.alternatives {
-            let when_val = evaluate_expression(when, bindings, graph)?;
+            let when_val = evaluate_expression(when, bindings, graph, parameters)?;
             if scrutinee_val == when_val {
-                return evaluate_expression(then, bindings, graph);
+                return evaluate_expression(then, bindings, graph, parameters);
             }
         }
     } else {
         for (when, then) in &case.alternatives {
-            let when_val = evaluate_expression(when, bindings, graph)?;
+            let when_val = evaluate_expression(when, bindings, graph, parameters)?;
             if is_truthy(&when_val) == Some(true) {
-                return evaluate_expression(then, bindings, graph);
+                return evaluate_expression(then, bindings, graph, parameters);
             }
         }
     }
     if let Some(default) = &case.default {
-        evaluate_expression(default, bindings, graph)
+        evaluate_expression(default, bindings, graph, parameters)
     } else {
         Ok(CypherValue::Null)
     }
@@ -1124,6 +1350,7 @@ fn evaluate_expression(
     expr: &Expression,
     bindings: &Bindings,
     graph: &Graph<impl CypherNode, impl CypherEdge>,
+    parameters: &Parameters,
 ) -> Result<CypherValue, CypherError> {
     match expr {
         Expression::Variable(var) => {
@@ -1159,7 +1386,7 @@ fn evaluate_expression(
         Expression::Literal(v) => Ok(v.clone()),
         Expression::All => Ok(CypherValue::Null),
         Expression::Unary(op, expr) => {
-            let val = evaluate_expression(expr, bindings, graph)?;
+            let val = evaluate_expression(expr, bindings, graph, parameters)?;
             match op {
                 UnaryOp::Not => match val {
                     CypherValue::Null => Ok(CypherValue::Null),
@@ -1184,14 +1411,14 @@ fn evaluate_expression(
             }
         }
         Expression::Binary(op, left, right) => {
-            let left_val = evaluate_expression(left, bindings, graph)?;
-            let right_val = evaluate_expression(right, bindings, graph)?;
+            let left_val = evaluate_expression(left, bindings, graph, parameters)?;
+            let right_val = evaluate_expression(right, bindings, graph, parameters)?;
             evaluate_binary_op(*op, left_val, right_val)
         }
         Expression::List(items) => {
             let values = items
                 .iter()
-                .map(|item| evaluate_expression(item, bindings, graph))
+                .map(|item| evaluate_expression(item, bindings, graph, parameters))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(CypherValue::List(values))
         }
@@ -1199,12 +1426,12 @@ fn evaluate_expression(
             name,
             args,
             distinct,
-        } => evaluate_function(name, args, *distinct, bindings, graph),
-        Expression::Parameter(name) => Err(CypherError::Unsupported(format!(
-            "parameters not yet supported: ${}",
-            name
-        ))),
-        Expression::Case(case) => evaluate_case(case, bindings, graph),
+        } => evaluate_function(name, args, *distinct, bindings, graph, parameters),
+        Expression::Parameter(name) => parameters
+            .get(name)
+            .cloned()
+            .ok_or_else(|| CypherError::InvalidQuery(format!("missing query parameter: ${name}"))),
+        Expression::Case(case) => evaluate_case(case, bindings, graph, parameters),
     }
 }
 
@@ -1212,12 +1439,13 @@ fn evaluate_where(
     expr: &WhereExpr,
     bindings: &Bindings,
     graph: &Graph<impl CypherNode, impl CypherEdge>,
+    parameters: &Parameters,
 ) -> bool {
     match expr {
         WhereExpr::Eq(left, right) => {
             match (
-                evaluate_expression(left, bindings, graph),
-                evaluate_expression(right, bindings, graph),
+                evaluate_expression(left, bindings, graph, parameters),
+                evaluate_expression(right, bindings, graph, parameters),
             ) {
                 (Ok(l), Ok(r)) => matches!(cypher_value_eq(&l, &r), CypherValue::Boolean(true)),
                 _ => false,
@@ -1225,8 +1453,8 @@ fn evaluate_where(
         }
         WhereExpr::NotEq(left, right) => {
             match (
-                evaluate_expression(left, bindings, graph),
-                evaluate_expression(right, bindings, graph),
+                evaluate_expression(left, bindings, graph, parameters),
+                evaluate_expression(right, bindings, graph, parameters),
             ) {
                 (Ok(l), Ok(r)) => matches!(cypher_value_eq(&l, &r), CypherValue::Boolean(false)),
                 _ => false,
@@ -1234,8 +1462,8 @@ fn evaluate_where(
         }
         WhereExpr::Lt(left, right) => {
             match (
-                evaluate_expression(left, bindings, graph),
-                evaluate_expression(right, bindings, graph),
+                evaluate_expression(left, bindings, graph, parameters),
+                evaluate_expression(right, bindings, graph, parameters),
             ) {
                 (Ok(l), Ok(r)) => compare_cypher_values(&l, &r) == Some(std::cmp::Ordering::Less),
                 _ => false,
@@ -1243,8 +1471,8 @@ fn evaluate_where(
         }
         WhereExpr::Gt(left, right) => {
             match (
-                evaluate_expression(left, bindings, graph),
-                evaluate_expression(right, bindings, graph),
+                evaluate_expression(left, bindings, graph, parameters),
+                evaluate_expression(right, bindings, graph, parameters),
             ) {
                 (Ok(l), Ok(r)) => {
                     compare_cypher_values(&l, &r) == Some(std::cmp::Ordering::Greater)
@@ -1254,8 +1482,8 @@ fn evaluate_where(
         }
         WhereExpr::Le(left, right) => {
             match (
-                evaluate_expression(left, bindings, graph),
-                evaluate_expression(right, bindings, graph),
+                evaluate_expression(left, bindings, graph, parameters),
+                evaluate_expression(right, bindings, graph, parameters),
             ) {
                 (Ok(l), Ok(r)) => {
                     matches!(
@@ -1268,8 +1496,8 @@ fn evaluate_where(
         }
         WhereExpr::Ge(left, right) => {
             match (
-                evaluate_expression(left, bindings, graph),
-                evaluate_expression(right, bindings, graph),
+                evaluate_expression(left, bindings, graph, parameters),
+                evaluate_expression(right, bindings, graph, parameters),
             ) {
                 (Ok(l), Ok(r)) => {
                     matches!(
@@ -1281,48 +1509,51 @@ fn evaluate_where(
             }
         }
         WhereExpr::In(expression, values) => {
-            match evaluate_expression(expression, bindings, graph) {
+            match evaluate_expression(expression, bindings, graph, parameters) {
                 Ok(val) => values.iter().any(|v| v == &val),
                 _ => false,
             }
         }
         WhereExpr::StartsWith(expression, prefix) => {
-            match evaluate_expression(expression, bindings, graph) {
+            match evaluate_expression(expression, bindings, graph, parameters) {
                 Ok(CypherValue::String(s)) => s.starts_with(prefix),
                 _ => false,
             }
         }
         WhereExpr::EndsWith(expression, suffix) => {
-            match evaluate_expression(expression, bindings, graph) {
+            match evaluate_expression(expression, bindings, graph, parameters) {
                 Ok(CypherValue::String(s)) => s.ends_with(suffix),
                 _ => false,
             }
         }
         WhereExpr::Contains(expression, substring) => {
-            match evaluate_expression(expression, bindings, graph) {
+            match evaluate_expression(expression, bindings, graph, parameters) {
                 Ok(CypherValue::String(s)) => s.contains(substring),
                 _ => false,
             }
         }
         WhereExpr::IsNull(expression) => {
             matches!(
-                evaluate_expression(expression, bindings, graph),
+                evaluate_expression(expression, bindings, graph, parameters),
                 Ok(CypherValue::Null)
             )
         }
         WhereExpr::IsNotNull(expression) => !matches!(
-            evaluate_expression(expression, bindings, graph),
+            evaluate_expression(expression, bindings, graph, parameters),
             Ok(CypherValue::Null)
         ),
-        WhereExpr::Not(inner) => !evaluate_where(inner, bindings, graph),
+        WhereExpr::Not(inner) => !evaluate_where(inner, bindings, graph, parameters),
         WhereExpr::And(left, right) => {
-            evaluate_where(left, bindings, graph) && evaluate_where(right, bindings, graph)
+            evaluate_where(left, bindings, graph, parameters)
+                && evaluate_where(right, bindings, graph, parameters)
         }
         WhereExpr::Or(left, right) => {
-            evaluate_where(left, bindings, graph) || evaluate_where(right, bindings, graph)
+            evaluate_where(left, bindings, graph, parameters)
+                || evaluate_where(right, bindings, graph, parameters)
         }
         WhereExpr::Xor(left, right) => {
-            evaluate_where(left, bindings, graph) ^ evaluate_where(right, bindings, graph)
+            evaluate_where(left, bindings, graph, parameters)
+                ^ evaluate_where(right, bindings, graph, parameters)
         }
     }
 }
@@ -1544,6 +1775,7 @@ fn project_expression(
     expr: &Expression,
     bindings: &Bindings,
     graph: &Graph<impl CypherNode, impl CypherEdge>,
+    parameters: &Parameters,
 ) -> Result<ResultValue, CypherError> {
     match expr {
         Expression::Variable(var) => {
@@ -1594,7 +1826,7 @@ fn project_expression(
         }
         Expression::All => Ok(ResultValue::Scalar(CypherValue::Null)),
         other => {
-            let val = evaluate_expression(other, bindings, graph)?;
+            let val = evaluate_expression(other, bindings, graph, parameters)?;
             Ok(ResultValue::Scalar(val))
         }
     }
@@ -1629,6 +1861,7 @@ fn project_row(
     items: &[ReturnItem],
     bindings: &Bindings,
     graph: &Graph<impl CypherNode, impl CypherEdge>,
+    parameters: &Parameters,
 ) -> Result<Row, CypherError> {
     let mut values = HashMap::new();
     let mut expr_counter = 0;
@@ -1664,7 +1897,7 @@ fn project_row(
             continue;
         }
 
-        let result_value = project_expression(&item.expression, bindings, graph)?;
+        let result_value = project_expression(&item.expression, bindings, graph, parameters)?;
         values.insert(key, result_value);
     }
 
@@ -1773,17 +2006,22 @@ fn apply_skip_limit(rows: Vec<Row>, skip: Option<usize>, limit: Option<usize>) -
 // Read-only executor
 // ---------------------------------------------------------------------------
 
-struct ReadQueryExecutor<'a, N: CypherNode, E: CypherEdge> {
-    graph: &'a Graph<N, E>,
+struct ReadQueryExecutor<'g, 'p, N: CypherNode, E: CypherEdge> {
+    graph: &'g Graph<N, E>,
     strategy: MatchStrategy,
+    parameters: &'p Parameters,
 }
 
-impl<'a, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'a, N, E> {
-    fn new(graph: &'a Graph<N, E>, strategy: MatchStrategy) -> Self {
-        Self { graph, strategy }
+impl<'g, 'p, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'g, 'p, N, E> {
+    fn new(graph: &'g Graph<N, E>, strategy: MatchStrategy, parameters: &'p Parameters) -> Self {
+        Self {
+            graph,
+            strategy,
+            parameters,
+        }
     }
 
-    fn execute(self, query: CypherQuery) -> Result<QueryResult<'a, N, E>, CypherError> {
+    fn execute(self, query: CypherQuery) -> Result<QueryResult<'g, N, E>, CypherError> {
         let mut bindings: Vec<Bindings> = vec![HashMap::new()];
         let mut return_items: Option<Vec<ReturnItem>> = None;
         let mut return_distinct = false;
@@ -1799,7 +2037,8 @@ impl<'a, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'a, N, E> {
                 } => {
                     bindings = self.execute_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
-                        bindings.retain(|b| evaluate_where(&where_expr, b, self.graph));
+                        bindings
+                            .retain(|b| evaluate_where(&where_expr, b, self.graph, self.parameters));
                     }
                 }
                 Clause::OptionalMatch {
@@ -1808,7 +2047,8 @@ impl<'a, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'a, N, E> {
                 } => {
                     bindings = self.execute_optional_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
-                        bindings.retain(|b| evaluate_where(&where_expr, b, self.graph));
+                        bindings
+                            .retain(|b| evaluate_where(&where_expr, b, self.graph, self.parameters));
                     }
                 }
                 Clause::Unwind {
@@ -1848,7 +2088,8 @@ impl<'a, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'a, N, E> {
             for binding in &bindings {
                 let mut keys = Vec::with_capacity(sort_items.len());
                 for item in sort_items {
-                    let val = evaluate_expression(&item.expression, binding, self.graph)?;
+                    let val =
+                        evaluate_expression(&item.expression, binding, self.graph, self.parameters)?;
                     keys.push(val);
                 }
                 sort_keys.push(keys);
@@ -1875,7 +2116,7 @@ impl<'a, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'a, N, E> {
         if let Some(items) = return_items {
             let columns = result_columns(&items);
             for binding in bindings {
-                let row = project_row(&items, &binding, self.graph)?;
+                let row = project_row(&items, &binding, self.graph, self.parameters)?;
                 rows.push(row);
             }
 
@@ -1960,6 +2201,7 @@ impl<'a> MutQueryExecutor<'a> {
 
     fn execute(mut self, query: CypherQuery) -> Result<(), CypherError> {
         let mut bindings: Vec<Bindings> = vec![HashMap::new()];
+        let parameters = Parameters::new();
 
         for clause in query.clauses {
             match clause {
@@ -1969,7 +2211,8 @@ impl<'a> MutQueryExecutor<'a> {
                 } => {
                     bindings = self.execute_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
-                        bindings.retain(|b| evaluate_where(&where_expr, b, self.graph));
+                        bindings
+                            .retain(|b| evaluate_where(&where_expr, b, self.graph, &parameters));
                     }
                 }
                 Clause::OptionalMatch {
@@ -1978,7 +2221,8 @@ impl<'a> MutQueryExecutor<'a> {
                 } => {
                     bindings = self.execute_optional_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
-                        bindings.retain(|b| evaluate_where(&where_expr, b, self.graph));
+                        bindings
+                            .retain(|b| evaluate_where(&where_expr, b, self.graph, &parameters));
                     }
                 }
                 Clause::Create { patterns } => {
@@ -1998,7 +2242,7 @@ impl<'a> MutQueryExecutor<'a> {
                         let test_results = matcher.match_single_path(&pattern, bindings_row);
                         if test_results.is_empty() {
                             self.apply_path_pattern_mut(bindings_row, &pattern)?;
-                            self.apply_set_items(bindings_row, &on_create)?;
+                            self.apply_set_items(bindings_row, &on_create, &parameters)?;
                         } else {
                             // Propagate matched bindings into bindings_row
                             let first = &test_results[0];
@@ -2014,7 +2258,7 @@ impl<'a> MutQueryExecutor<'a> {
                                     bindings_row.insert(k.clone(), *v);
                                 }
                             }
-                            self.apply_set_items(bindings_row, &on_match)?;
+                            self.apply_set_items(bindings_row, &on_match, &parameters)?;
                         }
                     }
                 }
@@ -2023,7 +2267,7 @@ impl<'a> MutQueryExecutor<'a> {
                 }
                 Clause::Set { items } => {
                     for bindings_row in &bindings {
-                        self.apply_set_items(bindings_row, &items)?;
+                        self.apply_set_items(bindings_row, &items, &parameters)?;
                     }
                 }
                 Clause::Remove { items } => {
@@ -2154,6 +2398,7 @@ impl<'a> MutQueryExecutor<'a> {
         &mut self,
         bindings: &Bindings,
         items: &[SetItem],
+        parameters: &Parameters,
     ) -> Result<(), CypherError> {
         for item in items {
             match item {
@@ -2163,7 +2408,7 @@ impl<'a> MutQueryExecutor<'a> {
                     value,
                 } => {
                     if let Some(bound) = bindings.get(variable) {
-                        let val = evaluate_expression(value, bindings, self.graph)?;
+                        let val = evaluate_expression(value, bindings, self.graph, parameters)?;
                         match bound {
                             BoundValue::Node(idx) => {
                                 if matches!(val, CypherValue::Null) {
