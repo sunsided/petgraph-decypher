@@ -1057,6 +1057,41 @@ fn query_prepared_query_rejects_mutation_clauses() {
     );
 }
 
+#[test]
+fn query_prepared_query_execute_variants_match_direct_execution() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice"})
+           CREATE (b:Person {name: "Bob"})"#,
+    )
+    .unwrap();
+    let query = "MATCH (n:Person) RETURN n.name AS name ORDER BY name";
+    let prepared = PreparedQuery::parse(query).unwrap();
+
+    let direct = collect_rows(g.cypher(query).unwrap());
+    let prepared_default = collect_rows(prepared.execute(&g).unwrap());
+    assert_eq!(prepared_default, direct);
+
+    let prepared_strategy = collect_rows(
+        prepared
+            .execute_with_strategy(&g, MatchStrategy::Fast)
+            .unwrap(),
+    );
+    let direct_strategy = collect_rows(g.cypher_with_strategy(query, MatchStrategy::Fast).unwrap());
+    assert_eq!(prepared_strategy, direct_strategy);
+
+    let params = Parameters::new();
+    let prepared_strategy_params = collect_rows(
+        prepared
+            .execute_with_strategy_params(&g, MatchStrategy::Backtrack, &params)
+            .unwrap(),
+    );
+    let direct_strategy_params = collect_rows(
+        g.cypher_with_strategy_params(query, MatchStrategy::Backtrack, &params)
+            .unwrap(),
+    );
+    assert_eq!(prepared_strategy_params, direct_strategy_params);
+}
+
 // ---------------------------------------------------------------------------
 // OPTIONAL MATCH
 // ---------------------------------------------------------------------------
