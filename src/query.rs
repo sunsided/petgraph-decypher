@@ -59,6 +59,60 @@ type Bindings = HashMap<String, BoundValue>;
 /// For example, query text `$name` is resolved from the `"name"` key.
 pub type Parameters = HashMap<String, CypherValue>;
 
+/// A parsed and validated read-only Cypher query that can be executed multiple times.
+#[derive(Debug, Clone)]
+pub struct PreparedQuery {
+    query: CypherQuery,
+}
+
+impl PreparedQuery {
+    /// Parse and validate a read-only Cypher query once for repeated execution.
+    pub fn parse(query: &str) -> Result<Self, CypherError> {
+        let query = crate::parse_cypher(query)?;
+        validate_read_query(&query)?;
+        Ok(Self { query })
+    }
+
+    /// Execute the prepared query with default strategy and no parameters.
+    pub fn execute<'g, N: CypherNode, E: CypherEdge>(
+        &self,
+        graph: &'g Graph<N, E>,
+    ) -> Result<QueryResult<'g, N, E>, CypherError> {
+        let params = Parameters::new();
+        self.execute_with_strategy_params(graph, MatchStrategy::default(), &params)
+    }
+
+    /// Execute the prepared query with default strategy and parameters.
+    pub fn execute_params<'g, N: CypherNode, E: CypherEdge>(
+        &self,
+        graph: &'g Graph<N, E>,
+        parameters: &Parameters,
+    ) -> Result<QueryResult<'g, N, E>, CypherError> {
+        self.execute_with_strategy_params(graph, MatchStrategy::default(), parameters)
+    }
+
+    /// Execute the prepared query with a specific match strategy and no parameters.
+    pub fn execute_with_strategy<'g, N: CypherNode, E: CypherEdge>(
+        &self,
+        graph: &'g Graph<N, E>,
+        strategy: MatchStrategy,
+    ) -> Result<QueryResult<'g, N, E>, CypherError> {
+        let params = Parameters::new();
+        self.execute_with_strategy_params(graph, strategy, &params)
+    }
+
+    /// Execute the prepared query with a specific match strategy and parameters.
+    pub fn execute_with_strategy_params<'g, N: CypherNode, E: CypherEdge>(
+        &self,
+        graph: &'g Graph<N, E>,
+        strategy: MatchStrategy,
+        parameters: &Parameters,
+    ) -> Result<QueryResult<'g, N, E>, CypherError> {
+        validate_read_query_parameters(&self.query, parameters)?;
+        ReadQueryExecutor::new(graph, strategy, parameters).execute(&self.query)
+    }
+}
+
 /// An iterator over query result rows.
 ///
 /// Both the MATCH and RETURN projection phases are executed eagerly.
@@ -234,7 +288,7 @@ impl<N: CypherNode, E: CypherEdge> PetgraphCypherRead<N, E> for Graph<N, E> {
         let ast = crate::parse_cypher(query)?;
         validate_read_query(&ast)?;
         validate_read_query_parameters(&ast, parameters)?;
-        ReadQueryExecutor::new(self, strategy, parameters).execute(ast)
+        ReadQueryExecutor::new(self, strategy, parameters).execute(&ast)
     }
 }
 
@@ -282,7 +336,7 @@ impl PetgraphCypher for Graph<NodeData, EdgeData> {
         let ast = crate::parse_cypher(query)?;
         validate_read_query(&ast)?;
         validate_read_query_parameters(&ast, parameters)?;
-        ReadQueryExecutor::new(self, strategy, parameters).execute(ast)
+        ReadQueryExecutor::new(self, strategy, parameters).execute(&ast)
     }
 }
 
@@ -2142,7 +2196,7 @@ impl<'g, 'p, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'g, 'p, N, E> {
         }
     }
 
-    fn execute(self, query: CypherQuery) -> Result<QueryResult<'g, N, E>, CypherError> {
+    fn execute(self, query: &CypherQuery) -> Result<QueryResult<'g, N, E>, CypherError> {
         let mut bindings: Vec<Bindings> = vec![HashMap::new()];
         let mut return_items: Option<Vec<ReturnItem>> = None;
         let mut return_distinct = false;
@@ -2150,7 +2204,7 @@ impl<'g, 'p, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'g, 'p, N, E> {
         let mut skip: Option<usize> = None;
         let mut limit: Option<usize> = None;
 
-        for clause in query.clauses {
+        for clause in &query.clauses {
             match clause {
                 Clause::Match {
                     patterns,
@@ -2158,9 +2212,8 @@ impl<'g, 'p, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'g, 'p, N, E> {
                 } => {
                     bindings = self.execute_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
-                        bindings.retain(|b| {
-                            evaluate_where(&where_expr, b, self.graph, self.parameters)
-                        });
+                        bindings
+                            .retain(|b| evaluate_where(where_expr, b, self.graph, self.parameters));
                     }
                 }
                 Clause::OptionalMatch {
@@ -2169,9 +2222,8 @@ impl<'g, 'p, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'g, 'p, N, E> {
                 } => {
                     bindings = self.execute_optional_match(patterns, bindings);
                     if let Some(where_expr) = where_clause {
-                        bindings.retain(|b| {
-                            evaluate_where(&where_expr, b, self.graph, self.parameters)
-                        });
+                        bindings
+                            .retain(|b| evaluate_where(where_expr, b, self.graph, self.parameters));
                     }
                 }
                 Clause::Unwind {
@@ -2181,17 +2233,17 @@ impl<'g, 'p, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'g, 'p, N, E> {
                     bindings = self.execute_unwind(expression, variable, bindings)?;
                 }
                 Clause::Return { items, distinct } => {
-                    return_items = Some(items);
-                    return_distinct = distinct;
+                    return_items = Some(items.clone());
+                    return_distinct = *distinct;
                 }
                 Clause::OrderBy { items } => {
-                    order_by = Some(items);
+                    order_by = Some(items.clone());
                 }
                 Clause::Skip { count } => {
-                    skip = Some(count);
+                    skip = Some(*count);
                 }
                 Clause::Limit { count } => {
-                    limit = Some(count);
+                    limit = Some(*count);
                 }
                 Clause::Create { .. }
                 | Clause::Merge { .. }
@@ -2261,7 +2313,7 @@ impl<'g, 'p, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'g, 'p, N, E> {
 
     fn execute_match(
         &self,
-        patterns: Vec<PathPattern>,
+        patterns: &[PathPattern],
         input_bindings: Vec<Bindings>,
     ) -> Vec<Bindings> {
         if patterns.is_empty() {
@@ -2271,7 +2323,7 @@ impl<'g, 'p, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'g, 'p, N, E> {
         let matcher = PatternMatcher::new(self.graph, self.strategy);
         let mut results = Vec::new();
         for existing_bindings in &input_bindings {
-            let pattern_results = matcher.match_patterns(&patterns, existing_bindings);
+            let pattern_results = matcher.match_patterns(patterns, existing_bindings);
             results.extend(pattern_results);
         }
         results
@@ -2279,7 +2331,7 @@ impl<'g, 'p, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'g, 'p, N, E> {
 
     fn execute_optional_match(
         &self,
-        patterns: Vec<PathPattern>,
+        patterns: &[PathPattern],
         input_bindings: Vec<Bindings>,
     ) -> Vec<Bindings> {
         if patterns.is_empty() {
@@ -2289,7 +2341,7 @@ impl<'g, 'p, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'g, 'p, N, E> {
         let matcher = PatternMatcher::new(self.graph, self.strategy);
         let mut results = Vec::new();
         for existing_bindings in &input_bindings {
-            let pattern_results = matcher.match_patterns(&patterns, existing_bindings);
+            let pattern_results = matcher.match_patterns(patterns, existing_bindings);
             if pattern_results.is_empty() {
                 // Missing bindings already behave like NULL in the evaluator/projector,
                 // so we just propagate the existing bindings without additions.
@@ -2303,8 +2355,8 @@ impl<'g, 'p, N: CypherNode, E: CypherEdge> ReadQueryExecutor<'g, 'p, N, E> {
 
     fn execute_unwind(
         &self,
-        _expression: Expression,
-        _variable: String,
+        _expression: &Expression,
+        _variable: &str,
         _input_bindings: Vec<Bindings>,
     ) -> Result<Vec<Bindings>, CypherError> {
         Err(CypherError::Unsupported(

@@ -3,8 +3,8 @@
 use petgraph::Graph;
 use petgraph_decypher::{
     CypherEdge, CypherError, CypherNode, CypherProperties, CypherValue, MatchStrategy, NodeData,
-    Parameters, PetgraphCypher, QueryResult, ResultValue, Row, build_graph_from_cypher,
-    build_graph_from_cypher_typed,
+    Parameters, PetgraphCypher, PreparedQuery, QueryResult, ResultValue, Row,
+    build_graph_from_cypher, build_graph_from_cypher_typed,
 };
 use std::collections::HashMap;
 
@@ -1021,6 +1021,75 @@ fn query_missing_parameter_returns_error() {
         err,
         CypherError::InvalidQuery("missing query parameter: $name".into())
     );
+}
+
+#[test]
+fn query_prepared_query_matches_direct_execution_with_params() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice"})
+           CREATE (b:Person {name: "Bob"})"#,
+    )
+    .unwrap();
+
+    let query = r#"MATCH (n:Person) WHERE n.name = $name RETURN n.name AS name"#;
+    let prepared = PreparedQuery::parse(query).unwrap();
+
+    let mut alice = Parameters::new();
+    alice.insert("name".into(), CypherValue::String("Alice".into()));
+    let prepared_alice_rows = collect_rows(prepared.execute_params(&g, &alice).unwrap());
+    let direct_alice_rows = collect_rows(g.cypher_params(query, &alice).unwrap());
+    assert_eq!(prepared_alice_rows, direct_alice_rows);
+
+    let mut bob = Parameters::new();
+    bob.insert("name".into(), CypherValue::String("Bob".into()));
+    let prepared_bob_rows = collect_rows(prepared.execute_params(&g, &bob).unwrap());
+    let direct_bob_rows = collect_rows(g.cypher_params(query, &bob).unwrap());
+    assert_eq!(prepared_bob_rows, direct_bob_rows);
+}
+
+#[test]
+fn query_prepared_query_rejects_mutation_clauses() {
+    let err = PreparedQuery::parse("CREATE (n:Person {name: \"Alice\"})")
+        .expect_err("expected parse-time rejection of mutation clause");
+    assert_eq!(
+        err,
+        CypherError::Unsupported("CREATE not allowed in cypher(); use cypher_mut()".into())
+    );
+}
+
+#[test]
+fn query_prepared_query_execute_variants_match_direct_execution() {
+    let g = build_graph_from_cypher(
+        r#"CREATE (a:Person {name: "Alice"})
+           CREATE (b:Person {name: "Bob"})"#,
+    )
+    .unwrap();
+    let query = "MATCH (n:Person) RETURN n.name AS name ORDER BY name";
+    let prepared = PreparedQuery::parse(query).unwrap();
+
+    let direct = collect_rows(g.cypher(query).unwrap());
+    let prepared_default = collect_rows(prepared.execute(&g).unwrap());
+    assert_eq!(prepared_default, direct);
+
+    let prepared_strategy = collect_rows(
+        prepared
+            .execute_with_strategy(&g, MatchStrategy::Fast)
+            .unwrap(),
+    );
+    let direct_strategy = collect_rows(g.cypher_with_strategy(query, MatchStrategy::Fast).unwrap());
+    assert_eq!(prepared_strategy, direct_strategy);
+
+    let params = Parameters::new();
+    let prepared_strategy_params = collect_rows(
+        prepared
+            .execute_with_strategy_params(&g, MatchStrategy::Backtrack, &params)
+            .unwrap(),
+    );
+    let direct_strategy_params = collect_rows(
+        g.cypher_with_strategy_params(query, MatchStrategy::Backtrack, &params)
+            .unwrap(),
+    );
+    assert_eq!(prepared_strategy_params, direct_strategy_params);
 }
 
 // ---------------------------------------------------------------------------

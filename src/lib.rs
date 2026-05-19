@@ -49,7 +49,9 @@ pub use ast::{
     UnaryOp, WhereExpr,
 };
 pub use error::CypherError;
-pub use query::{MatchStrategy, Parameters, PetgraphCypher, QueryResult, ResultValue, Row};
+pub use query::{
+    MatchStrategy, Parameters, PetgraphCypher, PreparedQuery, QueryResult, ResultValue, Row,
+};
 
 use petgraph::Graph;
 use std::collections::HashMap;
