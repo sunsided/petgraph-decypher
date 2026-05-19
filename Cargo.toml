@@ -1,6 +1,6 @@
 [package]
 name = "petgraph-decypher"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Build petgraph graphs from OpenCypher queries"
 license = "EUPL-1.2 OR MIT OR Apache-2.0"
@@ -17,7 +17,7 @@ rng-fastrand = ["dep:fastrand"]
 
 [dependencies]
 petgraph = "0.8"
-decypher = "0.2.0-alpha.4"
+decypher = "0.2.0-alpha.5"
 thiserror = "2"
 itertools = "0.14"
 rand = { version = "0.10", optional = true }
