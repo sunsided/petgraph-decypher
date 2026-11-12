@@ -50,13 +50,10 @@ fn parse_create_left_directed_relationship() {
 }
 
 #[test]
-fn parse_create_undirected_relationship() {
-    let q = parse_cypher("CREATE (a)-[:PEER]-(b)").unwrap();
-    let Clause::Create { patterns } = &q.clauses[0] else {
-        panic!("expected Create clause");
-    };
-    let (rel, _) = &patterns[0].rels[0];
-    assert_eq!(rel.direction, RelDirection::Both);
+fn parse_create_undirected_relationship_is_rejected() {
+    // openCypher: CREATE needs a direction for every relationship.
+    let result = parse_cypher("CREATE (a)-[:PEER]-(b)");
+    assert!(matches!(result, Err(CypherError::ParseError(_))));
 }
 
 #[test]
@@ -195,14 +192,10 @@ fn parse_semicolon_separated_statements() {
 }
 
 #[test]
-fn parse_simple_arrow_relationship() {
-    let q = parse_cypher("CREATE (a)-->(b)").unwrap();
-    let Clause::Create { patterns } = &q.clauses[0] else {
-        panic!();
-    };
-    let (rel, _) = &patterns[0].rels[0];
-    assert_eq!(rel.direction, RelDirection::Right);
-    assert!(rel.rel_type.is_none());
+fn parse_create_untyped_relationship_is_rejected() {
+    // openCypher: CREATE needs exactly one type for every relationship.
+    let result = parse_cypher("CREATE (a)-->(b)");
+    assert!(matches!(result, Err(CypherError::ParseError(_))));
 }
 
 #[test]

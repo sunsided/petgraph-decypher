@@ -42,7 +42,7 @@ assert_eq!(graph.edge_count(), 1);
 | Mutation queries: `CREATE`, `MERGE`, `SET`, `REMOVE`, `[DETACH] DELETE` | ✅ |
 | Scalar functions (e.g. `size`, `toString`, `toUpper`, `toLower`, `trim`) | ✅ |
 | Multiple clauses / semicolon-separated statements | ✅ |
-| Multi-label nodes and undirected relationships | ✅ |
+| Multi-label nodes and undirected relationships (in `MATCH`; `CREATE` needs a direction and a type) | ✅ |
 | String, integer, float, bool, null, list, map values | ✅ |
 
 ## Current limitations and planned work

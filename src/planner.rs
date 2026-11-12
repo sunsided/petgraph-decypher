@@ -671,6 +671,12 @@ impl<'a> PlanningContext<'a> {
                         properties,
                     })
                 }
+                decypher::hir::ops::SetItem::SetDynamicProperty { .. } => {
+                    Err(CypherError::Unsupported(
+                        "SET with a dynamic property key (e.g. `n[$key]`) is not supported"
+                            .to_string(),
+                    ))
+                }
             })
             .collect()
     }
