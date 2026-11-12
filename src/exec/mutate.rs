@@ -8,7 +8,7 @@ use super::{Executor, Result, Row};
 use crate::element::{CypherEdge, CypherEdgeMut, CypherNode, CypherNodeMut};
 use crate::error::CypherError;
 use crate::graph::{CypherGraph, CypherGraphMut};
-use crate::prepared::Query;
+use crate::prepared::Unit;
 use crate::value::{Properties, Value};
 
 /// A node or relationship being updated.
@@ -399,17 +399,17 @@ impl<'q, A: Access> Executor<'q, A> {
     /// The query outlives the executor's borrows, so names from it can be
     /// held while the graph is mutated.
     fn binding_name(&self, b: decypher::hir::BindingId) -> &'q str {
-        let q: &'q Query = self.q;
+        let q: &'q Unit = self.q;
         &q.hir.arenas.bindings.get(b).name
     }
 
     fn key(&self, key: decypher::hir::arena::PropertyKeyId) -> &'q str {
-        let q: &'q Query = self.q;
+        let q: &'q Unit = self.q;
         &q.keys[key.0]
     }
 
     fn label(&self, label: decypher::hir::arena::LabelId) -> &'q str {
-        let q: &'q Query = self.q;
+        let q: &'q Unit = self.q;
         &q.labels[label.0]
     }
 

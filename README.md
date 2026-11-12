@@ -54,9 +54,10 @@ assert_eq!(row.get("b.age"), Some(&Value::from(42)));
 
 `cargo test --test tck` executes the official openCypher TCK (release 2024.3,
 vendored in [`tests/tck`](tests/tck/README.md)) against petgraph graphs and
-compares result tables, errors and side effects: **2759 of 3897 scenarios
-pass**. Of the 1087 failing, 1004 need temporal types; most others are
-unsupported subqueries or operator-precedence issues in the parser. They are
+compares result tables, errors and side effects: **2744 of 3897 scenarios
+pass**. Of the 1102 failing, most need temporal types; the others are
+`EXISTS` / `COUNT` subqueries and argument errors that decypher reports
+while preparing a query where the TCK expects them at runtime. They are
 listed in `tests/tck/known_failures.txt`; the test fails if a new scenario
 breaks or a listed one starts passing.
 
