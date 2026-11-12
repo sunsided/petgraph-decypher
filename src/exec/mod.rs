@@ -18,7 +18,7 @@ use petgraph::graph::{EdgeIndex, NodeIndex};
 
 use crate::error::CypherError;
 use crate::graph::CypherGraph;
-use crate::prepared::{Branch, Query};
+use crate::prepared::{Branch, Query, Unit};
 use crate::result::QueryResult;
 use crate::value::{Properties, Value};
 use functions::{Accumulator, Function};
@@ -32,9 +32,15 @@ type Result<T> = std::result::Result<T, CypherError>;
 pub type Parameters = std::collections::HashMap<String, Value>;
 
 pub(crate) struct Executor<'q, A: Access> {
-    q: &'q Query,
+    query: &'q Query,
+    /// The unit (HIR arenas and names) of the branch being executed.
+    q: &'q Unit,
     access: A,
-    params: Vec<Value>,
+    /// Parameter values per unit, indexed by its `ParameterId`s.
+    unit_params: Vec<Vec<Value>>,
+    /// The index of `q` in the query's units.
+    unit: usize,
+    /// Row width of `q`: its number of bindings.
     slots: usize,
     deleted_nodes: HashSet<NodeIndex>,
     deleted_edges: HashSet<EdgeIndex>,
@@ -42,24 +48,32 @@ pub(crate) struct Executor<'q, A: Access> {
 
 impl<'q, A: Access> Executor<'q, A> {
     /// Runs every statement; the result is the last statement's.
-    pub(crate) fn run(q: &'q Query, access: A, params: &Parameters) -> Result<QueryResult> {
-        let params =
-            q.parameters
-                .iter()
-                .map(|name| {
-                    params.get(name).cloned().ok_or_else(|| {
-                        CypherError::InvalidQuery(format!("missing parameter ${name}"))
+    pub(crate) fn run(query: &'q Query, access: A, params: &Parameters) -> Result<QueryResult> {
+        let unit_params = query
+            .units
+            .iter()
+            .map(|unit| {
+                unit.parameters
+                    .iter()
+                    .map(|name| {
+                        params.get(name).cloned().ok_or_else(|| {
+                            CypherError::InvalidQuery(format!("missing parameter ${name}"))
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>>>()?;
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut ex = Executor {
-            q,
+            query,
+            q: &query.units[0],
             access,
-            params,
-            slots: q.hir.arenas.bindings.iter().count(),
+            unit_params,
+            unit: 0,
+            slots: 0,
             deleted_nodes: HashSet::new(),
             deleted_edges: HashSet::new(),
         };
+        ex.enter_unit(0);
         match ex.run_statements() {
             Ok(result) => Ok(result),
             Err(e) => {
@@ -69,9 +83,21 @@ impl<'q, A: Access> Executor<'q, A> {
         }
     }
 
+    /// Makes `unit` the one expressions, names and parameters resolve against.
+    fn enter_unit(&mut self, unit: usize) {
+        self.unit = unit;
+        self.q = &self.query.units[unit];
+        self.slots = self.q.hir.arenas.bindings.iter().count();
+    }
+
+    /// The value of a parameter of the current unit.
+    pub(super) fn param(&self, id: decypher::hir::arena::ParameterId) -> &Value {
+        &self.unit_params[self.unit][id.0]
+    }
+
     fn run_statements(&mut self) -> Result<QueryResult> {
         let mut result = QueryResult::default();
-        for statement in &self.q.statements {
+        for statement in &self.query.statements {
             let mut rows = Vec::new();
             for branch in &statement.branches {
                 rows.extend(self.run_branch(branch)?);
@@ -91,6 +117,7 @@ impl<'q, A: Access> Executor<'q, A> {
     }
 
     fn run_branch(&mut self, branch: &Branch) -> Result<Vec<Vec<Value>>> {
+        self.enter_unit(branch.unit);
         let mut rows = vec![vec![None; self.slots]];
         for part in &self.q.hir.parts[branch.parts.clone()] {
             for op in &part.operations {
@@ -298,7 +325,7 @@ impl<'q, A: Access> Executor<'q, A> {
     fn aggregate(&self, a: &decypher::hir::ops::AggregateOp, rows: Vec<Row>) -> Result<Vec<Row>> {
         let mut groups: Vec<(Vec<Value>, Vec<Accumulator>)> = Vec::new();
         let mut index: BTreeMap<Ordered, usize> = BTreeMap::new();
-        let new_group = |q: &Query| {
+        let new_group = |q: &Unit| {
             a.aggregates
                 .iter()
                 .map(|item| match q.functions[item.function.0] {

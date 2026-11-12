@@ -4,9 +4,7 @@
 use std::ops::Range;
 
 use decypher::ast::clause::Return;
-use decypher::ast::expr::Expression;
 use decypher::ast::query::{QueryBody, SinglePartBody, SingleQuery, SingleQueryKind};
-use decypher::ast::{RegularQuery, ToCypher};
 use decypher::hir::arena::{Id, Interner};
 use decypher::hir::ops::Operation;
 use decypher::hir::{BindingId, HirQuery, LowerConfig};
@@ -34,17 +32,22 @@ use crate::exec::functions::Function;
 /// ```
 #[derive(Debug, Clone)]
 pub struct Query {
-    pub(crate) hir: HirQuery,
-    pub(crate) labels: Vec<String>,
-    pub(crate) rel_types: Vec<String>,
-    pub(crate) keys: Vec<String>,
-    pub(crate) parameters: Vec<String>,
-    pub(crate) functions: Vec<Function>,
+    /// The lowered query and, after it, one unit per `UNION` branch: each
+    /// has its own HIR arenas.
+    pub(crate) units: Vec<Unit>,
     pub(crate) statements: Vec<Statement>,
-    /// Per expression: a comparison continuing the chain of the comparison
-    /// on its left (`a < b < c`), see [`chained_comparisons`].
-    pub(crate) chained: Vec<bool>,
     read_only: bool,
+}
+
+/// A lowered query with its interned names resolved once.
+#[derive(Debug, Clone)]
+pub(crate) struct Unit {
+    pub hir: HirQuery,
+    pub labels: Vec<String>,
+    pub rel_types: Vec<String>,
+    pub keys: Vec<String>,
+    pub parameters: Vec<String>,
+    pub functions: Vec<Function>,
 }
 
 /// One `;`-separated statement: one branch, or several joined by `UNION`.
@@ -55,9 +58,10 @@ pub(crate) struct Statement {
     pub distinct: bool,
 }
 
-/// A single query: a run of [`HirQuery::parts`] and the columns it returns.
+/// A single query: a run of parts of one unit and the columns it returns.
 #[derive(Debug, Clone)]
 pub(crate) struct Branch {
+    pub unit: usize,
     pub parts: Range<usize>,
     pub columns: Vec<String>,
     /// The binding holding each column.
@@ -66,86 +70,135 @@ pub(crate) struct Branch {
     pub returns: bool,
 }
 
-impl Query {
-    /// Parses and analyzes `text`.
-    pub fn new(text: &str) -> Result<Self, CypherError> {
-        let ast = decypher::parse(text).map_err(|e| CypherError::ParseError(e.to_string()))?;
-        let cst = decypher::parse_cst(text).tree;
+fn mismatch() -> CypherError {
+    CypherError::InvalidQuery("query parts do not match the parsed query".into())
+}
 
-        let mut catalog = decypher::hir::Catalog::default();
-        catalog.set_strict(true);
-        let config = LowerConfig { catalog };
-        let mut hir = decypher::hir::lower::lower(&ast, &config)
-            .map_err(|d| CypherError::InvalidQuery(d.to_string()))?;
-        fix_pattern_offsets(&ast, &mut hir)?;
-
+impl Unit {
+    fn new(hir: HirQuery) -> Result<Self, CypherError> {
         let functions = names(&hir.arenas.functions)
             .iter()
             .map(|name| Function::resolve(name))
             .collect::<Result<Vec<_>, _>>()?;
-
-        let mut statements = Vec::new();
-        let mut next_part = 0;
-        for body in &ast.statements {
-            let singles: Vec<(&SingleQuery, bool)> = match body {
-                QueryBody::SingleQuery(sq) => vec![(sq, true)],
-                QueryBody::Regular(RegularQuery {
-                    single_query,
-                    unions,
-                }) => std::iter::once((single_query, true))
-                    .chain(unions.iter().map(|u| (&u.single_query, u.all)))
-                    .collect(),
-                QueryBody::Standalone(_) => {
-                    return Err(CypherError::Unsupported("procedure calls".into()));
-                }
-                _ => return Err(CypherError::Unsupported("schema and admin commands".into())),
-            };
-            let distinct = singles.iter().skip(1).any(|(_, all)| !all);
-            let mut branches = Vec::new();
-            for (sq, _) in singles {
-                let count = match &sq.kind {
-                    SingleQueryKind::SinglePart(_) => 1,
-                    SingleQueryKind::MultiPart(mp) => mp.parts.len() + 1,
-                };
-                let parts = next_part..next_part + count;
-                next_part += count;
-                let last = hir.parts.get(parts.end - 1).ok_or_else(|| {
-                    CypherError::InvalidQuery("query parts do not match the parsed query".into())
-                })?;
-                let returns = matches!(last.operations.last(), Some(Operation::Return(_)));
-                let outputs = if returns {
-                    hir.arenas.scopes.get(last.output_scope).bindings.clone()
-                } else {
-                    Vec::new()
-                };
-                let columns = column_names(final_return(sq), &outputs, &hir, &cst);
-                branches.push(Branch {
-                    parts,
-                    columns,
-                    outputs,
-                    returns,
-                });
-            }
-            statements.push(Statement { branches, distinct });
-        }
-        if next_part != hir.parts.len() {
-            return Err(CypherError::InvalidQuery(
-                "query parts do not match the parsed query".into(),
-            ));
-        }
-
-        let chained = chained_comparisons(&hir, text);
-        let read_only = !hir.parts.iter().any(|p| p.operations.iter().any(mutates));
         Ok(Self {
             labels: names(&hir.arenas.labels),
             rel_types: names(&hir.arenas.relationship_types),
             keys: names(&hir.arenas.property_keys),
             parameters: names(&hir.arenas.parameters),
             functions,
-            statements,
-            chained,
-            read_only,
             hir,
+        })
+    }
+
+    /// The branch of `sq`, made of `parts` of this unit.
+    fn branch(
+        &self,
+        index: usize,
+        parts: Range<usize>,
+        sq: &SingleQuery,
+    ) -> Result<Branch, CypherError> {
+        // The executor slices the parts by this range, so it must be valid.
+        if parts.start >= parts.end || parts.end > self.hir.parts.len() {
+            return Err(mismatch());
+        }
+        let last = &self.hir.parts[parts.end - 1];
+        let returns = matches!(last.operations.last(), Some(Operation::Return(_)));
+        let outputs = if returns {
+            self.hir
+                .arenas
+                .scopes
+                .get(last.output_scope)
+                .bindings
+                .clone()
+        } else {
+            Vec::new()
+        };
+        let columns = column_names(final_return(sq), &outputs, &self.hir);
+        Ok(Branch {
+            unit: index,
+            parts,
+            columns,
+            outputs,
+            returns,
+        })
+    }
+}
+
+impl Query {
+    /// Parses and analyzes `text`.
+    pub fn new(text: &str) -> Result<Self, CypherError> {
+        let ast = decypher::parse(text).map_err(|e| CypherError::ParseError(e.to_string()))?;
+
+        let mut catalog = decypher::hir::Catalog::default();
+        catalog.set_strict(true);
+        let config = LowerConfig { catalog };
+        let hir = decypher::hir::lower::lower(&ast, &config)
+            .map_err(|d| CypherError::InvalidQuery(d.to_string()))?;
+
+        let mut units = vec![Unit::new(hir)?];
+        let mut statements = Vec::new();
+        let mut next_part = 0;
+        for body in &ast.statements {
+            let (single, unions) = match body {
+                QueryBody::SingleQuery(sq) => (sq, &[][..]),
+                QueryBody::Regular(rq) => (&rq.single_query, &rq.unions[..]),
+                QueryBody::Standalone(_) => {
+                    return Err(CypherError::Unsupported("procedure calls".into()));
+                }
+                _ => return Err(CypherError::Unsupported("schema and admin commands".into())),
+            };
+            if unions.is_empty() {
+                let count = match &single.kind {
+                    SingleQueryKind::SinglePart(_) => 1,
+                    SingleQueryKind::MultiPart(mp) => mp.parts.len() + 1,
+                };
+                let parts = next_part..next_part + count;
+                next_part += count;
+                let branch = units[0].branch(0, parts, single)?;
+                statements.push(Statement {
+                    branches: vec![branch],
+                    distinct: false,
+                });
+                continue;
+            }
+            // A union is one part holding the branches as queries of their own.
+            // Move the branches out: each becomes a unit of its own, and the
+            // read-only check below scans those units.
+            let Some(Operation::Union(union)) = units[0]
+                .hir
+                .parts
+                .get_mut(next_part)
+                .and_then(|p| p.operations.first_mut())
+            else {
+                return Err(mismatch());
+            };
+            let (branch_hirs, distinct) = (std::mem::take(&mut union.branches), union.distinct);
+            next_part += 1;
+            let singles = std::iter::once(single).chain(unions.iter().map(|u| &u.single_query));
+            if branch_hirs.len() != unions.len() + 1 {
+                return Err(mismatch());
+            }
+            let mut branches = Vec::new();
+            for (sq, hir) in singles.zip(branch_hirs) {
+                let parts = 0..hir.parts.len();
+                units.push(Unit::new(hir)?);
+                let index = units.len() - 1;
+                branches.push(units[index].branch(index, parts, sq)?);
+            }
+            statements.push(Statement { branches, distinct });
+        }
+        if next_part != units[0].hir.parts.len() {
+            return Err(mismatch());
+        }
+
+        let read_only = !units
+            .iter()
+            .flat_map(|u| &u.hir.parts)
+            .any(|p| p.operations.iter().any(mutates));
+        Ok(Self {
+            units,
+            statements,
+            read_only,
         })
     }
 
@@ -156,7 +209,14 @@ impl Query {
 
     /// The names of the parameters the query uses (without `$`).
     pub fn parameters(&self) -> impl Iterator<Item = &str> {
-        self.parameters.iter().map(String::as_str)
+        let mut names: Vec<&str> = self
+            .units
+            .iter()
+            .flat_map(|u| u.parameters.iter().map(String::as_str))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names.into_iter()
     }
 }
 
@@ -168,157 +228,6 @@ impl std::str::FromStr for Query {
     }
 }
 
-/// Works around decypher 0.2.0-alpha.9 lowering comma-separated patterns
-/// (`MATCH (a)-->(b), (c)-->(d)`) with relationship endpoints relative to
-/// their own part instead of the whole pattern: shifts them by the part's
-/// first node. Parts already lowered with global indices are left alone, so
-/// this is a no-op once decypher is fixed.
-///
-/// The node count of every part comes from the AST, whose `MATCH` and
-/// `CREATE` clauses are lowered in source order.
-fn fix_pattern_offsets(ast: &decypher::ast::Query, hir: &mut HirQuery) -> Result<(), CypherError> {
-    use decypher::ast::clause::ForeachUpdate;
-    use decypher::ast::pattern::{Pattern, PatternElement};
-    use decypher::ast::query::{ReadingClause, UpdatingClause};
-
-    fn nodes(e: &PatternElement) -> usize {
-        match e {
-            PatternElement::Path { chains, .. } => chains.len() + 1,
-            PatternElement::Parenthesized(inner) => nodes(inner),
-            PatternElement::Quantified { element, .. } => nodes(element),
-        }
-    }
-    fn part_sizes(p: &Pattern) -> Vec<usize> {
-        p.parts
-            .iter()
-            .map(|part| nodes(&part.anonymous.element))
-            .collect()
-    }
-    fn reading(out: &mut Vec<Vec<usize>>, rc: &ReadingClause) {
-        if let ReadingClause::Match(m) = rc {
-            out.push(part_sizes(&m.pattern));
-        }
-    }
-    fn updating(out: &mut Vec<Vec<usize>>, uc: &UpdatingClause) {
-        match uc {
-            UpdatingClause::Create(c) => out.push(part_sizes(&c.pattern)),
-            UpdatingClause::Foreach(f) => foreach(out, &f.updates),
-            _ => {}
-        }
-    }
-    fn foreach(out: &mut Vec<Vec<usize>>, updates: &[ForeachUpdate]) {
-        for u in updates {
-            match u {
-                ForeachUpdate::Create(c) => out.push(part_sizes(&c.pattern)),
-                ForeachUpdate::Foreach(f) => foreach(out, &f.updates),
-                _ => {}
-            }
-        }
-    }
-    fn single(out: &mut Vec<Vec<usize>>, sq: &SingleQuery) {
-        let (parts, last) = match &sq.kind {
-            SingleQueryKind::SinglePart(sp) => (&[][..], sp),
-            SingleQueryKind::MultiPart(mp) => (&mp.parts[..], &mp.final_part),
-        };
-        for part in parts {
-            part.reading_clauses.iter().for_each(|rc| reading(out, rc));
-            part.updating_clauses
-                .iter()
-                .for_each(|uc| updating(out, uc));
-        }
-        last.reading_clauses.iter().for_each(|rc| reading(out, rc));
-        if let SinglePartBody::Updating { updating: ucs, .. } = &last.body {
-            ucs.iter().for_each(|uc| updating(out, uc));
-        }
-    }
-
-    let mut sizes = Vec::new();
-    for body in &ast.statements {
-        match body {
-            QueryBody::SingleQuery(sq) => single(&mut sizes, sq),
-            QueryBody::Regular(rq) => {
-                single(&mut sizes, &rq.single_query);
-                rq.unions
-                    .iter()
-                    .for_each(|u| single(&mut sizes, &u.single_query));
-            }
-            _ => {}
-        }
-    }
-
-    fn patterns<'a>(ops: &'a mut [Operation], out: &mut Vec<&'a mut decypher::hir::GraphPattern>) {
-        for op in ops {
-            match op {
-                Operation::Match(m) | Operation::OptionalMatch(m) => out.push(&mut m.pattern),
-                Operation::Create(c) => out.push(&mut c.pattern),
-                Operation::Foreach(f) => patterns(&mut f.operations, out),
-                _ => {}
-            }
-        }
-    }
-    let mut targets = Vec::new();
-    for part in &mut hir.parts {
-        patterns(&mut part.operations, &mut targets);
-    }
-    let mismatch = || CypherError::InvalidQuery("pattern does not match the parsed query".into());
-    if targets.len() != sizes.len() {
-        return Err(mismatch());
-    }
-    for (pattern, sizes) in targets.into_iter().zip(sizes) {
-        if sizes.iter().sum::<usize>() != pattern.nodes.len()
-            || sizes.iter().map(|n| n - 1).sum::<usize>() != pattern.relationships.len()
-        {
-            return Err(mismatch());
-        }
-        let (mut node_start, mut rel_start) = (0, 0);
-        for n in sizes {
-            let rels = &mut pattern.relationships[rel_start..rel_start + n - 1];
-            if node_start > 0 && rels.first().is_some_and(|r| r.left.min(r.right) == 0) {
-                for r in rels.iter_mut() {
-                    r.left += node_start;
-                    r.right += node_start;
-                }
-            }
-            // Every endpoint must now lie within its own part; the executor
-            // indexes nodes by these.
-            let part = node_start..node_start + n;
-            if !rels
-                .iter()
-                .all(|r| part.contains(&r.left) && part.contains(&r.right))
-            {
-                return Err(mismatch());
-            }
-            node_start += n;
-            rel_start += n - 1;
-        }
-    }
-    Ok(())
-}
-
-/// decypher 0.2.0-alpha.9 lowers `a < b < c` like `(a < b) < c`: a
-/// comparison whose left operand is a comparison. The two differ only in the
-/// source: a comparison's span covers its `op rhs` part, which a chain follows
-/// directly with the next operator and a parenthesized operand with `)`.
-fn chained_comparisons(hir: &HirQuery, text: &str) -> Vec<bool> {
-    use decypher::hir::ExprKind;
-    let exprs = &hir.arenas.expressions;
-    exprs
-        .iter()
-        .map(|(_, e)| match &e.kind {
-            ExprKind::Comparison { left, .. } => match &exprs.get(*left).kind {
-                ExprKind::Comparison { .. } => {
-                    let end = exprs.get(*left).span.end;
-                    text.get(end..)
-                        .and_then(|rest| rest.trim_start().chars().next())
-                        .is_some_and(|c| c != ')')
-                }
-                _ => false,
-            },
-            _ => false,
-        })
-        .collect()
-}
-
 fn mutates(op: &Operation) -> bool {
     match op {
         Operation::Create(_)
@@ -327,6 +236,11 @@ fn mutates(op: &Operation) -> bool {
         | Operation::Remove(_)
         | Operation::Delete(_) => true,
         Operation::Foreach(f) => f.operations.iter().any(mutates),
+        Operation::Union(u) => u
+            .branches
+            .iter()
+            .flat_map(|b| &b.parts)
+            .any(|p| p.operations.iter().any(mutates)),
         _ => false,
     }
 }
@@ -353,50 +267,16 @@ fn final_return(sq: &SingleQuery) -> Option<&Return> {
 /// Column names: the binding names of variables passed through by `*`
 /// (sorted by the lowering), then each item's alias, variable name, or
 /// expression text exactly as written (`count(*)`, `n.name`).
-fn column_names(
-    ret: Option<&Return>,
-    outputs: &[BindingId],
-    hir: &HirQuery,
-    cst: &decypher::syntax::SyntaxNode,
-) -> Vec<String> {
+fn column_names(ret: Option<&Return>, outputs: &[BindingId], hir: &HirQuery) -> Vec<String> {
     let items = ret.map_or(&[][..], |r| &r.items[..]);
     let star = outputs.len().saturating_sub(items.len());
-    let texts = ret.map(|r| item_texts(cst, r)).unwrap_or_default();
     let mut columns: Vec<String> = outputs[..star]
         .iter()
         .map(|&b| hir.arenas.bindings.get(b).name.clone())
         .collect();
-    columns.extend(items.iter().enumerate().map(|(i, item)| {
-        match (&item.alias, &item.expression) {
-            (Some(alias), _) => alias.name.name.clone(),
-            (None, Expression::Variable(v)) => v.name.name.clone(),
-            (None, expr) => texts.get(i).cloned().unwrap_or_else(|| expr.to_cypher()),
-        }
-    }));
+    columns.extend(items.iter().map(|item| item.column().0));
     columns.truncate(outputs.len());
     columns
-}
-
-/// The source text of each projection item of `ret`, from the CST.
-fn item_texts(cst: &decypher::syntax::SyntaxNode, ret: &Return) -> Vec<String> {
-    use decypher::syntax::SyntaxKind;
-    let clause = cst.descendants().find(|n| {
-        let range = n.text_range();
-        n.kind() == SyntaxKind::RETURN_CLAUSE
-            && usize::from(range.start()) <= ret.span.start
-            && ret.span.start < usize::from(range.end())
-    });
-    let Some(items) = clause.and_then(|c| {
-        c.descendants()
-            .find(|n| n.kind() == SyntaxKind::PROJECTION_ITEMS)
-    }) else {
-        return Vec::new();
-    };
-    items
-        .children()
-        .filter(|n| n.kind() == SyntaxKind::PROJECTION_ITEM)
-        .map(|n| n.text().to_string().trim().to_owned())
-        .collect()
 }
 
 impl Query {

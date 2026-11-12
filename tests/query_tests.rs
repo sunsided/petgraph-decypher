@@ -1206,3 +1206,59 @@ fn query_null_dynamic_label_matches_nothing() {
     let r = g.cypher("MATCH (n:$(null)) RETURN count(*) AS n").unwrap();
     assert_eq!(column(&r, "n"), vec![Value::from(0)]);
 }
+
+// ---------------------------------------------------------------------------
+// UNION branches
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_union_branches_read_their_own_parameters() {
+    let g = Graph::<NodeData, EdgeData>::new();
+    let q = Query::new("RETURN $a AS x UNION ALL RETURN $b AS x UNION ALL RETURN $a AS x").unwrap();
+    assert_eq!(q.parameters().collect::<Vec<_>>(), ["a", "b"]);
+
+    let params = Parameters::from([
+        ("a".to_string(), Value::from(1)),
+        ("b".to_string(), Value::from(2)),
+    ]);
+    let r = q.execute(&g, &params).unwrap();
+    assert_eq!(
+        column(&r, "x"),
+        vec![Value::from(1), Value::from(2), Value::from(1)]
+    );
+
+    let distinct = Query::new("RETURN $a AS x UNION RETURN $a AS x").unwrap();
+    let r = distinct.execute(&g, &params).unwrap();
+    assert_eq!(column(&r, "x"), vec![Value::from(1)]);
+}
+
+#[test]
+fn query_union_missing_parameter_in_later_branch_is_an_error() {
+    let g = Graph::<NodeData, EdgeData>::new();
+    let q = Query::new("RETURN 1 AS x UNION RETURN $b AS x").unwrap();
+    let err = q
+        .execute(&g, &Parameters::from([("a".to_string(), Value::from(1))]))
+        .unwrap_err();
+    assert!(
+        matches!(&err, CypherError::InvalidQuery(m) if m.contains('b')),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn query_union_branch_matches_in_its_own_scope() {
+    let mut g = build_graph_from_cypher("CREATE (:A {v: 1}), (:B {v: 2})").unwrap();
+    g.cypher_mut("MATCH (n:A) SET n.seen = true").unwrap();
+    let r = g
+        .cypher("MATCH (n:A) RETURN n.v AS v UNION ALL MATCH (n:B) WHERE n.v = $v RETURN n.v AS v")
+        .err();
+    // A missing $v fails before any branch runs.
+    assert!(r.is_some());
+    let r = g
+        .cypher_params(
+            "MATCH (n:A) RETURN n.v AS v UNION ALL MATCH (n:B) WHERE n.v = $v RETURN n.v AS v",
+            &Parameters::from([("v".to_string(), Value::from(2))]),
+        )
+        .unwrap();
+    assert_eq!(column(&r, "v"), vec![Value::from(1), Value::from(2)]);
+}

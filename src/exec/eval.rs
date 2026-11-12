@@ -184,7 +184,7 @@ impl<A: Access> Executor<'_, A> {
                 Literal::String(s) => Value::String(s.clone()),
             }),
             ExprKind::Binding(b) => Ok(row.get(b.0).and_then(Clone::clone).unwrap_or_default()),
-            ExprKind::Parameter(p) => Ok(self.params[p.0].clone()),
+            ExprKind::Parameter(p) => Ok(self.param(*p).clone()),
             ExprKind::Property { base, key } => {
                 let base = self.eval(*base, row)?;
                 self.property(&base, &q.keys[key.0])
@@ -215,7 +215,7 @@ impl<A: Access> Executor<'_, A> {
                 }
             }
             ExprKind::Binary { op, left, right } => self.binary(*op, *left, *right, row),
-            ExprKind::Comparison { .. } => Ok(from_truth(self.chain(id, row)?.0)),
+            ExprKind::Comparison { left, operators } => self.comparison(*left, operators, row),
             ExprKind::In { lhs, rhs } => {
                 let needle = self.eval(*lhs, row)?;
                 self.contains(&needle, self.eval(*rhs, row)?)
@@ -445,23 +445,16 @@ impl<A: Access> Executor<'_, A> {
         }
     }
 
-    /// A comparison chain `a < b < c` (`a < b AND b < c`, each operand
-    /// evaluated once): its truth and its last operand.
-    ///
-    /// decypher 0.2.0-alpha.9 lowers a chain as nested comparisons
-    /// (`(a < b) < c`); [`Query::chained`] marks the real chains.
-    ///
-    /// [`Query::chained`]: crate::prepared::Query
-    fn chain(&self, id: ExprId, row: &Row) -> Result<(Option<bool>, Value)> {
-        let ExprKind::Comparison { left, operators } = &self.q.hir.arenas.expressions.get(id).kind
-        else {
-            return Ok((Some(true), self.eval(id, row)?));
-        };
-        let (mut result, mut lhs) = if self.q.chained[id.0] {
-            self.chain(*left, row)?
-        } else {
-            (Some(true), self.eval(*left, row)?)
-        };
+    /// A comparison chain `a < b < c`: `a < b AND b < c`, each operand
+    /// evaluated once.
+    fn comparison(
+        &self,
+        left: ExprId,
+        operators: &[(ComparisonOperator, ExprId)],
+        row: &Row,
+    ) -> Result<Value> {
+        let mut lhs = self.eval(left, row)?;
+        let mut result = Some(true);
         for (op, rhs) in operators {
             let rhs = self.eval(*rhs, row)?;
             match truth(&compare(*op, &lhs, &rhs)?, "comparison")? {
@@ -471,7 +464,7 @@ impl<A: Access> Executor<'_, A> {
             }
             lhs = rhs;
         }
-        Ok((result, lhs))
+        Ok(from_truth(result))
     }
 
     fn binary(&self, op: BinaryOp, left: ExprId, right: ExprId, row: &Row) -> Result<Value> {

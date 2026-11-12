@@ -18,7 +18,7 @@ rng-fastrand = ["dep:fastrand"]
 
 [dependencies]
 petgraph = "0.8"
-decypher = "0.2.0-alpha.9"
+decypher = "0.2.0-alpha.10"
 thiserror = "2"
 itertools = "0.14"
 rand = { version = "0.10", optional = true }

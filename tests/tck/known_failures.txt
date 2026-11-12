@@ -99,13 +99,6 @@ expressions/list/List11.feature:132#6 # expected ArgumentError should be raised 
 expressions/list/List11.feature:132#7 # expected ArgumentError should be raised at runtime: InvalidArgumentType, got error at compile time: invalid query: error: argument 1 of `range()` expects an Int…
 expressions/list/List11.feature:132#8 # expected ArgumentError should be raised at runtime: InvalidArgumentType, got error at compile time: invalid query: error: argument 2 of `range()` expects an Int…
 expressions/list/List11.feature:132#9 # expected ArgumentError should be raised at runtime: InvalidArgumentType, got error at compile time: invalid query: error: argument 2 of `range()` expects an Int…
-expressions/precedence/Precedence2.feature:67#1 # rows differ: expected {[512.0 | 512.0 | 68719476736.0]}, got {[512.0 | 512.0 | 1.109067877648326e130]}
-expressions/precedence/Precedence2.feature:67#2 # rows differ: expected {[8.0 | 8.0 | 64.0]}, got {[8.0 | 8.0 | 4.0]}
-expressions/precedence/Precedence2.feature:67#3 # rows differ: expected {[0.0 | 0.0 | 64.0]}, got {[0.0 | 0.0 | 4.0]}
-expressions/precedence/Precedence2.feature:86#1 # rows differ: expected {[72.0 | 72.0 | 1073741824.0]}, got {[72.0 | 72.0 | 1.8092513943330656e75]}
-expressions/precedence/Precedence2.feature:86#2 # rows differ: expected {[56.0 | 56.0 | 64.0]}, got {[56.0 | 56.0 | 4.0]}
-expressions/precedence/Precedence3.feature:72 # rows differ: expected {[false | false | [1, false, 4]]}, got {[[1, false, 4] | false | [1, false, 4]]}
-expressions/precedence/Precedence3.feature:85 # rows differ: expected {[false | false | [false, 4] | [1, false, 4]]}, got {[[1, false, 4] | false | [false, 4] | [1, false, 4]]}
 expressions/temporal/Temporal1.feature:120#1 # unsupported: function date()
 expressions/temporal/Temporal1.feature:120#2 # unsupported: function date()
 expressions/temporal/Temporal1.feature:120#3 # unsupported: function date()
