@@ -103,7 +103,11 @@ fn main() -> ExitCode {
     let known_path = dir.join("known_failures.txt");
     let filter = std::env::var("TCK_FILTER").ok().filter(|f| !f.is_empty());
     let verbose = std::env::var_os("TCK_VERBOSE").is_some();
-    let bless = std::env::var_os("TCK_BLESS").is_some();
+    let bless = std::env::var("TCK_BLESS").is_ok_and(|v| matches!(v.as_str(), "1" | "true"));
+    if bless && filter.is_some() {
+        eprintln!("TCK_BLESS with TCK_FILTER would drop the known failures outside the filter");
+        return ExitCode::FAILURE;
+    }
 
     let mut files = Vec::new();
     feature_files(&features_dir, &mut files);

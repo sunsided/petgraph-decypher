@@ -18,15 +18,19 @@ pub enum ExecError {
     /// The engine does not implement a feature the query needs. Never counts
     /// as the error a scenario expects.
     Unsupported(String),
-    /// Any other error.
-    Failed(String),
+    /// Any other error, and whether preparing the query (compile time)
+    /// rather than executing it (runtime) raised it.
+    Failed { compile: bool, error: CypherError },
 }
 
 impl std::fmt::Display for ExecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ExecError::Unsupported(m) => write!(f, "unsupported: {m}"),
-            ExecError::Failed(m) => write!(f, "error: {m}"),
+            ExecError::Failed { compile, error } => {
+                let phase = if *compile { "compile time" } else { "runtime" };
+                write!(f, "error at {phase}: {error}")
+            }
         }
     }
 }
@@ -73,13 +77,13 @@ impl Engine {
             .iter()
             .map(|(k, v)| Ok((k.clone(), to_value(v)?)))
             .collect::<Result<Parameters, ExecError>>()?;
-        let query = Query::new(query).map_err(exec_error)?;
+        let query = Query::new(query).map_err(|e| exec_error(e, true))?;
         let result = if query.is_read_only() {
             query.execute(&self.graph, &params)
         } else {
             query.execute_mut(&mut self.graph, &params)
         }
-        .map_err(exec_error)?;
+        .map_err(|e| exec_error(e, false))?;
         let columns = result.columns().to_vec();
         let rows = result
             .rows()
@@ -179,10 +183,10 @@ fn record(
     }
 }
 
-fn exec_error(e: CypherError) -> ExecError {
+fn exec_error(e: CypherError, compile: bool) -> ExecError {
     match e {
         CypherError::Unsupported(m) => ExecError::Unsupported(m),
-        other => ExecError::Failed(other.to_string()),
+        error => ExecError::Failed { compile, error },
     }
 }
 

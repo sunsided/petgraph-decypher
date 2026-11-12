@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use petgraph_decypher::CypherError;
+
 use super::engine::{Engine, ExecError, Snapshot, Table};
 use super::gherkin::{self, Step};
 use super::value::{self, TckValue};
@@ -167,6 +169,9 @@ impl State {
             return Err(StepError::Skip("needs a test procedure".into()));
         }
         if text == "executing query:" || text == "executing control query:" {
+            if docstring().trim().is_empty() {
+                return fail("harness: query step without a query");
+            }
             self.before = Some(self.engine.snapshot());
             self.result = Some(self.engine.execute(docstring(), &self.params));
             return Ok(());
@@ -335,9 +340,33 @@ impl State {
         }
     }
 
+    /// `a <Kind> should be raised at <phase>: <Detail>`: the query must fail in
+    /// that phase (preparing it is compile time, executing it runtime), and a
+    /// runtime `TypeError` must be a type mismatch. The detail is not checked:
+    /// the crate's errors carry no TCK error codes.
     fn expect_error(&self, kind: &str, description: &str) -> Result<(), StepError> {
+        let phase = description
+            .split(" should be raised at ")
+            .nth(1)
+            .and_then(|rest| rest.split(':').next())
+            .unwrap_or("any time")
+            .trim();
         match &self.result {
-            Some(Err(ExecError::Failed(_))) => Ok(()),
+            Some(Err(e @ ExecError::Failed { compile, error })) => {
+                let phase_ok = match phase {
+                    "compile time" => *compile,
+                    "runtime" => !*compile,
+                    _ => true,
+                };
+                let kind_ok = kind != "TypeError"
+                    || *compile
+                    || matches!(error, CypherError::TypeMismatch(_));
+                if phase_ok && kind_ok {
+                    Ok(())
+                } else {
+                    fail(format!("expected {description}, got {e}"))
+                }
+            }
             Some(Err(e @ ExecError::Unsupported(_))) => fail(format!("expected {kind}, got {e}")),
             Some(Ok(table)) => fail(format!(
                 "expected {description}, got {} row(s)",
