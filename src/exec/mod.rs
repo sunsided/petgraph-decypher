@@ -60,11 +60,21 @@ impl<'q, A: Access> Executor<'q, A> {
             deleted_nodes: HashSet::new(),
             deleted_edges: HashSet::new(),
         };
+        match ex.run_statements() {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                ex.access.rollback();
+                Err(e)
+            }
+        }
+    }
+
+    fn run_statements(&mut self) -> Result<QueryResult> {
         let mut result = QueryResult::default();
-        for statement in &q.statements {
+        for statement in &self.q.statements {
             let mut rows = Vec::new();
             for branch in &statement.branches {
-                rows.extend(ex.run_branch(branch)?);
+                rows.extend(self.run_branch(branch)?);
             }
             if statement.distinct {
                 dedup(&mut rows, |r| r.as_slice());
@@ -76,7 +86,7 @@ impl<'q, A: Access> Executor<'q, A> {
                 .unwrap_or_default();
             result = QueryResult::new(columns, rows);
         }
-        ex.apply_deletes()?;
+        self.apply_deletes()?;
         Ok(result)
     }
 
@@ -292,7 +302,10 @@ impl<'q, A: Access> Executor<'q, A> {
             a.aggregates
                 .iter()
                 .map(|item| match q.functions[item.function.0] {
-                    Function::Aggregate(f) => Ok(Accumulator::new(f, item.distinct)),
+                    Function::Aggregate(f) => {
+                        f.check_arity(item.args.len())?;
+                        Ok(Accumulator::new(f, item.distinct))
+                    }
                     Function::Scalar(_) => Err(CypherError::InvalidQuery(
                         "aggregation uses a non-aggregate function".into(),
                     )),
@@ -353,8 +366,16 @@ impl<'q, A: Access> Executor<'q, A> {
         }
     }
 
+    /// Whether a predicate holds: `null` does not, a non-boolean is an error.
     fn is_true(&self, expr: ExprId, row: &Row) -> Result<bool> {
-        Ok(matches!(self.eval(expr, row)?, Value::Boolean(true)))
+        match self.eval(expr, row)? {
+            Value::Boolean(b) => Ok(b),
+            Value::Null => Ok(false),
+            other => Err(CypherError::TypeMismatch(format!(
+                "a predicate must be a boolean, got {}",
+                other.type_name()
+            ))),
+        }
     }
 
     fn graph(&self) -> &A::G {

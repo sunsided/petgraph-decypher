@@ -107,8 +107,11 @@ impl<'q, A: Access> Executor<'q, A> {
                 &self.q.labels[id.0]
             }),
             LabelExpr::Wildcard => any,
+            // A `null` label, or a `null` in a label list, matches nothing.
             LabelExpr::Dynamic(e) => match self.eval(*e, row)? {
+                Value::Null => false,
                 Value::String(s) => has(&s),
+                Value::List(items) if items.iter().any(Value::is_null) => false,
                 Value::List(items) => {
                     let mut names = items.iter().map(|v| match v {
                         Value::String(s) => Ok(has(s)),
@@ -360,10 +363,10 @@ impl<A: Access> Search<'_, '_, A> {
                 Ok(())
             }
             RelationshipLength::Variable { min, max } => {
-                if let Some(bound) = bound_edge {
-                    return self.follow(ri, start, end_pi, from_left, dirs, bound, row);
-                }
                 let (min, max) = (min.unwrap_or(1) as usize, max.map(|m| m as usize));
+                if let Some(bound) = bound_edge {
+                    return self.follow(ri, start, end_pi, from_left, dirs, (min, max), bound, row);
+                }
                 let mut trail = Vec::new();
                 self.walk(
                     ri, start, end_pi, from_left, dirs, min, max, &mut trail, row,
@@ -382,12 +385,18 @@ impl<A: Access> Search<'_, '_, A> {
         end_pi: usize,
         from_left: bool,
         dirs: &[Direction],
+        (min, max): (usize, Option<usize>),
         bound: Value,
         row: &mut Row,
     ) -> Result<()> {
+        // Only a list of relationships within the pattern's length bounds
+        // can match; anything else (including `null`) matches nothing.
         let Value::List(items) = bound else {
             return Ok(());
         };
+        if items.len() < min || max.is_some_and(|m| items.len() > m) {
+            return Ok(());
+        }
         let mut edges = Vec::with_capacity(items.len());
         for item in items {
             match item {

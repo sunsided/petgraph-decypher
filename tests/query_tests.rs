@@ -1091,3 +1091,118 @@ fn query_mut_merge_on_match() {
     assert_eq!(column(&result, "seen"), [Value::from(true)]);
     assert_eq!(g.node_count(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Failure semantics
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_mut_failure_rolls_back_all_changes() {
+    let mut g = build_graph_from_cypher("CREATE (:A {k: 1, keep: 'x'})-[:R]->(:B)").unwrap();
+    let before = format!("{g:?}");
+    for query in [
+        "CREATE (:C) RETURN 1 / 0",
+        "MATCH (a:A) SET a.k = 2, a:Extra REMOVE a.keep CREATE (a)-[:S]->(:D) RETURN 1 / 0",
+        "MATCH (a:A) SET a = {k: [1, {nested: 1}]}",
+        "MATCH (a:A) DETACH DELETE a WITH 1 AS one RETURN 1 / 0",
+    ] {
+        assert!(g.cypher_mut(query).is_err(), "{query} should fail");
+        assert_eq!(
+            format!("{g:?}"),
+            before,
+            "{query} must leave the graph unchanged"
+        );
+    }
+}
+
+#[test]
+fn query_mut_rejects_invalid_relationship_before_creating_nodes() {
+    let mut g = Graph::<NodeData, EdgeData>::new();
+    assert!(
+        g.cypher_mut("CREATE (a)-[:R {k: [1, {m: 1}]}]->(b)")
+            .is_err()
+    );
+    assert_eq!((g.node_count(), g.edge_count()), (0, 0));
+}
+
+#[test]
+fn query_mut_bound_node_parameter_must_exist() {
+    let mut g = Graph::<NodeData, EdgeData>::new();
+    let params = Parameters::from([(
+        "n".to_string(),
+        Value::Node(petgraph::graph::NodeIndex::new(7)),
+    )]);
+    let err = g
+        .cypher_mut_params("WITH $n AS n CREATE (n)-[:R]->(:X)", &params)
+        .unwrap_err();
+    assert!(matches!(err, CypherError::RuntimeError(_)), "{err:?}");
+    assert_eq!(g.node_count(), 0);
+}
+
+#[test]
+fn query_non_boolean_predicate_is_a_type_error() {
+    // Values only known at runtime; decypher rejects literal ones up front.
+    let g = build_graph_from_cypher("CREATE (:A {k: 1})").unwrap();
+    for query in [
+        "MATCH (n) WHERE n.k RETURN n",
+        "MATCH (n) RETURN CASE WHEN n.k THEN 1 ELSE 2 END AS x",
+    ] {
+        let err = g.cypher(query).unwrap_err();
+        assert!(
+            matches!(err, CypherError::TypeMismatch(_)),
+            "{query}: {err:?}"
+        );
+    }
+    let r = g.cypher("MATCH (n) WHERE null RETURN n").unwrap();
+    assert!(r.is_empty());
+}
+
+#[test]
+fn query_functions_propagate_null() {
+    let g = Graph::<NodeData, EdgeData>::new();
+    let r = g
+        .cypher(
+            "RETURN substring('abc', null) AS a, substring('abc', 1, null) AS b, \
+             left('abc', null) AS c, right(null, 1) AS d, range(1, null) AS e",
+        )
+        .unwrap();
+    assert_eq!(
+        r.rows().next().unwrap().values(),
+        vec![Value::Null; 5].as_slice()
+    );
+}
+
+#[test]
+fn query_aggregate_arity_is_checked() {
+    let g = Graph::<NodeData, EdgeData>::new();
+    for query in [
+        "UNWIND [1, 2] AS x RETURN sum(x, 1) AS s",
+        "UNWIND [1, 2] AS x RETURN percentileCont(x) AS p",
+    ] {
+        assert!(g.cypher(query).is_err(), "{query} should be rejected");
+    }
+    let r = g
+        .cypher("UNWIND [1, 2, 3] AS x RETURN percentileDisc(x, 0.5) AS p")
+        .unwrap();
+    assert_eq!(column(&r, "p"), vec![Value::from(2)]);
+}
+
+#[test]
+fn query_bound_variable_length_relationship_respects_bounds() {
+    let g = build_graph_from_cypher("CREATE (:A)-[:R]->()-[:R]->()-[:R]->(:Z)").unwrap();
+    let r = g
+        .cypher("MATCH (:A)-[rs:R*2]->(m) WITH rs MATCH (a)-[rs*1..2]->(b) RETURN count(*) AS n")
+        .unwrap();
+    assert_eq!(column(&r, "n"), vec![Value::from(1)]);
+    let r = g
+        .cypher("MATCH (:A)-[rs:R*2]->(m) WITH rs MATCH (a)-[rs*3..4]->(b) RETURN count(*) AS n")
+        .unwrap();
+    assert_eq!(column(&r, "n"), vec![Value::from(0)]);
+}
+
+#[test]
+fn query_null_dynamic_label_matches_nothing() {
+    let g = build_graph_from_cypher("CREATE (:A)").unwrap();
+    let r = g.cypher("MATCH (n:$(null)) RETURN count(*) AS n").unwrap();
+    assert_eq!(column(&r, "n"), vec![Value::from(0)]);
+}

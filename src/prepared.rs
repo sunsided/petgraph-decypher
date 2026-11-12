@@ -274,10 +274,19 @@ fn fix_pattern_offsets(ast: &decypher::ast::Query, hir: &mut HirQuery) -> Result
         for n in sizes {
             let rels = &mut pattern.relationships[rel_start..rel_start + n - 1];
             if node_start > 0 && rels.first().is_some_and(|r| r.left.min(r.right) == 0) {
-                for r in rels {
+                for r in rels.iter_mut() {
                     r.left += node_start;
                     r.right += node_start;
                 }
+            }
+            // Every endpoint must now lie within its own part; the executor
+            // indexes nodes by these.
+            let part = node_start..node_start + n;
+            if !rels
+                .iter()
+                .all(|r| part.contains(&r.left) && part.contains(&r.right))
+            {
+                return Err(mismatch());
             }
             node_start += n;
             rel_start += n - 1;
@@ -412,6 +421,6 @@ impl Query {
         graph: &mut G,
         params: &crate::Parameters,
     ) -> Result<crate::QueryResult, CypherError> {
-        crate::exec::Executor::run(self, crate::exec::ReadWrite(graph), params)
+        crate::exec::Executor::run(self, crate::exec::ReadWrite::new(graph), params)
     }
 }

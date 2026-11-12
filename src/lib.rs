@@ -30,8 +30,11 @@
 //!
 //! `DELETE` takes effect when the query finishes. On a [`petgraph::Graph`],
 //! removing an element moves the last element into its slot, so indices of
-//! *other* elements may change; use a [`petgraph::stable_graph::StableGraph`]
-//! when indices must stay valid.
+//! *other* elements may change, including node and relationship values in
+//! the result of the deleting query itself. Use a
+//! [`petgraph::stable_graph::StableGraph`] when indices must stay valid.
+//!
+//! A query that fails leaves the graph unchanged.
 
 mod element;
 pub mod error;

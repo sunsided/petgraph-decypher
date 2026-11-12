@@ -536,7 +536,7 @@ impl<A: Access> Executor<'_, A> {
             let when = self.eval(alt.when, row)?;
             let hit = match &scrutinee {
                 Some(s) => s.cypher_eq(&when) == Some(true),
-                None => matches!(when, Value::Boolean(true)),
+                None => truth(&when, "CASE WHEN")? == Some(true),
             };
             if hit {
                 return self.eval(alt.then, row);

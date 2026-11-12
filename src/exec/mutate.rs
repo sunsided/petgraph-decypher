@@ -5,7 +5,7 @@ use decypher::hir::{ExprKind, GraphPattern, RelationshipDirection};
 use petgraph::graph::{EdgeIndex, NodeIndex};
 
 use super::{Executor, Result, Row};
-use crate::element::{CypherEdgeMut, CypherNodeMut};
+use crate::element::{CypherEdge, CypherEdgeMut, CypherNode, CypherNodeMut};
 use crate::error::CypherError;
 use crate::graph::{CypherGraph, CypherGraphMut};
 use crate::prepared::Query;
@@ -44,11 +44,36 @@ pub(crate) trait Access {
     fn clear_properties(&mut self, element: Element) -> Result<()>;
     fn set_label(&mut self, node: NodeIndex, label: &str, present: bool) -> Result<()>;
     fn remove(&mut self, nodes: Vec<NodeIndex>, edges: Vec<EdgeIndex>) -> Result<()>;
+    /// Reverts every change made so far, after a failed query.
+    fn rollback(&mut self);
 }
 
 pub(crate) struct ReadOnly<'g, G>(pub &'g G);
 
-pub(crate) struct ReadWrite<'g, G>(pub &'g mut G);
+/// Write access that logs how to undo each change, so a query that fails
+/// leaves the graph as it was.
+pub(crate) struct ReadWrite<'g, G> {
+    graph: &'g mut G,
+    undo: Vec<Undo>,
+}
+
+impl<'g, G> ReadWrite<'g, G> {
+    pub(crate) fn new(graph: &'g mut G) -> Self {
+        Self {
+            graph,
+            undo: Vec::new(),
+        }
+    }
+}
+
+/// The inverse of one change.
+enum Undo {
+    Node(NodeIndex),
+    Edge(EdgeIndex),
+    Property(Element, String, Option<Value>),
+    Properties(Element, Properties),
+    Label(NodeIndex, String, bool),
+}
 
 fn read_only<T>() -> Result<T> {
     Err(CypherError::InvalidQuery(
@@ -93,17 +118,85 @@ impl<G: CypherGraph> Access for ReadOnly<'_, G> {
     fn remove(&mut self, _: Vec<NodeIndex>, _: Vec<EdgeIndex>) -> Result<()> {
         read_only()
     }
+
+    fn rollback(&mut self) {}
 }
 
 fn missing(element: Element) -> CypherError {
     CypherError::RuntimeError(format!("{element:?} does not exist"))
 }
 
+impl<G: CypherGraphMut> ReadWrite<'_, G> {
+    fn properties_of(&self, element: Element) -> Result<Properties> {
+        let collect = |it: &mut dyn Iterator<Item = (&str, &Value)>| -> Properties {
+            it.map(|(k, v)| (k.to_owned(), v.clone())).collect()
+        };
+        match element {
+            Element::Node(n) => self.graph.node(n).map(|w| collect(&mut w.properties())),
+            Element::Edge(e) => self.graph.edge(e).map(|w| collect(&mut w.properties())),
+        }
+        .ok_or(missing(element))
+    }
+
+    fn property_of(&self, element: Element, key: &str) -> Result<Option<Value>> {
+        match element {
+            Element::Node(n) => self.graph.node(n).map(|w| w.property(key).cloned()),
+            Element::Edge(e) => self.graph.edge(e).map(|w| w.property(key).cloned()),
+        }
+        .ok_or(missing(element))
+    }
+
+    fn write_property(&mut self, element: Element, key: &str, value: Value) -> Result<()> {
+        match element {
+            Element::Node(n) => self
+                .graph
+                .node_mut(n)
+                .ok_or(missing(element))?
+                .set_property(key, value),
+            Element::Edge(e) => self
+                .graph
+                .edge_mut(e)
+                .ok_or(missing(element))?
+                .set_property(key, value),
+        }
+        Ok(())
+    }
+
+    fn write_label(&mut self, node: NodeIndex, label: &str, present: bool) -> Result<()> {
+        let weight = self
+            .graph
+            .node_mut(node)
+            .ok_or(missing(Element::Node(node)))?;
+        if present {
+            weight.add_label(label);
+        } else {
+            weight.remove_label(label);
+        }
+        Ok(())
+    }
+
+    fn write_clear(&mut self, element: Element) -> Result<()> {
+        match element {
+            Element::Node(n) => self
+                .graph
+                .node_mut(n)
+                .ok_or(missing(element))?
+                .clear_properties(),
+            Element::Edge(e) => self
+                .graph
+                .edge_mut(e)
+                .ok_or(missing(element))?
+                .clear_properties(),
+        }
+        Ok(())
+    }
+}
+
 impl<G: CypherGraphMut> Access for ReadWrite<'_, G> {
     type G = G;
 
     fn graph(&self) -> &G {
-        self.0
+        self.graph
     }
 
     fn create_node(
@@ -112,9 +205,11 @@ impl<G: CypherGraphMut> Access for ReadWrite<'_, G> {
         labels: Vec<String>,
         properties: Properties,
     ) -> Result<NodeIndex> {
-        Ok(self
-            .0
-            .add_node(G::Node::from_cypher(variable, labels, properties)))
+        let id = self
+            .graph
+            .add_node(G::Node::from_cypher(variable, labels, properties));
+        self.undo.push(Undo::Node(id));
+        Ok(id)
     }
 
     fn create_edge(
@@ -125,58 +220,72 @@ impl<G: CypherGraphMut> Access for ReadWrite<'_, G> {
         rel_type: String,
         properties: Properties,
     ) -> Result<EdgeIndex> {
-        Ok(self.0.add_edge(
+        let id = self.graph.add_edge(
             source,
             target,
             G::Edge::from_cypher(variable, rel_type, properties),
-        ))
+        );
+        self.undo.push(Undo::Edge(id));
+        Ok(id)
     }
 
     fn set_property(&mut self, element: Element, key: &str, value: Value) -> Result<()> {
-        match element {
-            Element::Node(n) => self
-                .0
-                .node_mut(n)
-                .ok_or(missing(element))?
-                .set_property(key, value),
-            Element::Edge(e) => self
-                .0
-                .edge_mut(e)
-                .ok_or(missing(element))?
-                .set_property(key, value),
-        }
+        let old = self.property_of(element, key)?;
+        self.write_property(element, key, value)?;
+        self.undo.push(Undo::Property(element, key.to_owned(), old));
         Ok(())
     }
 
     fn clear_properties(&mut self, element: Element) -> Result<()> {
-        match element {
-            Element::Node(n) => self
-                .0
-                .node_mut(n)
-                .ok_or(missing(element))?
-                .clear_properties(),
-            Element::Edge(e) => self
-                .0
-                .edge_mut(e)
-                .ok_or(missing(element))?
-                .clear_properties(),
-        }
+        let old = self.properties_of(element)?;
+        self.write_clear(element)?;
+        self.undo.push(Undo::Properties(element, old));
         Ok(())
     }
 
     fn set_label(&mut self, node: NodeIndex, label: &str, present: bool) -> Result<()> {
-        let weight = self.0.node_mut(node).ok_or(missing(Element::Node(node)))?;
-        if present {
-            weight.add_label(label);
-        } else {
-            weight.remove_label(label);
-        }
+        let had = self
+            .graph
+            .node(node)
+            .ok_or(missing(Element::Node(node)))?
+            .has_label(label);
+        self.write_label(node, label, present)?;
+        self.undo.push(Undo::Label(node, label.to_owned(), had));
         Ok(())
     }
 
     fn remove(&mut self, nodes: Vec<NodeIndex>, edges: Vec<EdgeIndex>) -> Result<()> {
-        self.0.remove(nodes, edges);
+        self.graph.remove(nodes, edges);
+        self.undo.clear();
         Ok(())
+    }
+
+    /// Undoes changes newest first. Deletions are only applied once the query
+    /// has succeeded, so every element created by the query is still the
+    /// newest of its kind when its creation is undone, and removing it moves
+    /// no other element.
+    fn rollback(&mut self) {
+        while let Some(undo) = self.undo.pop() {
+            // The elements were valid when logged; failures cannot occur.
+            let _ = match undo {
+                Undo::Node(n) => {
+                    self.graph.remove(vec![n], Vec::new());
+                    Ok(())
+                }
+                Undo::Edge(e) => {
+                    self.graph.remove(Vec::new(), vec![e]);
+                    Ok(())
+                }
+                Undo::Property(el, key, old) => {
+                    self.write_property(el, &key, old.unwrap_or_default())
+                }
+                Undo::Properties(el, old) => self.write_clear(el).and_then(|()| {
+                    old.into_iter()
+                        .try_for_each(|(k, v)| self.write_property(el, &k, v))
+                }),
+                Undo::Label(n, label, had) => self.write_label(n, &label, had),
+            };
+        }
     }
 }
 
@@ -202,11 +311,29 @@ impl<'q, A: Access> Executor<'q, A> {
     /// `CREATE`: creates every unbound node and every relationship of the
     /// pattern, binding them in `row`.
     pub(super) fn create_pattern(&mut self, pattern: &GraphPattern, row: &mut Row) -> Result<()> {
+        // Reject an invalid relationship before creating anything.
+        for rel in &pattern.relationships {
+            if rel.types.len() != 1 {
+                return Err(CypherError::InvalidQuery(
+                    "CREATE needs exactly one type for every relationship".into(),
+                ));
+            }
+        }
         let mut nodes = Vec::with_capacity(pattern.nodes.len());
         for node in &pattern.nodes {
             let bound = node.binding.and_then(|b| row[b.0].clone());
             let id = match bound {
-                Some(Value::Node(id)) => id,
+                // A bound node may come from a parameter, so it must exist
+                // and not be pending deletion.
+                Some(Value::Node(id)) if self.graph().node(id).is_some() && self.node_alive(id) => {
+                    id
+                }
+                Some(Value::Node(id)) => {
+                    return Err(CypherError::RuntimeError(format!(
+                        "cannot create a relationship to node {} that does not exist",
+                        id.index()
+                    )));
+                }
                 Some(other) => {
                     return Err(CypherError::TypeMismatch(format!(
                         "cannot create a relationship to a {}",
@@ -384,6 +511,8 @@ impl<'q, A: Access> Executor<'q, A> {
                     let Some(map) = self.property_map(map)? else {
                         continue;
                     };
+                    // Validate the whole map before dropping the old properties.
+                    let map = storable(map)?;
                     self.access.clear_properties(element)?;
                     for (k, v) in map {
                         self.set_value(element, &k, v)?;

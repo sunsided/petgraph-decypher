@@ -166,6 +166,29 @@ fn lookup<T: Copy>(table: &[(&str, T)], name: &str) -> Option<T> {
         .map(|(_, f)| *f)
 }
 
+impl Aggregate {
+    /// Checks the argument count: `count(*)` has none, percentiles take the
+    /// value and the percentile, every other aggregate one value.
+    pub(crate) fn check_arity(self, args: usize) -> Result<(), CypherError> {
+        let ok = match self {
+            Aggregate::Count => args <= 1,
+            Aggregate::PercentileCont | Aggregate::PercentileDisc => args == 2,
+            _ => args == 1,
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(CypherError::InvalidQuery(format!(
+                "{self:?}() does not take {args} argument(s)"
+            )))
+        }
+    }
+
+    fn is_percentile(self) -> bool {
+        matches!(self, Aggregate::PercentileCont | Aggregate::PercentileDisc)
+    }
+}
+
 impl Scalar {
     /// The Cypher name, for error messages.
     fn name(self) -> &'static str {
@@ -282,6 +305,9 @@ pub(crate) fn call(f: Scalar, args: Vec<Value>) -> Result<Value, CypherError> {
                     "range() expects 2 or 3 arguments".into(),
                 ));
             }
+            if args.iter().any(Value::is_null) {
+                return Ok(Value::Null);
+            }
             let int = |v: &Value| match v {
                 Value::Integer(i) => Ok(*i),
                 other => Err(CypherError::TypeMismatch(format!(
@@ -376,6 +402,9 @@ pub(crate) fn call(f: Scalar, args: Vec<Value>) -> Result<Value, CypherError> {
                     "substring() expects 2 or 3 arguments".into(),
                 ));
             }
+            if args.iter().any(Value::is_null) {
+                return Ok(Value::Null);
+            }
             let s = match &args[0] {
                 Value::Null => return Ok(Value::Null),
                 Value::String(s) => s,
@@ -400,6 +429,9 @@ pub(crate) fn call(f: Scalar, args: Vec<Value>) -> Result<Value, CypherError> {
         }
         S::Left | S::Right => {
             arity(name, &args, 2)?;
+            if args.iter().any(Value::is_null) {
+                return Ok(Value::Null);
+            }
             let s = match &args[0] {
                 Value::Null => return Ok(Value::Null),
                 Value::String(s) => s,
@@ -573,7 +605,7 @@ impl Accumulator {
             self.count += 1;
             return;
         };
-        if args.len() > 1 {
+        if self.function.is_percentile() && args.len() > 1 {
             self.percentile = Some(args.swap_remove(1));
         }
         let Some(value) = args.into_iter().next() else {

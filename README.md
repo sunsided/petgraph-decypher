@@ -92,7 +92,9 @@ assert_eq!(graph[*n].properties["id"], Value::from(2));
 
 `DELETE` is applied when the query finishes. On a `Graph`, removing an
 element moves the last element into its slot, so indices of *other* elements
-may change; use a `StableGraph` when indices must stay valid.
+may change, including node and relationship values in the result of the
+deleting query itself; use a `StableGraph` when indices must stay valid. A
+query that fails leaves the graph unchanged.
 
 ### Custom node and edge types
 
