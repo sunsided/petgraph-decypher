@@ -35,6 +35,14 @@ tasks:
     cmds:
       - cargo test
 
+  test:tck:
+    desc: Run the openCypher TCK execution suite (TCK_BLESS=1 regenerates known failures)
+    preconditions:
+      - sh: command -v cargo >/dev/null 2>&1
+        msg: cargo is not installed. Please install Rust via https://rustup.rs
+    cmds:
+      - cargo test --test tck
+
   build:
     desc: Build the workspace
     preconditions:

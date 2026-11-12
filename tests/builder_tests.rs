@@ -1,10 +1,9 @@
 //! Integration tests for the graph builder.
 
 use petgraph_decypher::{
-    CypherEdge, CypherNode, CypherProperties, CypherValue, NodeData, build_graph_from_cypher,
-    build_graph_from_cypher_typed,
+    CypherEdge, CypherEdgeMut, CypherError, CypherNode, CypherNodeMut, NodeData, Properties, Value,
+    build_graph_from_cypher, build_graph_from_cypher_typed,
 };
-use std::collections::HashMap;
 
 #[test]
 fn build_graph_single_node() {
@@ -14,10 +13,7 @@ fn build_graph_single_node() {
     let n = g.node_indices().next().unwrap();
     let data: &NodeData = &g[n];
     assert_eq!(data.labels, vec!["Person"]);
-    assert_eq!(
-        data.properties.get("name"),
-        Some(&CypherValue::String("Alice".into()))
-    );
+    assert_eq!(data.properties.get("name"), Some(&Value::from("Alice")));
 }
 
 #[test]
@@ -29,7 +25,7 @@ fn build_graph_two_nodes_one_edge() {
     assert_eq!(g.node_count(), 2);
     assert_eq!(g.edge_count(), 1);
     let e = g.edge_indices().next().unwrap();
-    assert_eq!(g[e].rel_type.as_deref(), Some("KNOWS"));
+    assert_eq!(g[e].rel_type, "KNOWS");
 }
 
 #[test]
@@ -59,10 +55,20 @@ fn build_graph_merge_creates_nodes() {
 
 #[test]
 fn build_graph_match_does_not_add_nodes() {
-    // A plain MATCH with no CREATE should produce an empty graph.
-    let g = build_graph_from_cypher("MATCH (n:Person)-[:KNOWS]->(m)").unwrap();
+    // A MATCH with no CREATE should produce an empty graph.
+    let g = build_graph_from_cypher("MATCH (n:Person)-[:KNOWS]->(m) RETURN m").unwrap();
     assert_eq!(g.node_count(), 0);
     assert_eq!(g.edge_count(), 0);
+}
+
+#[test]
+fn build_graph_rejects_query_without_return_or_update() {
+    // openCypher: a query must end with RETURN or an updating clause.
+    let result = build_graph_from_cypher("MATCH (n:Person)-[:KNOWS]->(m)");
+    assert!(
+        matches!(result, Err(CypherError::ParseError(_))),
+        "{result:?}"
+    );
 }
 
 #[test]
@@ -82,10 +88,7 @@ fn build_graph_left_directed_edge_direction() {
 fn build_graph_edge_with_properties() {
     let g = build_graph_from_cypher(r#"CREATE (a)-[:KNOWS {since: 2020}]->(b)"#).unwrap();
     let e = g.edge_indices().next().unwrap();
-    assert_eq!(
-        g[e].properties.get("since"),
-        Some(&CypherValue::Integer(2020))
-    );
+    assert_eq!(g[e].properties.get("since"), Some(&Value::Integer(2020)));
 }
 
 #[test]
@@ -104,7 +107,7 @@ fn build_graph_node_variable_data() {
     assert_eq!(data.variable.as_deref(), Some("n"));
     assert!(data.labels.contains(&"Person".to_string()));
     assert!(data.labels.contains(&"Employee".to_string()));
-    assert_eq!(data.properties.get("age"), Some(&CypherValue::Integer(30)));
+    assert_eq!(data.properties.get("age"), Some(&Value::Integer(30)));
 }
 
 /// Minimal custom node type for testing `build_graph_from_cypher_typed`.
@@ -112,38 +115,52 @@ fn build_graph_node_variable_data() {
 struct CustomNode {
     variable: Option<String>,
     labels: Vec<String>,
-    properties: HashMap<String, CypherValue>,
-}
-
-impl CypherProperties for CustomNode {
-    fn get(&self, name: &str) -> Option<&CypherValue> {
-        self.properties.get(name)
-    }
-
-    fn properties(&self) -> HashMap<String, CypherValue> {
-        self.properties.clone()
-    }
+    properties: Properties,
 }
 
 impl CypherNode for CustomNode {
-    fn has_label(&self, label: &str) -> bool {
-        self.labels.iter().any(|l| l == label)
+    fn labels(&self) -> impl Iterator<Item = &str> {
+        self.labels.iter().map(String::as_str)
     }
 
-    fn labels(&self) -> Vec<String> {
-        self.labels.clone()
+    fn property(&self, key: &str) -> Option<&Value> {
+        self.properties.get(key)
     }
 
-    fn from_cypher(
-        variable: Option<String>,
-        labels: Vec<String>,
-        properties: HashMap<String, CypherValue>,
-    ) -> Self {
+    fn properties(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.properties.iter().map(|(k, v)| (k.as_str(), v))
+    }
+}
+
+impl CypherNodeMut for CustomNode {
+    fn from_cypher(variable: Option<&str>, labels: Vec<String>, properties: Properties) -> Self {
         Self {
-            variable,
+            variable: variable.map(str::to_owned),
             labels,
             properties,
         }
+    }
+
+    fn add_label(&mut self, label: &str) {
+        if !self.has_label(label) {
+            self.labels.push(label.to_owned());
+        }
+    }
+
+    fn remove_label(&mut self, label: &str) {
+        self.labels.retain(|l| l != label);
+    }
+
+    fn set_property(&mut self, key: &str, value: Value) {
+        if value.is_null() {
+            self.properties.remove(key);
+        } else {
+            self.properties.insert(key.to_owned(), value);
+        }
+    }
+
+    fn clear_properties(&mut self) {
+        self.properties.clear();
     }
 }
 
@@ -151,46 +168,50 @@ impl CypherNode for CustomNode {
 #[derive(Debug, Clone, PartialEq)]
 struct CustomEdge {
     variable: Option<String>,
-    rel_type: Option<String>,
-    properties: HashMap<String, CypherValue>,
-}
-
-impl CypherProperties for CustomEdge {
-    fn get(&self, name: &str) -> Option<&CypherValue> {
-        self.properties.get(name)
-    }
-
-    fn properties(&self) -> HashMap<String, CypherValue> {
-        self.properties.clone()
-    }
+    rel_type: String,
+    properties: Properties,
 }
 
 impl CypherEdge for CustomEdge {
-    fn has_rel_type(&self, rel_type: &str) -> bool {
-        self.rel_type.as_deref() == Some(rel_type)
+    fn rel_type(&self) -> &str {
+        &self.rel_type
     }
 
-    fn rel_type(&self) -> Option<&str> {
-        self.rel_type.as_deref()
+    fn property(&self, key: &str) -> Option<&Value> {
+        self.properties.get(key)
     }
 
-    fn from_cypher(
-        variable: Option<String>,
-        rel_type: Option<String>,
-        properties: HashMap<String, CypherValue>,
-    ) -> Self {
+    fn properties(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.properties.iter().map(|(k, v)| (k.as_str(), v))
+    }
+}
+
+impl CypherEdgeMut for CustomEdge {
+    fn from_cypher(variable: Option<&str>, rel_type: String, properties: Properties) -> Self {
         Self {
-            variable,
+            variable: variable.map(str::to_owned),
             rel_type,
             properties,
         }
+    }
+
+    fn set_property(&mut self, key: &str, value: Value) {
+        if value.is_null() {
+            self.properties.remove(key);
+        } else {
+            self.properties.insert(key.to_owned(), value);
+        }
+    }
+
+    fn clear_properties(&mut self) {
+        self.properties.clear();
     }
 }
 
 #[test]
 fn build_graph_typed_with_custom_types() {
     let g = build_graph_from_cypher_typed::<CustomNode, CustomEdge>(
-        r#"CREATE (a:Person {name: "Alice"})-[:KNOWS {since: 2020}]->(b:Person {name: "Bob"})"#,
+        r#"CREATE (a:Person {name: "Alice"})-[r:KNOWS {since: 2020}]->(b:Person {name: "Bob"})"#,
     )
     .unwrap();
 
@@ -198,19 +219,31 @@ fn build_graph_typed_with_custom_types() {
     assert_eq!(g.edge_count(), 1);
 
     let nodes: Vec<_> = g.node_weights().collect();
-    assert!(nodes.iter().any(|n| n.has_label("Person")));
+    assert!(nodes.iter().all(|n| n.has_label("Person")));
     assert!(
         nodes
             .iter()
-            .any(|n| n.get("name") == Some(&CypherValue::String("Alice".into())))
+            .any(|n| n.property("name") == Some(&Value::from("Alice")))
     );
     assert!(
         nodes
             .iter()
-            .any(|n| n.get("name") == Some(&CypherValue::String("Bob".into())))
+            .any(|n| n.property("name") == Some(&Value::from("Bob")))
     );
 
     let edge = g.edge_indices().next().unwrap();
-    assert_eq!(g[edge].rel_type(), Some("KNOWS"));
-    assert_eq!(g[edge].get("since"), Some(&CypherValue::Integer(2020)));
+    assert_eq!(g[edge].rel_type(), "KNOWS");
+    assert_eq!(g[edge].property("since"), Some(&Value::Integer(2020)));
+    assert_eq!(g[edge].variable.as_deref(), Some("r"));
+    let (src, _) = g.edge_endpoints(edge).unwrap();
+    assert_eq!(g[src].variable.as_deref(), Some("a"));
+}
+
+#[test]
+fn build_graph_propagates_errors() {
+    let result = build_graph_from_cypher("CREATE (a)-[:X]-(b)");
+    assert!(
+        matches!(result, Err(CypherError::InvalidQuery(_))),
+        "{result:?}"
+    );
 }
