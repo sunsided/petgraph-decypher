@@ -1,7 +1,11 @@
 //! Indiana Jones example — replicates the decypher crate's example using
 //! petgraph-decypher's graph builder and query engine.
 
-use petgraph_decypher::{CypherValue, PetgraphCypher, ResultValue, build_graph_from_cypher};
+use petgraph_decypher::{
+    EdgeData, NodeData, PetgraphCypher, PetgraphCypherMut, Value, build_graph_from_cypher,
+};
+
+type IndyGraph = petgraph::Graph<NodeData, EdgeData>;
 
 fn main() {
     let mut graph = build_indiana_jones_graph();
@@ -42,10 +46,19 @@ fn main() {
         &graph,
         "MATCH (r:Role) OPTIONAL MATCH (r)-[:SEEKS]->(a:Artifact) RETURN r.name AS role, r.nickname AS nickname, a.name AS artifact ORDER BY role",
     );
+
+    run_query(
+        &graph,
+        "MATCH (p:Person)-[:PLAYS_IN]->(m:Movie) WITH m, count(p) AS cast WHERE cast > 1 RETURN m.name AS movie, cast ORDER BY cast DESC, movie",
+    );
+
+    run_query(
+        &graph,
+        "MATCH (p:Person)-[:PLAYS_AS]->(:Role)-[:SEEKS]->(a:Artifact)-[:IN_MOVIE]->(m:Movie) RETURN a.name AS artifact, collect(p.name) AS seekers, m AS movie ORDER BY artifact",
+    );
 }
 
-fn build_indiana_jones_graph()
--> petgraph::Graph<petgraph_decypher::NodeData, petgraph_decypher::EdgeData> {
+fn build_indiana_jones_graph() -> IndyGraph {
     build_graph_from_cypher(
         r#"
         // Actors (Person)
@@ -134,42 +147,46 @@ fn build_indiana_jones_graph()
     .expect("failed to build graph")
 }
 
-fn run_query(
-    graph: &petgraph::Graph<petgraph_decypher::NodeData, petgraph_decypher::EdgeData>,
-    query: &str,
-) {
+fn run_query(graph: &IndyGraph, query: &str) {
     println!("\n--- Query: {} ---", query);
     match graph.cypher(query) {
         Ok(result) => {
-            let columns: Vec<String> = result.columns().to_vec();
             let rows: Vec<Vec<String>> = result
-                .map(|row| {
-                    columns
-                        .iter()
-                        .map(|col| match row.values.get(col) {
-                            Some(ResultValue::Scalar(CypherValue::String(s))) => s.clone(),
-                            Some(ResultValue::Scalar(CypherValue::Integer(i))) => i.to_string(),
-                            Some(ResultValue::Scalar(CypherValue::Float(f))) => f.to_string(),
-                            Some(ResultValue::Scalar(CypherValue::Boolean(b))) => b.to_string(),
-                            Some(ResultValue::Scalar(CypherValue::Null)) => "NULL".to_string(),
-                            Some(ResultValue::Scalar(CypherValue::List(_))) => "[list]".to_string(),
-                            Some(ResultValue::Scalar(CypherValue::Map(_))) => "{map}".to_string(),
-                            Some(ResultValue::Node { labels, .. }) => {
-                                format!("Node({})", labels.join(":"))
-                            }
-                            Some(ResultValue::Edge { rel_type, .. }) => {
-                                format!("Edge({})", rel_type.as_deref().unwrap_or("?"))
-                            }
-                            None => "NULL".to_string(),
-                        })
-                        .collect()
-                })
+                .rows()
+                .map(|row| row.values().iter().map(|v| render(graph, v)).collect())
                 .collect();
-            print_table(&columns, &rows);
+            print_table(result.columns(), &rows);
         }
         Err(err) => {
             eprintln!("Query error: {}", err);
         }
+    }
+}
+
+/// Renders a result value; nodes and relationships are looked up in the graph.
+fn render(graph: &IndyGraph, value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Null => "NULL".to_string(),
+        Value::List(items) => {
+            let items: Vec<String> = items.iter().map(|v| render(graph, v)).collect();
+            format!("[{}]", items.join(", "))
+        }
+        Value::Node(n) => format!(
+            "({}{})",
+            graph[*n]
+                .labels
+                .iter()
+                .map(|l| format!(":{l}"))
+                .collect::<String>(),
+            graph[*n]
+                .properties
+                .get("name")
+                .map(|name| format!(" {}", render(graph, name)))
+                .unwrap_or_default()
+        ),
+        Value::Relationship(e) => format!("[:{}]", graph[*e].rel_type),
+        other => other.to_string(),
     }
 }
 

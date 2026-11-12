@@ -1,265 +1,123 @@
-//! `petgraph-decypher` – build [`petgraph`] graphs from OpenCypher queries.
+//! `petgraph-decypher` – run openCypher queries against [`petgraph`] graphs.
 //!
-//! # Overview
-//!
-//! This crate provides three main entry points:
-//!
-//! * [`parse_cypher`] – parse a Cypher query string into the internal query plan.
-//! * [`build_graph_from_cypher`] – parse a Cypher query and materialise all
-//!   `CREATE` / `MERGE` operations into a [`petgraph::Graph`] with the default
-//!   [`NodeData`] / [`EdgeData`] types.
-//! * [`build_graph_from_cypher_typed`] – generic version that accepts any types
-//!   implementing [`CypherNode`] and [`CypherEdge`].
-//!
-//! # Supported Cypher subset
-//!
-//! | Feature | Status |
-//! |---------|--------|
-//! | `CREATE (n:Label {k: v})-[:TYPE]->(m)` | ✅ materialised + executed |
-//! | `MERGE  (n:Label {k: v})-[:TYPE]->(m)` | ✅ materialised + executed |
-//! | `MATCH  (n)-[r]->(m) WHERE n.p = v`    | ✅ evaluated |
-//! | `RETURN n, n.prop AS alias` / `RETURN *` | ✅ evaluated |
-//! | `[DETACH] DELETE n`                    | ✅ executed |
-//! | Multiple clauses in one query          | ✅ |
-//! | Semicolon-separated statements         | ✅ |
+//! Queries are parsed and analyzed by [`decypher`] and executed directly on
+//! its high-level IR. Read queries work on any `Graph<N, E>` or
+//! `StableGraph<N, E>` whose weights implement [`CypherNode`] /
+//! [`CypherEdge`]; mutating queries also need [`CypherNodeMut`] /
+//! [`CypherEdgeMut`]. [`NodeData`] and [`EdgeData`] implement all four.
 //!
 //! # Example
 //!
 //! ```rust
-//! use petgraph_decypher::build_graph_from_cypher;
+//! use petgraph_decypher::{PetgraphCypher, PetgraphCypherMut, Value, build_graph_from_cypher};
 //!
-//! let graph = build_graph_from_cypher(
-//!     r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,
-//! )
-//! .unwrap();
+//! let mut graph = build_graph_from_cypher(
+//!     "CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})",
+//! )?;
+//! graph.cypher_mut("MATCH (p:Person {name: 'Bob'}) SET p.age = 42")?;
 //!
-//! assert_eq!(graph.node_count(), 2);
-//! assert_eq!(graph.edge_count(), 1);
+//! let result = graph.cypher("MATCH (a)-[:KNOWS]->(b) RETURN a.name, b.age")?;
+//! assert_eq!(result.columns(), ["a.name", "b.age"]);
+//! let row = result.rows().next().unwrap();
+//! assert_eq!(row.get("a.name"), Some(&Value::from("Alice")));
+//! assert_eq!(row.get("b.age"), Some(&Value::from(42)));
+//! # Ok::<(), petgraph_decypher::CypherError>(())
 //! ```
+//!
+//! Use [`Query`] to parse a query once and run it many times.
+//!
+//! # Graph types and deletion
+//!
+//! `DELETE` takes effect when the query finishes. On a [`petgraph::Graph`],
+//! removing an element moves the last element into its slot, so indices of
+//! *other* elements may change; use a [`petgraph::stable_graph::StableGraph`]
+//! when indices must stay valid.
 
-pub mod ast;
-mod builder;
+mod element;
 pub mod error;
-mod planner;
-pub mod query;
+mod exec;
+mod graph;
+mod prepared;
+mod result;
+mod value;
 
-pub use ast::{
-    BinaryOp, CaseExpr, Clause, CypherQuery, CypherValue, Expression, NodePattern, PathPattern,
-    RelDirection, RelPattern, RelationshipLength, ReturnItem, SetItem, SortDirection, SortItem,
-    UnaryOp, WhereExpr,
-};
+pub use element::{CypherEdge, CypherEdgeMut, CypherNode, CypherNodeMut, EdgeData, NodeData};
 pub use error::CypherError;
-pub use query::{MatchStrategy, Parameters, PetgraphCypher, QueryResult, ResultValue, Row};
+pub use exec::Parameters;
+pub use graph::{CypherGraph, CypherGraphMut};
+pub use prepared::Query;
+pub use result::{QueryResult, Row};
+pub use value::{Path, Properties, Value};
 
 use petgraph::Graph;
-use std::collections::HashMap;
 
-/// Data stored at each node in the graph built by [`build_graph_from_cypher`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct NodeData {
-    /// Bound variable name from the Cypher pattern (e.g. `"n"`), if present.
-    pub variable: Option<String>,
-    /// Node labels (e.g. `["Person", "Employee"]`).
-    pub labels: Vec<String>,
-    /// Properties specified in the node pattern.
-    pub properties: HashMap<String, CypherValue>,
-}
-
-/// Common property access used by the query planner and executor.
-pub trait CypherProperties {
-    /// Get a property value by name.
-    fn get(&self, name: &str) -> Option<&CypherValue>;
-
-    /// Return all properties as a cloned map for query results.
-    fn properties(&self) -> HashMap<String, CypherValue>;
-}
-
-/// Metadata required from node weights during Cypher planning and execution.
-pub trait CypherNode: CypherProperties {
-    /// Returns whether this node has the requested label.
-    fn has_label(&self, label: &str) -> bool;
-
-    /// Return all node labels.
-    fn labels(&self) -> Vec<String>;
-
-    /// Construct a node value from a Cypher pattern.
-    fn from_cypher(
-        variable: Option<String>,
-        labels: Vec<String>,
-        properties: HashMap<String, CypherValue>,
-    ) -> Self;
-}
-
-/// Data stored at each edge in the graph built by [`build_graph_from_cypher`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct EdgeData {
-    /// Bound variable name from the Cypher pattern (e.g. `"r"`), if present.
-    pub variable: Option<String>,
-    /// Relationship type (e.g. `"KNOWS"`), if specified.
-    pub rel_type: Option<String>,
-    /// Properties specified in the relationship pattern.
-    pub properties: HashMap<String, CypherValue>,
-}
-
-/// Metadata required from edge weights during Cypher planning and execution.
-pub trait CypherEdge: CypherProperties {
-    /// Returns whether this edge matches the requested relationship type.
-    fn has_rel_type(&self, rel_type: &str) -> bool;
-
-    /// Return the relationship type, if any.
-    fn rel_type(&self) -> Option<&str>;
-
-    /// Construct an edge value from a Cypher pattern.
-    fn from_cypher(
-        variable: Option<String>,
-        rel_type: Option<String>,
-        properties: HashMap<String, CypherValue>,
-    ) -> Self;
-}
-
-impl CypherProperties for NodeData {
-    fn get(&self, name: &str) -> Option<&CypherValue> {
-        self.properties.get(name)
+/// Runs read-only Cypher queries on a graph.
+pub trait PetgraphCypher: CypherGraph + Sized {
+    /// Runs a read-only query.
+    fn cypher(&self, query: &str) -> Result<QueryResult, CypherError> {
+        Query::new(query)?.execute(self, &Parameters::new())
     }
 
-    fn properties(&self) -> HashMap<String, CypherValue> {
-        self.properties.clone()
+    /// Runs a read-only query with parameters (`$name` reads `params["name"]`).
+    fn cypher_params(&self, query: &str, params: &Parameters) -> Result<QueryResult, CypherError> {
+        Query::new(query)?.execute(self, params)
     }
 }
 
-impl CypherNode for NodeData {
-    fn has_label(&self, label: &str) -> bool {
-        self.labels.iter().any(|node_label| node_label == label)
+impl<G: CypherGraph> PetgraphCypher for G {}
+
+/// Runs any Cypher query, including `CREATE`, `MERGE`, `SET`, `REMOVE` and
+/// `DELETE`, on a graph.
+pub trait PetgraphCypherMut: CypherGraphMut + Sized {
+    /// Runs a query that may modify the graph and returns its rows.
+    fn cypher_mut(&mut self, query: &str) -> Result<QueryResult, CypherError> {
+        Query::new(query)?.execute_mut(self, &Parameters::new())
     }
 
-    fn labels(&self) -> Vec<String> {
-        self.labels.clone()
-    }
-
-    fn from_cypher(
-        variable: Option<String>,
-        labels: Vec<String>,
-        properties: HashMap<String, CypherValue>,
-    ) -> Self {
-        Self {
-            variable,
-            labels,
-            properties,
-        }
+    /// Runs a query that may modify the graph, with parameters.
+    fn cypher_mut_params(
+        &mut self,
+        query: &str,
+        params: &Parameters,
+    ) -> Result<QueryResult, CypherError> {
+        Query::new(query)?.execute_mut(self, params)
     }
 }
 
-impl CypherProperties for EdgeData {
-    fn get(&self, name: &str) -> Option<&CypherValue> {
-        self.properties.get(name)
-    }
+impl<G: CypherGraphMut> PetgraphCypherMut for G {}
 
-    fn properties(&self) -> HashMap<String, CypherValue> {
-        self.properties.clone()
-    }
-}
-
-impl CypherEdge for EdgeData {
-    fn has_rel_type(&self, rel_type: &str) -> bool {
-        self.rel_type.as_deref() == Some(rel_type)
-    }
-
-    fn rel_type(&self) -> Option<&str> {
-        self.rel_type.as_deref()
-    }
-
-    fn from_cypher(
-        variable: Option<String>,
-        rel_type: Option<String>,
-        properties: HashMap<String, CypherValue>,
-    ) -> Self {
-        Self {
-            variable,
-            rel_type,
-            properties,
-        }
-    }
-}
-
-/// Parse a Cypher query string and return its HIR-backed query plan representation.
-///
-/// # Errors
-///
-/// Returns [`CypherError::ParseError`] if the input cannot be parsed.
-///
-/// # Example
+/// Builds a new graph with custom weights by running `query` (typically
+/// `CREATE` / `MERGE` clauses) on an empty graph.
 ///
 /// ```rust
-/// use petgraph_decypher::parse_cypher;
-///
-/// let query = parse_cypher("CREATE (n:Person {name: \"Alice\"})").unwrap();
-/// assert_eq!(query.clauses.len(), 1);
-/// ```
-pub fn parse_cypher(query: &str) -> Result<CypherQuery, CypherError> {
-    planner::plan_query(query)
-}
-
-/// Parse a Cypher query and build a petgraph [`Graph`] from its `CREATE` and
-/// `MERGE` clauses using custom node and edge types.
-///
-/// This is the generic version of [`build_graph_from_cypher`]. Use it when you
-/// want to supply your own types that implement [`CypherNode`] and [`CypherEdge`].
-///
-/// Each distinct variable in the query corresponds to a single node; if the
-/// same variable appears in multiple patterns it maps to the same
-/// [`petgraph::graph::NodeIndex`].
-///
-/// # Errors
-///
-/// Returns [`CypherError::ParseError`] if the input cannot be parsed.
-///
-/// # Example
-///
-/// ```rust
-/// use petgraph_decypher::{build_graph_from_cypher_typed, NodeData, EdgeData};
+/// use petgraph_decypher::{EdgeData, NodeData, build_graph_from_cypher_typed};
 ///
 /// let graph = build_graph_from_cypher_typed::<NodeData, EdgeData>(
-///     r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,
-/// )
-/// .unwrap();
-///
-/// assert_eq!(graph.node_count(), 2);
-/// assert_eq!(graph.edge_count(), 1);
+///     "CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})",
+/// )?;
+/// assert_eq!((graph.node_count(), graph.edge_count()), (2, 1));
+/// # Ok::<(), petgraph_decypher::CypherError>(())
 /// ```
-pub fn build_graph_from_cypher_typed<N: CypherNode, E: CypherEdge>(
+pub fn build_graph_from_cypher_typed<N: CypherNodeMut, E: CypherEdgeMut>(
     query: &str,
 ) -> Result<Graph<N, E>, CypherError> {
-    let ast = parse_cypher(query)?;
-    builder::build_graph(ast)
+    let mut graph = Graph::new();
+    graph.cypher_mut(query)?;
+    Ok(graph)
 }
 
-/// Parse a Cypher query and build a petgraph [`Graph`] from its `CREATE` and
-/// `MERGE` clauses.
-///
-/// Each distinct variable in the query corresponds to a single node; if the
-/// same variable appears in multiple patterns it maps to the same
-/// [`petgraph::graph::NodeIndex`].
-///
-/// # Errors
-///
-/// Returns [`CypherError::ParseError`] if the input cannot be parsed.
-///
-/// # Example
+/// Builds a new `Graph<NodeData, EdgeData>` by running `query` on an empty
+/// graph.
 ///
 /// ```rust
-/// use petgraph_decypher::{build_graph_from_cypher, CypherValue};
+/// use petgraph_decypher::build_graph_from_cypher;
 ///
 /// let graph = build_graph_from_cypher(
-///     r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,
-/// )
-/// .unwrap();
-///
-/// assert_eq!(graph.node_count(), 2);
-/// assert_eq!(graph.edge_count(), 1);
-///
-/// // Check the edge type
+///     "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})",
+/// )?;
 /// let edge = graph.edge_indices().next().unwrap();
-/// assert_eq!(graph[edge].rel_type.as_deref(), Some("KNOWS"));
+/// assert_eq!(graph[edge].rel_type, "KNOWS");
+/// # Ok::<(), petgraph_decypher::CypherError>(())
 /// ```
 pub fn build_graph_from_cypher(query: &str) -> Result<Graph<NodeData, EdgeData>, CypherError> {
     build_graph_from_cypher_typed(query)

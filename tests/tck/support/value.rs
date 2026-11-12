@@ -90,7 +90,9 @@ fn render_float(out: &mut String, f: f64) {
     } else if f.is_infinite() {
         out.push_str(if f > 0.0 { "Inf" } else { "-Inf" });
     } else {
-        // `{:?}` keeps a fractional part (`1.0`) and round-trips exactly.
+        // `{:?}` keeps a fractional part (`1.0`) and round-trips exactly;
+        // `-0.0` equals `0.0` in Cypher.
+        let f = if f == 0.0 { 0.0 } else { f };
         write!(out, "{f:?}").unwrap();
     }
 }

@@ -2,20 +2,15 @@
 //!
 //! This is the only part of the harness that knows the crate's API: it runs
 //! setup and test queries, converts results into [`TckValue`]s and takes
-//! graph snapshots for side-effect checks.
+//! graph snapshots for side-effect checks. The graph is a `StableGraph`, so
+//! petgraph indices identify elements across deletions.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
-use petgraph::Graph;
-use petgraph_decypher::query::PetgraphCypher;
-use petgraph_decypher::{CypherError, CypherValue, EdgeData, NodeData, ResultValue};
+use petgraph::stable_graph::StableGraph;
+use petgraph_decypher::{CypherError, EdgeData, NodeData, Parameters, Query, Value};
 
-use super::value::{Node, Rel, TckValue};
-
-/// Prefix of the identity tags the harness stores in `NodeData::variable` /
-/// `EdgeData::variable`. The engine never reads those fields while executing,
-/// and they are not visible in query results.
-const TAG: &str = "#tck";
+use super::value::{self, Node, Rel, TckValue};
 
 /// Why a query did not produce a result.
 #[derive(Debug)]
@@ -48,20 +43,24 @@ pub struct Snapshot {
     pub nodes: BTreeSet<String>,
     pub rels: BTreeSet<String>,
     pub labels: BTreeSet<String>,
-    /// `(element tag, key, canonical value)`.
+    /// `(element, key, canonical value)`.
     pub properties: BTreeSet<(String, String, String)>,
 }
 
+type TckGraph = StableGraph<NodeData, EdgeData>;
+
 #[derive(Default)]
 pub struct Engine {
-    graph: Graph<NodeData, EdgeData>,
-    next_tag: usize,
+    graph: TckGraph,
 }
 
 impl Engine {
     /// Runs a setup query (`having executed:` or a named graph script).
     pub fn setup(&mut self, query: &str) -> Result<(), String> {
-        self.graph.cypher_mut(query).map_err(|e| e.to_string())
+        Query::new(query)
+            .and_then(|q| q.execute_mut(&mut self.graph, &Parameters::new()))
+            .map(drop)
+            .map_err(|e| e.to_string())
     }
 
     /// Runs the query under test.
@@ -70,96 +69,114 @@ impl Engine {
         query: &str,
         params: &BTreeMap<String, TckValue>,
     ) -> Result<Table, ExecError> {
-        let hir = decypher::analyze(query).map_err(|e| ExecError::Failed(e.to_string()))?;
-        if is_mutating(&hir) {
-            if !params.is_empty() {
-                return Err(ExecError::Unsupported(
-                    "parameters in a mutating query".into(),
-                ));
-            }
-            self.graph.cypher_mut(query).map_err(exec_error)?;
-            return Ok(Table {
-                columns: Vec::new(),
-                rows: Vec::new(),
-            });
-        }
-
         let params = params
             .iter()
-            .map(|(k, v)| Ok((k.clone(), to_cypher(v)?)))
-            .collect::<Result<HashMap<_, _>, ExecError>>()?;
-        let result = self
-            .graph
-            .cypher_params(query, &params)
-            .map_err(exec_error)?;
+            .map(|(k, v)| Ok((k.clone(), to_value(v)?)))
+            .collect::<Result<Parameters, ExecError>>()?;
+        let query = Query::new(query).map_err(exec_error)?;
+        let result = if query.is_read_only() {
+            query.execute(&self.graph, &params)
+        } else {
+            query.execute_mut(&mut self.graph, &params)
+        }
+        .map_err(exec_error)?;
         let columns = result.columns().to_vec();
         let rows = result
+            .rows()
             .map(|row| {
-                row.values
-                    .into_iter()
-                    .map(|(k, v)| (k, from_result(v)))
+                row.iter()
+                    .map(|(k, v)| (k.to_owned(), self.convert(v)))
                     .collect()
             })
             .collect();
         Ok(Table { columns, rows })
     }
 
-    /// Tags elements that have no identity tag yet and records the graph state.
+    /// Records the graph state.
     pub fn snapshot(&mut self) -> Snapshot {
         let mut snap = Snapshot::default();
-        for weight in self.graph.node_weights_mut() {
-            let tag = tag(&mut weight.variable, &mut self.next_tag);
+        for n in self.graph.node_indices() {
+            let id = format!("n{}", n.index());
+            let weight = &self.graph[n];
             snap.labels.extend(weight.labels.iter().cloned());
-            record(&mut snap.properties, &tag, &weight.properties);
-            snap.nodes.insert(tag);
+            record(&mut snap.properties, &id, &weight.properties);
+            snap.nodes.insert(id);
         }
-        for weight in self.graph.edge_weights_mut() {
-            let tag = tag(&mut weight.variable, &mut self.next_tag);
-            record(&mut snap.properties, &tag, &weight.properties);
-            snap.rels.insert(tag);
+        for e in self.graph.edge_indices() {
+            let id = format!("r{}", e.index());
+            record(&mut snap.properties, &id, &self.graph[e].properties);
+            snap.rels.insert(id);
         }
         snap
     }
-}
 
-fn tag(variable: &mut Option<String>, next: &mut usize) -> String {
-    if let Some(tag) = variable.as_ref().filter(|v| v.starts_with(TAG)) {
-        return tag.clone();
+    fn convert(&self, value: &Value) -> TckValue {
+        match value {
+            Value::Null => TckValue::Null,
+            Value::Boolean(b) => TckValue::Bool(*b),
+            Value::Integer(i) => TckValue::Int(*i),
+            Value::Float(f) => TckValue::Float(*f),
+            Value::String(s) => TckValue::String(s.clone()),
+            Value::List(items) => TckValue::List(items.iter().map(|v| self.convert(v)).collect()),
+            Value::Map(map) => TckValue::Map(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), self.convert(v)))
+                    .collect(),
+            ),
+            Value::Node(n) => TckValue::Node(self.node(*n)),
+            Value::Relationship(e) => TckValue::Rel(self.rel(*e)),
+            Value::Path(p) => {
+                let mut hops = Vec::new();
+                for (i, &e) in p.relationships.iter().enumerate() {
+                    let forward = self
+                        .graph
+                        .edge_endpoints(e)
+                        .is_some_and(|(s, _)| s == p.nodes[i]);
+                    hops.push((self.rel(e), forward, self.node(p.nodes[i + 1])));
+                }
+                TckValue::Path(value::Path {
+                    start: self.node(p.nodes[0]),
+                    hops,
+                })
+            }
+        }
     }
-    *next += 1;
-    let tag = format!("{TAG}{next}");
-    *variable = Some(tag.clone());
-    tag
+
+    fn node(&self, n: petgraph::graph::NodeIndex) -> Node {
+        self.graph
+            .node_weight(n)
+            .map(|w| Node {
+                labels: w.labels.clone(),
+                properties: self.props(&w.properties),
+            })
+            .unwrap_or_default()
+    }
+
+    fn rel(&self, e: petgraph::graph::EdgeIndex) -> Rel {
+        self.graph
+            .edge_weight(e)
+            .map(|w| Rel {
+                rel_type: w.rel_type.clone(),
+                properties: self.props(&w.properties),
+            })
+            .unwrap_or_default()
+    }
+
+    fn props(&self, map: &BTreeMap<String, Value>) -> BTreeMap<String, TckValue> {
+        map.iter()
+            .map(|(k, v)| (k.clone(), self.convert(v)))
+            .collect()
+    }
 }
 
 fn record(
     out: &mut BTreeSet<(String, String, String)>,
-    tag: &str,
-    properties: &HashMap<String, CypherValue>,
+    id: &str,
+    properties: &BTreeMap<String, Value>,
 ) {
     for (key, value) in properties {
-        if *value != CypherValue::Null {
-            out.insert((
-                tag.to_owned(),
-                key.clone(),
-                from_cypher(value).canonical(false),
-            ));
-        }
+        out.insert((id.to_owned(), key.clone(), value.to_string()));
     }
-}
-
-fn is_mutating(hir: &decypher::hir::HirQuery) -> bool {
-    use decypher::hir::ops::Operation;
-    hir.parts.iter().flat_map(|p| &p.operations).any(|op| {
-        matches!(
-            op,
-            Operation::Create(_)
-                | Operation::Merge(_)
-                | Operation::Set(_)
-                | Operation::Remove(_)
-                | Operation::Delete(_)
-        )
-    })
 }
 
 fn exec_error(e: CypherError) -> ExecError {
@@ -169,19 +186,17 @@ fn exec_error(e: CypherError) -> ExecError {
     }
 }
 
-fn to_cypher(value: &TckValue) -> Result<CypherValue, ExecError> {
+fn to_value(value: &TckValue) -> Result<Value, ExecError> {
     Ok(match value {
-        TckValue::Null => CypherValue::Null,
-        TckValue::Bool(b) => CypherValue::Boolean(*b),
-        TckValue::Int(i) => CypherValue::Integer(*i),
-        TckValue::Float(f) => CypherValue::Float(*f),
-        TckValue::String(s) => CypherValue::String(s.clone()),
-        TckValue::List(items) => {
-            CypherValue::List(items.iter().map(to_cypher).collect::<Result<_, _>>()?)
-        }
-        TckValue::Map(map) => CypherValue::Map(
+        TckValue::Null => Value::Null,
+        TckValue::Bool(b) => Value::Boolean(*b),
+        TckValue::Int(i) => Value::Integer(*i),
+        TckValue::Float(f) => Value::Float(*f),
+        TckValue::String(s) => Value::String(s.clone()),
+        TckValue::List(items) => Value::List(items.iter().map(to_value).collect::<Result<_, _>>()?),
+        TckValue::Map(map) => Value::Map(
             map.iter()
-                .map(|(k, v)| Ok((k.clone(), to_cypher(v)?)))
+                .map(|(k, v)| Ok((k.clone(), to_value(v)?)))
                 .collect::<Result<_, ExecError>>()?,
         ),
         other => {
@@ -191,47 +206,4 @@ fn to_cypher(value: &TckValue) -> Result<CypherValue, ExecError> {
             )));
         }
     })
-}
-
-fn from_cypher(value: &CypherValue) -> TckValue {
-    match value {
-        CypherValue::Null => TckValue::Null,
-        CypherValue::Boolean(b) => TckValue::Bool(*b),
-        CypherValue::Integer(i) => TckValue::Int(*i),
-        CypherValue::Float(f) => TckValue::Float(*f),
-        CypherValue::String(s) => TckValue::String(s.clone()),
-        CypherValue::List(items) => TckValue::List(items.iter().map(from_cypher).collect()),
-        CypherValue::Map(map) => TckValue::Map(
-            map.iter()
-                .map(|(k, v)| (k.clone(), from_cypher(v)))
-                .collect(),
-        ),
-    }
-}
-
-fn properties(map: &HashMap<String, CypherValue>) -> BTreeMap<String, TckValue> {
-    map.iter()
-        .filter(|(_, v)| **v != CypherValue::Null)
-        .map(|(k, v)| (k.clone(), from_cypher(v)))
-        .collect()
-}
-
-fn from_result(value: ResultValue) -> TckValue {
-    match value {
-        ResultValue::Scalar(v) => from_cypher(&v),
-        ResultValue::Node {
-            labels,
-            properties: props,
-        } => TckValue::Node(Node {
-            labels,
-            properties: properties(&props),
-        }),
-        ResultValue::Edge {
-            rel_type,
-            properties: props,
-        } => TckValue::Rel(Rel {
-            rel_type: rel_type.unwrap_or_default(),
-            properties: properties(&props),
-        }),
-    }
 }
