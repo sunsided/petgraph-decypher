@@ -97,11 +97,11 @@ impl Unit {
         parts: Range<usize>,
         sq: &SingleQuery,
     ) -> Result<Branch, CypherError> {
-        let last = self
-            .hir
-            .parts
-            .get(parts.end.wrapping_sub(1))
-            .ok_or_else(mismatch)?;
+        // The executor slices the parts by this range, so it must be valid.
+        if parts.start >= parts.end || parts.end > self.hir.parts.len() {
+            return Err(mismatch());
+        }
+        let last = &self.hir.parts[parts.end - 1];
         let returns = matches!(last.operations.last(), Some(Operation::Return(_)));
         let outputs = if returns {
             self.hir
@@ -162,31 +162,30 @@ impl Query {
                 continue;
             }
             // A union is one part holding the branches as queries of their own.
+            // Move the branches out: each becomes a unit of its own, and the
+            // read-only check below scans those units.
             let Some(Operation::Union(union)) = units[0]
                 .hir
                 .parts
-                .get(next_part)
-                .and_then(|p| p.operations.first())
-                .cloned()
+                .get_mut(next_part)
+                .and_then(|p| p.operations.first_mut())
             else {
                 return Err(mismatch());
             };
+            let (branch_hirs, distinct) = (std::mem::take(&mut union.branches), union.distinct);
             next_part += 1;
             let singles = std::iter::once(single).chain(unions.iter().map(|u| &u.single_query));
-            if union.branches.len() != unions.len() + 1 {
+            if branch_hirs.len() != unions.len() + 1 {
                 return Err(mismatch());
             }
             let mut branches = Vec::new();
-            for (sq, hir) in singles.zip(union.branches) {
+            for (sq, hir) in singles.zip(branch_hirs) {
                 let parts = 0..hir.parts.len();
                 units.push(Unit::new(hir)?);
                 let index = units.len() - 1;
                 branches.push(units[index].branch(index, parts, sq)?);
             }
-            statements.push(Statement {
-                branches,
-                distinct: union.distinct,
-            });
+            statements.push(Statement { branches, distinct });
         }
         if next_part != units[0].hir.parts.len() {
             return Err(mismatch());
