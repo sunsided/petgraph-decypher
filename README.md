@@ -45,6 +45,14 @@ assert_eq!(graph.edge_count(), 1);
 | Multi-label nodes and undirected relationships (in `MATCH`; `CREATE` needs a direction and a type) | ✅ |
 | String, integer, float, bool, null, list, map values | ✅ |
 
+## openCypher conformance
+
+`cargo test --test tck` executes the official openCypher TCK (release 2024.3,
+vendored in [`tests/tck`](tests/tck/README.md)) against petgraph graphs and
+compares result tables, errors and side effects. Scenarios that do not pass
+yet are listed in `tests/tck/known_failures.txt`; the test fails if a new
+scenario breaks or a listed one starts passing.
+
 ## Current limitations and planned work
 
 | Capability | Status |
