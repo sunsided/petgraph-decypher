@@ -184,7 +184,7 @@ impl<A: Access> Executor<'_, A> {
                 Literal::String(s) => Value::String(s.clone()),
             }),
             ExprKind::Binding(b) => Ok(row.get(b.0).and_then(Clone::clone).unwrap_or_default()),
-            ExprKind::Parameter(p) => Ok(self.params[p.0].clone()),
+            ExprKind::Parameter(p) => Ok(self.param(*p).clone()),
             ExprKind::Property { base, key } => {
                 let base = self.eval(*base, row)?;
                 self.property(&base, &q.keys[key.0])

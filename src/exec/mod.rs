@@ -38,7 +38,9 @@ pub(crate) struct Executor<'q, A: Access> {
     access: A,
     /// Parameter values per unit, indexed by its `ParameterId`s.
     unit_params: Vec<Vec<Value>>,
-    params: Vec<Value>,
+    /// The index of `q` in the query's units.
+    unit: usize,
+    /// Row width of `q`: its number of bindings.
     slots: usize,
     deleted_nodes: HashSet<NodeIndex>,
     deleted_edges: HashSet<EdgeIndex>,
@@ -66,11 +68,12 @@ impl<'q, A: Access> Executor<'q, A> {
             q: &query.units[0],
             access,
             unit_params,
-            params: Vec::new(),
+            unit: 0,
             slots: 0,
             deleted_nodes: HashSet::new(),
             deleted_edges: HashSet::new(),
         };
+        ex.enter_unit(0);
         match ex.run_statements() {
             Ok(result) => Ok(result),
             Err(e) => {
@@ -78,6 +81,18 @@ impl<'q, A: Access> Executor<'q, A> {
                 Err(e)
             }
         }
+    }
+
+    /// Makes `unit` the one expressions, names and parameters resolve against.
+    fn enter_unit(&mut self, unit: usize) {
+        self.unit = unit;
+        self.q = &self.query.units[unit];
+        self.slots = self.q.hir.arenas.bindings.iter().count();
+    }
+
+    /// The value of a parameter of the current unit.
+    pub(super) fn param(&self, id: decypher::hir::arena::ParameterId) -> &Value {
+        &self.unit_params[self.unit][id.0]
     }
 
     fn run_statements(&mut self) -> Result<QueryResult> {
@@ -102,9 +117,7 @@ impl<'q, A: Access> Executor<'q, A> {
     }
 
     fn run_branch(&mut self, branch: &Branch) -> Result<Vec<Vec<Value>>> {
-        self.q = &self.query.units[branch.unit];
-        self.params.clone_from(&self.unit_params[branch.unit]);
-        self.slots = self.q.hir.arenas.bindings.iter().count();
+        self.enter_unit(branch.unit);
         let mut rows = vec![vec![None; self.slots]];
         for part in &self.q.hir.parts[branch.parts.clone()] {
             for op in &part.operations {
