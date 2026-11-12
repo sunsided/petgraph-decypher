@@ -13,177 +13,112 @@ Cypher® and Neo4j® are registered trademarks of Neo4j, Inc.
 
 ## Overview
 
-`petgraph-decypher` is both:
+`petgraph-decypher` runs openCypher queries against `petgraph` graphs:
 
-1. A Cypher-driven graph builder (`CREATE` / `MERGE`), and
-2. A query engine for executing read and mutation queries on `petgraph::Graph`.
+1. Build graphs with `CREATE` / `MERGE`.
+2. Query and mutate any `Graph<N, E>` or `StableGraph<N, E>`, using the bundled
+   `NodeData` / `EdgeData` weights or your own.
 
-You can start from Cypher **or** from an existing graph and run Cypher against it.
+Queries are parsed and analyzed by [`decypher`](https://crates.io/crates/decypher)
+and executed directly on its high-level IR; results reference nodes and
+relationships by their petgraph index.
 
 ```rust
-use petgraph_decypher::build_graph_from_cypher;
+use petgraph_decypher::{PetgraphCypher, PetgraphCypherMut, Value, build_graph_from_cypher};
 
-let graph = build_graph_from_cypher(
-    r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,
-)
-.unwrap();
+let mut graph = build_graph_from_cypher(
+    "CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})",
+).unwrap();
+graph.cypher_mut("MATCH (p:Person {name: 'Bob'}) SET p.age = 42").unwrap();
 
-assert_eq!(graph.node_count(), 2);
-assert_eq!(graph.edge_count(), 1);
+let result = graph.cypher("MATCH (a)-[:KNOWS]->(b) RETURN a.name, b.age").unwrap();
+assert_eq!(result.columns(), ["a.name", "b.age"]);
+let row = result.rows().next().unwrap();
+assert_eq!(row.get("b.age"), Some(&Value::from(42)));
 ```
 
-## What works today
+## What works
 
 | Feature | Status |
 |---------|--------|
-| Build graphs with `CREATE` / `MERGE` | ✅ |
-| Read queries: `MATCH`, `WHERE`, `RETURN`, `OPTIONAL MATCH` | ✅ |
-| Projection features: `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT` | ✅ |
-| Mutation queries: `CREATE`, `MERGE`, `SET`, `REMOVE`, `[DETACH] DELETE` | ✅ |
-| Scalar functions (e.g. `size`, `toString`, `toUpper`, `toLower`, `trim`) | ✅ |
-| Multiple clauses / semicolon-separated statements | ✅ |
-| Multi-label nodes and undirected relationships (in `MATCH`; `CREATE` needs a direction and a type) | ✅ |
-| String, integer, float, bool, null, list, map values | ✅ |
+| `MATCH`, `OPTIONAL MATCH`, `WHERE`, `WITH`, `UNWIND`, `RETURN`, `UNION [ALL]` | ✅ |
+| `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`, aggregation (`count`, `sum`, `avg`, `min`, `max`, `collect`, `stDev`, percentiles) | ✅ |
+| `CREATE`, `MERGE` (`ON CREATE` / `ON MATCH`), `SET`, `REMOVE`, `[DETACH] DELETE`, `FOREACH` | ✅ |
+| Variable-length relationships (`*1..3`), path variables, label expressions (`:A\|B`, `:!A`) | ✅ |
+| Parameters (`$name`), list/pattern comprehensions, quantifiers, `reduce`, `CASE`, map projection | ✅ |
+| Scalar, string, math, list and graph functions (`labels`, `type`, `nodes`, `keys`, …) | ✅ |
+| Temporal types and functions (`date()`, `duration()`, …) | ❌ |
+| `EXISTS { … }` / `COUNT { … }` subqueries, `CALL`, procedures, `LOAD CSV`, `=~` | ❌ |
 
 ## openCypher conformance
 
 `cargo test --test tck` executes the official openCypher TCK (release 2024.3,
 vendored in [`tests/tck`](tests/tck/README.md)) against petgraph graphs and
-compares result tables, errors and side effects. Scenarios that do not pass
-yet are listed in `tests/tck/known_failures.txt`; the test fails if a new
-scenario breaks or a listed one starts passing.
-
-## Current limitations and planned work
-
-| Capability | Status |
-|------------|--------|
-| Parameterized queries (`$param`) | 🚧 planned |
-| Variable-length paths (`*1..3`) | 🚧 planned |
-| Native subgraph selection as a first-class query output | 🚧 planned |
-| End-to-end Cypher subgraph -> petgraph algorithm -> Cypher-style projection helpers | 🚧 planned |
+compares result tables, errors and side effects: **2759 of 3897 scenarios
+pass**. Of the 1087 failing, 1004 need temporal types; most others are
+unsupported subqueries or operator-precedence issues in the parser. They are
+listed in `tests/tck/known_failures.txt`; the test fails if a new scenario
+breaks or a listed one starts passing.
 
 ## API
 
 ```rust
-// Parse only – returns the HIR-backed query plan
-let query = petgraph_decypher::parse_cypher("CREATE (n:Person {name: \"Alice\"})")
-    .unwrap();
+use petgraph::stable_graph::StableGraph;
+use petgraph_decypher::{EdgeData, NodeData, Parameters, PetgraphCypher, Query, Value};
 
-// Parse + build graph – executes CREATE/MERGE clauses
-let graph = petgraph_decypher::build_graph_from_cypher(
-    "CREATE (a)-[:KNOWS]->(b)"
-)
-.unwrap();
+// Run a query once …
+let mut graph = StableGraph::<NodeData, EdgeData>::new();
+use petgraph_decypher::PetgraphCypherMut;
+graph.cypher_mut("UNWIND range(1, 3) AS i CREATE (:Item {id: i})").unwrap();
 
-// Read-only query execution via PetgraphCypher trait
-use petgraph_decypher::PetgraphCypher;
-let result = graph.cypher("MATCH (n) RETURN n").unwrap();
-
-// Mutating query execution via PetgraphCypher trait
-graph.cypher_mut("CREATE (n:Person {name: \"Alice\"})").unwrap();
+// … or prepare it once and execute it many times.
+let by_id = Query::new("MATCH (n:Item {id: $id}) RETURN n").unwrap();
+let params = Parameters::from([("id".to_string(), Value::from(2))]);
+let result = by_id.execute(&graph, &params).unwrap();
+let Some(Value::Node(n)) = result.column("n").next() else { unreachable!() };
+assert_eq!(graph[*n].properties["id"], Value::from(2));
 ```
 
-### Query an existing graph
+- `PetgraphCypher::cypher` / `cypher_params` run read-only queries on any
+  `CypherGraph` (`Graph` and `StableGraph`).
+- `PetgraphCypherMut::cypher_mut` / `cypher_mut_params` run any query and
+  return its rows.
+- `Query::new` parses and analyzes once; `execute` / `execute_mut` run it.
+- `QueryResult` has `columns()`, `rows()` (with `Row::get(column)`),
+  `column(name)` and `into_rows()`. Column names follow Cypher:
+  `RETURN n.name` produces column `n.name`.
+- `Value` covers `null`, booleans, integers, floats, strings, lists, maps,
+  `Node(NodeIndex)`, `Relationship(EdgeIndex)` and `Path`.
 
-```rust
-use petgraph::Graph;
-use petgraph_decypher::{CypherValue, EdgeData, NodeData, PetgraphCypher};
-
-let mut graph = Graph::<NodeData, EdgeData>::new();
-let a = graph.add_node(NodeData {
-    variable: None,
-    labels: vec!["Person".into()],
-    properties: std::collections::HashMap::from([(
-        "name".into(),
-        CypherValue::String("Alice".into()),
-    )]),
-});
-let b = graph.add_node(NodeData {
-    variable: None,
-    labels: vec!["Person".into()],
-    properties: std::collections::HashMap::from([(
-        "name".into(),
-        CypherValue::String("Bob".into()),
-    )]),
-});
-graph.add_edge(
-    a,
-    b,
-    EdgeData {
-        variable: None,
-        rel_type: Some("KNOWS".into()),
-        properties: Default::default(),
-    },
-);
-
-let rows: Vec<_> = graph
-    .cypher("MATCH (p:Person)-[:KNOWS]->(q:Person) RETURN p.name AS from, q.name AS to")
-    .unwrap()
-    .collect();
-assert_eq!(rows.len(), 1);
-```
-
-### Mutate an existing graph
-
-```rust
-use petgraph_decypher::{PetgraphCypher, build_graph_from_cypher};
-
-let mut graph = build_graph_from_cypher(r#"CREATE (p:Person {name: "Alice"})"#).unwrap();
-
-graph.cypher_mut(r#"MATCH (p:Person {name: "Alice"}) SET p.role = "Archaeologist""#).unwrap();
-graph.cypher_mut(r#"MATCH (p:Person {name: "Alice"}) REMOVE p.role"#).unwrap();
-```
+`DELETE` is applied when the query finishes. On a `Graph`, removing an
+element moves the last element into its slot, so indices of *other* elements
+may change; use a `StableGraph` when indices must stay valid.
 
 ### Custom node and edge types
 
-`build_graph_from_cypher_typed` supports domain-specific node and edge weights via
-`CypherNode` and `CypherEdge`.
+Implement `CypherNode` / `CypherEdge` (labels, type and property access) to
+query your own weights, and `CypherNodeMut` / `CypherEdgeMut` (construction
+and updates) to mutate them. See `CustomNode` / `CustomEdge` in
+`tests/query_tests.rs`.
 
-For a complete working reference, see:
-
-- `tests/builder_tests.rs` (`build_graph_typed_with_custom_types`)
-- `tests/query_tests.rs` (`query_match_all_nodes_with_custom_weights`)
-
-### Showcase direction: Cypher + petgraph algorithms
-
-Today, you can already compose Cypher selection with petgraph algorithms in user code:
-
-1. Build/load the graph.
-2. Use Cypher to select the slice of interest (e.g. nodes/relationships by label/property).
-3. Run a petgraph algorithm on that selection.
-4. Map algorithm output back to original node properties.
-
-The `examples/indiana_jones.rs` example demonstrates the first two steps with read + mutation queries.
-
-### Node data
-
-Each petgraph node carries a `NodeData` value:
+### Node and edge data
 
 ```rust
 pub struct NodeData {
-    pub variable:   Option<String>,
+    pub variable:   Option<String>, // the CREATE pattern variable, if any
     pub labels:     Vec<String>,
-    pub properties: HashMap<String, CypherValue>,
+    pub properties: Properties,     // BTreeMap<String, Value>
 }
-```
 
-`NodeData` implements `CypherNode`, and its property map is exposed through
-`CypherProperties::get`.
-
-### Edge data
-
-Each petgraph edge carries an `EdgeData` value:
-
-```rust
 pub struct EdgeData {
     pub variable:   Option<String>,
-    pub rel_type:   Option<String>,
-    pub properties: HashMap<String, CypherValue>,
+    pub rel_type:   String,
+    pub properties: Properties,
 }
 ```
 
-`EdgeData` implements `CypherEdge`, and exposes relationship properties through
-`CypherProperties::get`.
+`examples/indiana_jones.rs` builds a small movie graph and runs read,
+aggregation and mutation queries against it.
 
 ## License
 
