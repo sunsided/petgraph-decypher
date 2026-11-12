@@ -100,7 +100,7 @@ impl Value {
             (Value::Null, _) | (_, Value::Null) => None,
             (Value::Integer(a), Value::Integer(b)) => Some(a == b),
             (Value::Integer(_) | Value::Float(_), Value::Integer(_) | Value::Float(_)) => {
-                Some(self.as_f64() == other.as_f64())
+                Some(num_cmp(self, other) == Some(Ordering::Equal))
             }
             (Value::List(a), Value::List(b)) => {
                 if a.len() != b.len() {
@@ -124,7 +124,7 @@ impl Value {
         match (self, other) {
             (Value::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
             (Value::Integer(_) | Value::Float(_), Value::Integer(_) | Value::Float(_)) => {
-                self.as_f64()?.partial_cmp(&other.as_f64()?)
+                num_cmp(self, other)
             }
             (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
             (Value::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
@@ -159,12 +159,12 @@ impl Value {
         match (self, other) {
             (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
             (Value::Integer(_) | Value::Float(_), Value::Integer(_) | Value::Float(_)) => {
-                let (a, b) = (self.as_f64().unwrap(), other.as_f64().unwrap());
-                match (a.is_nan(), b.is_nan()) {
+                let nan = |v: &Value| matches!(v, Value::Float(f) if f.is_nan());
+                match (nan(self), nan(other)) {
                     (true, true) => Ordering::Equal,
                     (true, false) => Ordering::Greater,
                     (false, true) => Ordering::Less,
-                    (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+                    (false, false) => num_cmp(self, other).unwrap_or(Ordering::Equal),
                 }
             }
             (Value::String(a), Value::String(b)) => a.cmp(b),
@@ -204,6 +204,42 @@ impl Value {
             _ => None,
         }
     }
+}
+
+/// Exact numeric comparison of integers and floats: no rounding through
+/// `f64`, so integers beyond 2^53 keep their order. `None` involves `NaN`.
+fn num_cmp(a: &Value, b: &Value) -> Option<Ordering> {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => Some(x.cmp(y)),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
+        (Value::Integer(i), Value::Float(f)) => int_float_cmp(*i, *f),
+        (Value::Float(f), Value::Integer(i)) => int_float_cmp(*i, *f).map(Ordering::reverse),
+        _ => None,
+    }
+}
+
+fn int_float_cmp(i: i64, f: f64) -> Option<Ordering> {
+    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+    if f.is_nan() {
+        return None;
+    }
+    if f >= TWO_POW_63 {
+        return Some(Ordering::Less);
+    }
+    if f < -TWO_POW_63 {
+        return Some(Ordering::Greater);
+    }
+    // In range, so the integral part converts to i64 exactly.
+    let whole = f.trunc();
+    Some(i.cmp(&(whole as i64)).then_with(|| {
+        if f > whole {
+            Ordering::Less
+        } else if f < whole {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    }))
 }
 
 fn all_eq<'a>(pairs: impl Iterator<Item = (&'a Value, &'a Value)>) -> Option<bool> {
@@ -329,6 +365,22 @@ mod tests {
         assert_eq!(with_null.cypher_eq(&Value::from(vec![1, 2])), None);
         assert_eq!(with_null.cypher_eq(&Value::from(vec![2, 2])), Some(false));
         assert_eq!(Value::from("a").cypher_eq(&Value::from(1)), Some(false));
+    }
+
+    #[test]
+    fn large_integers_compare_exactly_with_floats() {
+        let big = 1_i64 << 53;
+        let (int_above, float_at) = (Value::from(big + 1), Value::from(big as f64));
+        assert_eq!(int_above.order(&float_at), Ordering::Greater);
+        assert_eq!(int_above.cypher_eq(&float_at), Some(false));
+        assert!(!int_above.equivalent(&float_at));
+        assert_eq!(
+            Value::from(i64::MAX).order(&Value::from(9.3e18)),
+            Ordering::Less
+        );
+        assert_eq!(Value::from(2).order(&Value::from(2.5)), Ordering::Less);
+        assert_eq!(Value::from(-2).order(&Value::from(-2.5)), Ordering::Greater);
+        assert_eq!(Value::from(3).cypher_eq(&Value::from(3.0)), Some(true));
     }
 
     #[test]
