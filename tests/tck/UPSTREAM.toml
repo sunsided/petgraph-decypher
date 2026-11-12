@@ -1,0 +1,10 @@
+# The openCypher release the vendored TCK was copied from.
+# Same release decypher's syntax-only TCK projection is generated from.
+tag = "2024.3"
+commit = "677cbafabb8c3c5eed458fd3b1ec0daec8d67d23"
+repository = "https://github.com/opencypher/openCypher"
+
+# Copied unmodified:
+#   tck/features/**                          -> tests/tck/features/
+#   tck/graphs/<name>/<name>.cypher          -> tests/tck/graphs/<name>/
+#   LICENSE, NOTICE                          -> tests/tck/
