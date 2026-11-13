@@ -212,6 +212,14 @@ fn lookup<T: Copy>(table: &[(&str, T)], name: &str) -> Option<T> {
 }
 
 impl Aggregate {
+    /// The Cypher name, for error messages.
+    fn name(self) -> &'static str {
+        AGGREGATES
+            .iter()
+            .find(|(_, f)| *f == self)
+            .map_or("aggregate", |(name, _)| name)
+    }
+
     /// Checks the argument count: `count(*)` has none, percentiles take the
     /// value and the percentile, every other aggregate one value.
     pub(crate) fn check_arity(self, args: usize) -> Result<(), CypherError> {
@@ -318,7 +326,8 @@ fn conversion(f: Scalar) -> Scalar {
         S::ToBooleanOrNull | S::ToBooleanList => S::ToBoolean,
         S::ToIntegerOrNull | S::ToIntegerList => S::ToInteger,
         S::ToFloatOrNull | S::ToFloatList => S::ToFloat,
-        _ => S::ToString,
+        S::ToStringOrNull | S::ToStringList => S::ToString,
+        other => unreachable!("{other:?} is not an OrNull or List conversion"),
     }
 }
 
@@ -372,28 +381,40 @@ fn trim(f: Scalar, args: &[Value]) -> Result<Value, CypherError> {
     ))
 }
 
-/// Splits `s` at every occurrence of any of `delimiters`, preferring the
-/// longest delimiter that matches at a position. Empty delimiters are
-/// ignored.
+/// `split`: cuts `s` at the earliest match of any delimiter; when several
+/// match at the same position, the first in `delimiters` wins. An empty
+/// delimiter splits between characters (`split('abc', '')` is
+/// `['a', 'b', 'c']`). The manual leaves both cases open; these are this
+/// engine's rules, applied alike to one delimiter and to a list.
 fn split_any(s: &str, delimiters: &[&str]) -> Vec<Value> {
+    let between_chars = delimiters.iter().any(|d| d.is_empty());
     let mut parts = Vec::new();
     let (mut start, mut i) = (0, 0);
+    // Whether the last cut was a delimiter, which leaves an empty last part.
+    let mut cut_at_delimiter = false;
     while i < s.len() {
-        let matched = delimiters
+        if let Some(d) = delimiters
             .iter()
-            .filter(|d| !d.is_empty() && s[i..].starts_with(**d))
-            .map(|d| d.len())
-            .max();
-        match matched {
-            Some(len) => {
-                parts.push(Value::from(&s[start..i]));
-                i += len;
-                start = i;
-            }
-            None => i += s[i..].chars().next().map_or(1, char::len_utf8),
+            .find(|d| !d.is_empty() && s[i..].starts_with(**d))
+        {
+            parts.push(Value::from(&s[start..i]));
+            i += d.len();
+            start = i;
+            cut_at_delimiter = true;
+            continue;
         }
+        // An empty delimiter separates this character from the previous one,
+        // unless a delimiter already did.
+        if between_chars && i > start {
+            parts.push(Value::from(&s[start..i]));
+            start = i;
+        }
+        i += s[i..].chars().next().map_or(1, char::len_utf8);
+        cut_at_delimiter = false;
     }
-    parts.push(Value::from(&s[start..]));
+    if !between_chars || start < s.len() || cut_at_delimiter || parts.is_empty() {
+        parts.push(Value::from(&s[start..]));
+    }
     parts
 }
 
@@ -454,8 +475,10 @@ fn round(args: &[Value]) -> Result<Value, CypherError> {
     };
     Ok(Value::Float(match mode {
         // Without a mode, whole numbers keep Cypher's classic rounding of
-        // ties towards positive infinity (`round(-1.5)` is -1.0), while a
-        // precision rounds ties away from zero (`round(-1.55, 1)` is -1.6).
+        // ties towards positive infinity, also with an explicit precision of
+        // 0: the manual gives `round(-1.5)` and `round(-1.5, 0)` as -1.0. Any
+        // other precision rounds ties away from zero (`round(-1.55, 1)` is
+        // -1.6).
         // `x - floor` is exact; `(x + 0.5).floor()` would round twice.
         None if precision == 0 => {
             let f = x.floor();
@@ -736,11 +759,7 @@ pub(crate) fn call(f: Scalar, args: Vec<Value>) -> Result<Value, CypherError> {
         S::Split => {
             arity(name, &args, 2)?;
             match (&args[0], &args[1]) {
-                (Value::String(s), Value::String(sep)) => Ok(Value::List(
-                    s.split(sep.as_str())
-                        .map(|p| Value::String(p.to_owned()))
-                        .collect(),
-                )),
+                (Value::String(s), Value::String(sep)) => Ok(Value::List(split_any(s, &[sep]))),
                 (a, b) if a.is_null() || b.is_null() => Ok(Value::Null),
                 (Value::String(s), Value::List(seps)) => {
                     let mut delimiters = Vec::with_capacity(seps.len());
@@ -851,6 +870,8 @@ pub(crate) fn call(f: Scalar, args: Vec<Value>) -> Result<Value, CypherError> {
                 v => Err(type_error(name, v)),
             }
         }
+        // Derived from the index, so like `id()` it changes when a `DELETE` on
+        // a `petgraph::Graph` moves another element into a freed slot.
         S::ElementId => {
             arity(name, &args, 1)?;
             match &args[0] {
@@ -921,7 +942,9 @@ fn rand() -> Result<Value, CypherError> {
     ))
 }
 
-/// A random (version 4) UUID, lowercase and hyphenated.
+/// A random (version 4) UUID, lowercase and hyphenated. Random enough to be
+/// unique, but not from a cryptographic generator: do not use it as a
+/// secret or an unguessable token.
 fn random_uuid() -> String {
     let mut bits = (u128::from(random_u64()) << 64) | u128::from(random_u64());
     bits = (bits & !(0xF << 76)) | (0x4 << 76); // version 4
@@ -1030,7 +1053,7 @@ impl Accumulator {
                 }
             }
             A::StDev | A::StDevP | A::Var | A::VarP => {
-                let xs = numbers("stDev")?;
+                let xs = numbers(self.function.name())?;
                 let n = xs.len() as f64;
                 // Sample statistics divide by n - 1, population ones by n.
                 let denominator = if matches!(self.function, A::StDev | A::Var) {
