@@ -44,6 +44,12 @@ impl Selection {
     /// Collects every node, relationship and path in `result`, including
     /// those inside lists and maps. A relationship also selects both of its
     /// end nodes, which are looked up in `graph`.
+    ///
+    /// `graph` must be the graph `result` was computed on, unchanged since.
+    /// A selection holds plain indices, which cannot be checked against a
+    /// graph: with another graph, or after a `DELETE` on a
+    /// [`petgraph::Graph`] (which moves elements to fill the gap), they
+    /// silently refer to other elements.
     pub fn from_result<G: CypherGraph>(result: &QueryResult, graph: &G) -> Self {
         let mut selection = Self::default();
         for row in result.rows() {
@@ -131,8 +137,17 @@ impl Selection {
     }
 
     /// Copies the selected nodes and relationships into a new graph. Nodes
-    /// keep their order, and so do relationships; a selected relationship
-    /// whose end nodes are not both selected is left out.
+    /// keep their order, and so do relationships.
+    ///
+    /// Only *selected* relationships are copied: a selection of nodes alone
+    /// yields isolated nodes, while [`Selection::induced`] also shows the
+    /// edges between them. For an owned induced copy, select the
+    /// relationships in the query too, or use petgraph's `filter_map` with
+    /// [`Selection::contains_node`].
+    ///
+    /// Elements `graph` does not have, and relationships whose end nodes are
+    /// not both copied, are left out; with the graph the selection came from
+    /// (see [`Selection::from_result`]) that does not happen.
     pub fn subgraph<G>(&self, graph: &G) -> Subgraph<G::Node, G::Edge>
     where
         G: CypherGraph,
@@ -172,6 +187,10 @@ impl Selection {
 
 /// A selection copied into a graph of its own, with the way back to the
 /// original indices.
+///
+/// The fields are plain data: adding or removing elements of `graph`, or
+/// changing `nodes` / `edges`, breaks the mapping that
+/// [`Subgraph::original_node`] and [`Subgraph::original_edge`] read.
 #[derive(Debug, Clone)]
 pub struct Subgraph<N, E> {
     /// The copied nodes and relationships.
