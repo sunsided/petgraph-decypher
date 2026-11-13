@@ -73,21 +73,27 @@ impl Value {
     }
 
     /// Whether the value may be stored as a property: `null`, a scalar, or a
-    /// list of scalars of one type.
+    /// list of scalars of one kind (booleans, numbers or strings; integers
+    /// and floats mix).
     pub fn is_property_value(&self) -> bool {
+        // The kind of a storable scalar; `None` for anything else.
+        fn kind(v: &Value) -> Option<u8> {
+            match v {
+                Value::Boolean(_) => Some(0),
+                Value::Integer(_) | Value::Float(_) => Some(1),
+                Value::String(_) => Some(2),
+                _ => None,
+            }
+        }
         match self {
-            Value::Null
-            | Value::Boolean(_)
-            | Value::Integer(_)
-            | Value::Float(_)
-            | Value::String(_) => true,
-            Value::List(items) => items.iter().all(|v| {
-                matches!(
-                    v,
-                    Value::Boolean(_) | Value::Integer(_) | Value::Float(_) | Value::String(_)
-                ) && v.type_name() == items[0].type_name()
-            }),
-            _ => false,
+            Value::Null => true,
+            Value::List(items) => {
+                let first = items.first().map(kind);
+                items
+                    .iter()
+                    .all(|v| kind(v).is_some() && Some(kind(v)) == first)
+            }
+            scalar => kind(scalar).is_some(),
         }
     }
 

@@ -104,7 +104,7 @@ impl<'q, A: Access> Executor<'q, A> {
                 rows.extend(self.run_branch(branch)?);
             }
             if statement.distinct {
-                dedup(&mut rows, |r| r.as_slice());
+                rows = dedup(rows, Clone::clone);
             }
             let columns = statement
                 .branches
@@ -303,19 +303,12 @@ impl<'q, A: Access> Executor<'q, A> {
             out.push(row);
         }
         if p.distinct {
-            let mut keyed: Vec<(Vec<Value>, Row)> = out
-                .into_iter()
-                .map(|row| {
-                    let key = p
-                        .items
-                        .iter()
-                        .map(|i| row[i.alias.0].clone().unwrap_or_default())
-                        .collect();
-                    (key, row)
-                })
-                .collect();
-            dedup(&mut keyed, |(key, _)| key);
-            out = keyed.into_iter().map(|(_, row)| row).collect();
+            out = dedup(out, |row| {
+                p.items
+                    .iter()
+                    .map(|i| row[i.alias.0].clone().unwrap_or_default())
+                    .collect()
+            });
         }
         Ok(out)
     }
@@ -512,8 +505,10 @@ impl Ord for Ordered {
     }
 }
 
-/// Removes rows equivalent to an earlier row, keeping the first.
-fn dedup<T>(rows: &mut Vec<T>, key: impl Fn(&T) -> &[Value]) {
+/// Drops rows whose key is equivalent to an earlier row's, keeping the first.
+fn dedup<T>(rows: Vec<T>, key: impl Fn(&T) -> Vec<Value>) -> Vec<T> {
     let mut seen = std::collections::BTreeSet::new();
-    rows.retain(|row| seen.insert(Ordered(key(row).to_vec())));
+    rows.into_iter()
+        .filter(|row| seen.insert(Ordered(key(row))))
+        .collect()
 }
