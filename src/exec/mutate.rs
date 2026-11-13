@@ -415,6 +415,21 @@ impl<'q, A: Access> Executor<'q, A> {
 
     /// `MERGE`: the matches of the pattern, or the pattern created once.
     pub(super) fn merge(&mut self, m: &MergeOp, row: Row) -> Result<Vec<Row>> {
+        // A `null` property never matches, so MERGE would create a new element
+        // on every run.
+        let property_maps = (m.pattern.nodes.iter().map(|n| n.properties))
+            .chain(m.pattern.relationships.iter().map(|r| r.properties));
+        for expr in property_maps {
+            if let Some((key, _)) = self
+                .properties(expr, &row)?
+                .iter()
+                .find(|(_, v)| v.is_null())
+            {
+                return Err(CypherError::RuntimeError(format!(
+                    "cannot MERGE with a null value for property `{key}`"
+                )));
+            }
+        }
         let matches = self.match_pattern(&m.pattern, &row, &[], None)?;
         if matches.is_empty() {
             let mut row = row;

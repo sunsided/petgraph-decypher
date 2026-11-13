@@ -85,7 +85,7 @@ impl Value {
                 matches!(
                     v,
                     Value::Boolean(_) | Value::Integer(_) | Value::Float(_) | Value::String(_)
-                )
+                ) && v.type_name() == items[0].type_name()
             }),
             _ => false,
         }

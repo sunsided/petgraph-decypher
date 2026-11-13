@@ -9,6 +9,7 @@ pub(crate) mod functions;
 mod mutate;
 mod pattern;
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashSet};
 
 use decypher::hir::ExprId;
@@ -302,22 +303,19 @@ impl<'q, A: Access> Executor<'q, A> {
             out.push(row);
         }
         if p.distinct {
-            let aliases: Vec<usize> = p.items.iter().map(|i| i.alias.0).collect();
-            let keys: Vec<Vec<Value>> = out
-                .iter()
+            let mut keyed: Vec<(Vec<Value>, Row)> = out
+                .into_iter()
                 .map(|row| {
-                    aliases
+                    let key = p
+                        .items
                         .iter()
-                        .map(|&a| row[a].clone().unwrap_or_default())
-                        .collect()
+                        .map(|i| row[i.alias.0].clone().unwrap_or_default())
+                        .collect();
+                    (key, row)
                 })
                 .collect();
-            let mut seen = std::collections::BTreeSet::new();
-            out = out
-                .into_iter()
-                .zip(keys)
-                .filter_map(|(row, key)| seen.insert(Ordered(key)).then_some(row))
-                .collect();
+            dedup(&mut keyed, |(key, _)| key);
+            out = keyed.into_iter().map(|(_, row)| row).collect();
         }
         Ok(out)
     }
@@ -345,12 +343,11 @@ impl<'q, A: Access> Executor<'q, A> {
                 .iter()
                 .map(|k| self.eval(k.expression, row))
                 .collect::<Result<Vec<_>>>()?;
-            let group = match index.get(&Ordered(key.clone())) {
-                Some(&g) => g,
-                None => {
-                    groups.push((key.clone(), new_group(self.q)?));
-                    index.insert(Ordered(key), groups.len() - 1);
-                    groups.len() - 1
+            let group = match index.entry(Ordered(key)) {
+                Entry::Occupied(e) => *e.get(),
+                Entry::Vacant(e) => {
+                    groups.push((e.key().0.clone(), new_group(self.q)?));
+                    *e.insert(groups.len() - 1)
                 }
             };
             for (item, acc) in a.aggregates.iter().zip(&mut groups[group].1) {
