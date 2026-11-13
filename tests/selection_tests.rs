@@ -4,9 +4,10 @@ use petgraph::Graph;
 use petgraph::algo::{has_path_connecting, tarjan_scc};
 use petgraph::graph::{EdgeIndex, NodeIndex};
 use petgraph::stable_graph::StableGraph;
+use petgraph::visit::IntoEdgeReferences;
 use petgraph_decypher::{
-    CypherGraph, CypherNode, EdgeData, NodeData, PetgraphCypher, PetgraphCypherMut, Selection,
-    Value, build_graph_from_cypher,
+    CypherGraph, CypherNode, EdgeData, NodeData, Parameters, PetgraphCypher, PetgraphCypherMut,
+    Query, Selection, Value, build_graph_from_cypher,
 };
 
 /// The node whose `name` property is `name`.
@@ -138,4 +139,39 @@ fn subgraph_copies_the_selection_and_maps_back() {
     }
     assert_eq!(sub.original_node(NodeIndex::new(3)), None);
     assert_eq!(sub.original_edge(EdgeIndex::new(2)), None);
+}
+
+#[test]
+fn selection_from_a_prepared_query_with_parameters() {
+    let g = chain();
+    let query = Query::new("MATCH (n {name: $name})-[r]->(m) RETURN r").unwrap();
+    let params = Parameters::from([("name".to_owned(), Value::from("b"))]);
+    let result = query.execute(&g, &params).unwrap();
+    let sel = Selection::from_result(&result, &g);
+    assert_eq!(names(&g, sel.nodes()), ["b", "c"]);
+    assert_eq!(sel.edge_count(), 1);
+}
+
+#[test]
+fn subgraph_of_a_graph_copies_selected_edges_only() {
+    let g = chain();
+    // Nodes alone: the copy has no edges, unlike the induced view.
+    let nodes = g
+        .cypher_select("MATCH (n) WHERE n.name IN ['b', 'c'] RETURN n")
+        .unwrap();
+    let sub = nodes.subgraph(&g);
+    assert_eq!((sub.graph.node_count(), sub.graph.edge_count()), (2, 0));
+    assert_eq!(nodes.induced(&g).edge_references().count(), 1); // b -> c
+
+    let rels = g.cypher_select("MATCH ()-[r]->(:C) RETURN r").unwrap();
+    let sub = rels.subgraph(&g);
+    assert_eq!((sub.graph.node_count(), sub.graph.edge_count()), (2, 1));
+    let e = sub.graph.edge_indices().next().unwrap();
+    let (s, t) = sub.graph.edge_endpoints(e).unwrap();
+    let original = sub.original_edge(e).unwrap();
+    assert_eq!(
+        g.edge_endpoints(original),
+        Some((sub.original_node(s).unwrap(), sub.original_node(t).unwrap()))
+    );
+    assert_eq!(names(&g, [sub.original_node(s).unwrap()]), ["b"]);
 }
