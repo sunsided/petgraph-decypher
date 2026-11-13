@@ -90,6 +90,27 @@ assert_eq!(graph[*n].properties["id"], Value::from(2));
   `RETURN n.name` produces column `n.name`.
 - `Value` covers `null`, booleans, integers, floats, strings, lists, maps,
   `Node(NodeIndex)`, `Relationship(EdgeIndex)` and `Path`.
+- `PetgraphCypher::cypher_select` (or `Selection::from_result`) collects the
+  nodes, relationships and paths a query returns into a `Selection`.
+
+### Selections and petgraph algorithms
+
+Select a slice of the graph with Cypher, then analyze it with petgraph.
+`Selection::induced` and `Selection::edge_filtered` are views that keep the
+original indices, so algorithm results refer to the original graph;
+`Selection::subgraph` copies the slice into a new graph with a mapping back.
+
+```rust
+use petgraph::algo::tarjan_scc;
+use petgraph_decypher::{PetgraphCypher, build_graph_from_cypher};
+
+let graph = build_graph_from_cypher(
+    "CREATE (a:Page)-[:LINKS]->(b:Page)-[:LINKS]->(a), (b)-[:LINKS]->(:Ad)",
+).unwrap();
+let pages = graph.cypher_select("MATCH (p:Page) RETURN p").unwrap();
+let components = tarjan_scc(&pages.induced(&graph)); // NodeIndex of `graph`
+assert_eq!(components[0].len(), 2);
+```
 
 `DELETE` is applied when the query finishes. On a `Graph`, removing an
 element moves the last element into its slot, so indices of *other* elements

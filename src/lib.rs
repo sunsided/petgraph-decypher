@@ -35,6 +35,14 @@
 //! [`petgraph::stable_graph::StableGraph`] when indices must stay valid.
 //!
 //! A query that fails leaves the graph unchanged.
+//!
+//! # Selections and petgraph algorithms
+//!
+//! [`PetgraphCypher::cypher_select`] turns the nodes, relationships and paths
+//! a query returns into a [`Selection`]. Its views ([`Selection::induced`],
+//! [`Selection::edge_filtered`]) keep the original indices, so petgraph
+//! algorithms run on the selected slice and report results for the original
+//! graph; [`Selection::subgraph`] copies the slice into a graph of its own.
 
 mod element;
 pub mod error;
@@ -42,6 +50,7 @@ mod exec;
 mod graph;
 mod prepared;
 mod result;
+mod selection;
 mod value;
 
 pub use element::{CypherEdge, CypherEdgeMut, CypherNode, CypherNodeMut, EdgeData, NodeData};
@@ -50,6 +59,7 @@ pub use exec::Parameters;
 pub use graph::{CypherGraph, CypherGraphMut};
 pub use prepared::Query;
 pub use result::{QueryResult, Row};
+pub use selection::{Selection, Subgraph};
 pub use value::{Path, Properties, Value};
 
 use petgraph::Graph;
@@ -64,6 +74,14 @@ pub trait PetgraphCypher: CypherGraph + Sized {
     /// Runs a read-only query with parameters (`$name` reads `params["name"]`).
     fn cypher_params(&self, query: &str, params: &Parameters) -> Result<QueryResult, CypherError> {
         Query::new(query)?.execute(self, params)
+    }
+
+    /// Runs a read-only query and selects the nodes, relationships and paths
+    /// it returns. For parameters, run a [`Query`] and use
+    /// [`Selection::from_result`].
+    fn cypher_select(&self, query: &str) -> Result<Selection, CypherError> {
+        let result = self.cypher(query)?;
+        Ok(Selection::from_result(&result, self))
     }
 }
 
