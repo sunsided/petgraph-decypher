@@ -18,6 +18,8 @@ Cypher® and Neo4j® are registered trademarks of Neo4j, Inc.
 1. Build graphs with `CREATE` / `MERGE`.
 2. Query and mutate any `Graph<N, E>` or `StableGraph<N, E>`, using the bundled
    `NodeData` / `EdgeData` weights or your own.
+3. Select a slice of a graph with Cypher and run petgraph algorithms on it.
+4. Write a graph back out as a Cypher script.
 
 Queries are parsed and analyzed by [`decypher`](https://crates.io/crates/decypher)
 and executed directly on its high-level IR; results reference nodes and
@@ -41,14 +43,21 @@ assert_eq!(row.get("b.age"), Some(&Value::from(42)));
 
 | Feature | Status |
 |---------|--------|
-| `MATCH`, `OPTIONAL MATCH`, `WHERE`, `WITH`, `UNWIND`, `RETURN`, `UNION [ALL]` | ✅ |
+| `MATCH`, `OPTIONAL MATCH`, `WHERE`, `WITH`, `UNWIND`, `RETURN`, `UNION [ALL]`, `;`-separated statements | ✅ |
 | `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`, aggregation (`count`, `sum`, `avg`, `min`, `max`, `collect`, `stDev`, percentiles) | ✅ |
 | `CREATE`, `MERGE` (`ON CREATE` / `ON MATCH`), `SET`, `REMOVE`, `[DETACH] DELETE`, `FOREACH` | ✅ |
-| Variable-length relationships (`*1..3`), path variables, label expressions (`:A\|B`, `:!A`) | ✅ |
-| Parameters (`$name`), list/pattern comprehensions, quantifiers, `reduce`, `CASE`, map projection | ✅ |
-| Scalar, string, math, list and graph functions (`labels`, `type`, `nodes`, `keys`, …) | ✅ |
-| Temporal types and functions (`date()`, `duration()`, …) | ❌ |
-| `EXISTS { … }` / `COUNT { … }` subqueries, `CALL`, procedures, `LOAD CSV`, `=~` | ❌ |
+| Variable-length relationships (`*1..3`), path variables, label expressions (`:A\|B`, `:!A`) and dynamic labels (`:$(expr)`) when matching | ✅ |
+| Parameters (`$name`), dynamic properties (`n[key]`, `SET n[key] = …`), list/pattern comprehensions, quantifiers, `reduce`, `CASE`, map projection, list slices | ✅ |
+| Scalar, string, math, list and graph functions (`labels`, `type`, `nodes`, `keys`, `toUpper`, `substring`, `sqrt`, `range`, …) | ✅ |
+| `shortestPath` / `allShortestPaths` / `SHORTEST`, quantified path patterns (`((a)-->(b)){1,3}`), `WHERE` inside node or relationship patterns | ❌ |
+| Label expressions and dynamic labels in `CREATE` / `MERGE` / `SET` / `REMOVE`; `REMOVE n[key]` | ❌ |
+| Temporal types and functions (`date()`, `duration()`, …), `point()` | ❌ |
+| `EXISTS { … }` / `COUNT { … }` / `COLLECT { … }` subqueries, `CALL`, procedures, `LOAD CSV` | ❌ |
+| `=~`, `\|\|` concatenation, type predicates (`IS ::`), `IS NORMALIZED` | ❌ |
+| Newer functions: `elementId`, `to…OrNull`, `to…List`, `isEmpty`, `isNaN`, `valueType`, `nullIf`, `char_length`, `lower` / `upper` / `btrim`, `normalize`, `randomUUID`, `timestamp`, hyperbolic functions, `round` with a precision | ❌ |
+
+Queries using a feature marked ❌ fail with an error (a parse error or
+`CypherError::Unsupported`) instead of running with different semantics.
 
 ## openCypher conformance
 
@@ -93,8 +102,13 @@ assert_eq!(graph[*n].properties["id"], Value::from(2));
 - `PetgraphCypher::cypher_select` (or `Selection::from_result`) collects the
   nodes, relationships and paths a query returns into a `Selection`.
 - `to_cypher_create(&graph)` writes any graph as a script of `CREATE`
-  clauses that `build_graph_from_cypher` reads back, e.g. to save a graph
-  or to load it into another Cypher database.
+  clauses that `build_graph_from_cypher` reads back.
+
+`DELETE` is applied when the query finishes. On a `Graph`, removing an
+element moves the last element into its slot, so indices of *other* elements
+may change, including node and relationship values in the result of the
+deleting query itself; use a `StableGraph` when indices must stay valid. A
+query that fails leaves the graph unchanged.
 
 ### Selections and petgraph algorithms
 
@@ -114,12 +128,6 @@ let pages = graph.cypher_select("MATCH (p:Page) RETURN p").unwrap();
 let components = tarjan_scc(&pages.induced(&graph)); // NodeIndex of `graph`
 assert_eq!(components[0].len(), 2);
 ```
-
-`DELETE` is applied when the query finishes. On a `Graph`, removing an
-element moves the last element into its slot, so indices of *other* elements
-may change, including node and relationship values in the result of the
-deleting query itself; use a `StableGraph` when indices must stay valid. A
-query that fails leaves the graph unchanged.
 
 ### Custom node and edge types
 
