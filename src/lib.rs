@@ -47,6 +47,7 @@
 mod element;
 pub mod error;
 mod exec;
+mod export;
 mod graph;
 mod prepared;
 mod result;
@@ -56,6 +57,7 @@ mod value;
 pub use element::{CypherEdge, CypherEdgeMut, CypherNode, CypherNodeMut, EdgeData, NodeData};
 pub use error::CypherError;
 pub use exec::Parameters;
+pub use export::to_cypher_create;
 pub use graph::{CypherGraph, CypherGraphMut};
 pub use prepared::Query;
 pub use result::{QueryResult, Row};
