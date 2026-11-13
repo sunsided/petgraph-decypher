@@ -102,6 +102,10 @@ pub(crate) enum Scalar {
     CharLength,
     NullIf,
     BTrim,
+    ElementId,
+    RandomUuid,
+    // Evaluated by the executor: fixed for the whole query.
+    Timestamp,
 }
 
 /// Scalar functions by their Cypher name.
@@ -178,6 +182,9 @@ const SCALARS: &[(&str, Scalar)] = &[
     ("lower", Scalar::ToLower),
     ("upper", Scalar::ToUpper),
     ("btrim", Scalar::BTrim),
+    ("elementId", Scalar::ElementId),
+    ("randomUUID", Scalar::RandomUuid),
+    ("timestamp", Scalar::Timestamp),
 ];
 
 const AGGREGATES: &[(&str, Aggregate)] = &[
@@ -714,6 +721,19 @@ pub(crate) fn call(f: Scalar, args: Vec<Value>) -> Result<Value, CypherError> {
                 v => Err(type_error(name, v)),
             }
         }
+        S::ElementId => {
+            arity(name, &args, 1)?;
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Node(n) => Ok(Value::String(format!("node:{}", n.index()))),
+                Value::Relationship(e) => Ok(Value::String(format!("relationship:{}", e.index()))),
+                v => Err(type_error(name, v)),
+            }
+        }
+        S::RandomUuid => {
+            arity(name, &args, 0)?;
+            Ok(Value::String(random_uuid()))
+        }
         S::NullIf => {
             arity(name, &args, 2)?;
             let mut args = args.into_iter();
@@ -733,7 +753,8 @@ pub(crate) fn call(f: Scalar, args: Vec<Value>) -> Result<Value, CypherError> {
         | S::EndNode
         | S::Nodes
         | S::Relationships
-        | S::Length => unreachable!("graph functions are evaluated by the executor"),
+        | S::Length
+        | S::Timestamp => unreachable!("evaluated by the executor"),
     }
 }
 
@@ -752,12 +773,34 @@ pub(crate) fn format_float(x: f64) -> String {
     }
 }
 
-/// A uniform float in `[0, 1)`. Not cryptographic: every `RandomState` gets
-/// fresh SipHash keys, so hashing nothing yields new random bits.
-fn rand() -> Result<Value, CypherError> {
+/// 64 random bits. Not cryptographic: every `RandomState` gets fresh SipHash
+/// keys, so hashing nothing yields new random bits.
+fn random_u64() -> u64 {
     use std::hash::{BuildHasher, Hasher, RandomState};
-    let bits = RandomState::new().build_hasher().finish();
-    Ok(Value::Float((bits >> 11) as f64 / (1u64 << 53) as f64))
+    RandomState::new().build_hasher().finish()
+}
+
+/// A uniform float in `[0, 1)`.
+fn rand() -> Result<Value, CypherError> {
+    Ok(Value::Float(
+        (random_u64() >> 11) as f64 / (1u64 << 53) as f64,
+    ))
+}
+
+/// A random (version 4) UUID, lowercase and hyphenated.
+fn random_uuid() -> String {
+    let mut bits = (u128::from(random_u64()) << 64) | u128::from(random_u64());
+    bits = (bits & !(0xF << 76)) | (0x4 << 76); // version 4
+    bits = (bits & !(0x3 << 62)) | (0x2 << 62); // RFC 4122 variant
+    let hex = format!("{bits:032x}");
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
 }
 
 /// The running state of one aggregate over one group.

@@ -597,6 +597,14 @@ impl<A: Access> Executor<'_, A> {
                 "aggregate function in a non-aggregating context".into(),
             ));
         };
+        if f == Scalar::Timestamp {
+            if !args.is_empty() {
+                return Err(CypherError::InvalidQuery(
+                    "timestamp() expects no arguments".into(),
+                ));
+            }
+            return Ok(Value::Integer(self.started_ms));
+        }
         if f == Scalar::Exists {
             let [arg] = args else {
                 return Err(CypherError::InvalidQuery(

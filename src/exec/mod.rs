@@ -45,6 +45,9 @@ pub(crate) struct Executor<'q, A: Access> {
     slots: usize,
     deleted_nodes: HashSet<NodeIndex>,
     deleted_edges: HashSet<EdgeIndex>,
+    /// When the query started, in milliseconds since the Unix epoch:
+    /// `timestamp()` returns the same value for the whole query.
+    started_ms: i64,
 }
 
 impl<'q, A: Access> Executor<'q, A> {
@@ -73,6 +76,9 @@ impl<'q, A: Access> Executor<'q, A> {
             slots: 0,
             deleted_nodes: HashSet::new(),
             deleted_edges: HashSet::new(),
+            started_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
         };
         ex.enter_unit(0);
         match ex.run_statements() {
