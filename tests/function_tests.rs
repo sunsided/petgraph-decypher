@@ -63,9 +63,15 @@ fn list_conversions_convert_each_element_or_null() {
         list([Value::from(true), Value::from(false), Value::Null])
     );
     assert_eq!(ok("toIntegerList(null)"), Value::Null);
-    // A non-list argument is an error (decypher already rejects it when
-    // analyzing the query).
+    // A non-list argument is an error, as the manual specifies: decypher
+    // rejects a literal when analyzing the query, the engine a parameter.
     assert!(value_of("toIntegerList(1)").is_err());
+    let g = Graph::<NodeData, EdgeData>::new();
+    let params = petgraph_decypher::Parameters::from([("p".to_owned(), Value::from(1))]);
+    assert!(matches!(
+        g.cypher_params("RETURN toIntegerList($p) AS v", &params),
+        Err(CypherError::TypeMismatch(_))
+    ));
 }
 
 #[test]
@@ -109,7 +115,17 @@ fn trims_take_an_optional_trim_character() {
 fn split_on_any_of_several_delimiters() {
     let parts = |items: &[&str]| Value::List(items.iter().map(|s| Value::from(*s)).collect());
     assert_eq!(ok("split('a-b_c', ['-', '_'])"), parts(&["a", "b", "c"]));
-    assert_eq!(ok("split('a--b', ['-', '--'])"), parts(&["a", "b"]));
+    // The manual leaves overlapping and empty delimiters open. Here the
+    // earliest match wins, the first listed one on a tie, and an empty
+    // delimiter splits between characters, for one delimiter or a list.
+    assert_eq!(ok("split('a--b', ['--', '-'])"), parts(&["a", "b"]));
+    assert_eq!(ok("split('a--b', ['-', '--'])"), parts(&["a", "", "b"]));
+    assert_eq!(ok("split('abc', '')"), parts(&["a", "b", "c"]));
+    assert_eq!(ok("split('abc', [''])"), parts(&["a", "b", "c"]));
+    assert_eq!(ok("split('a,bc', [',', ''])"), parts(&["a", "b", "c"]));
+    assert_eq!(ok("split('a,', ',')"), parts(&["a", ""]));
+    assert_eq!(ok("split('a,', [',', ''])"), parts(&["a", ""]));
+    assert_eq!(ok("split('', '')"), parts(&[""]));
     assert_eq!(ok("split('é-ü', ['-'])"), parts(&["é", "ü"]));
     assert_eq!(ok("split('a-b', ['-', null])"), Value::Null);
     assert_eq!(ok("split('a-b', '-')"), parts(&["a", "b"]));
@@ -127,6 +143,10 @@ fn variance_aggregates() {
     assert_eq!(row.get("s"), Some(&Value::from(32.0 / 7.0)));
     assert_eq!(row.get("p"), Some(&Value::from(4.0)));
     assert_eq!(row.get("d"), Some(&Value::from(2.0)));
+    let err = g
+        .cypher("UNWIND [1, 'a'] AS x RETURN var(x) AS s")
+        .unwrap_err();
+    assert!(err.to_string().contains("var()"), "{err}");
     let r = g.cypher("UNWIND [1] AS x RETURN var(x) AS s").unwrap();
     assert_eq!(r.column("s").next(), Some(&Value::from(0.0)));
 }
