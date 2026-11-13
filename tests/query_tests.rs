@@ -1262,3 +1262,89 @@ fn query_union_branch_matches_in_its_own_scope() {
         .unwrap();
     assert_eq!(column(&r, "v"), vec![Value::from(1), Value::from(2)]);
 }
+
+#[test]
+fn query_mut_merge_with_null_property_is_an_error() {
+    let mut g = build_graph_from_cypher("CREATE (:A)").unwrap();
+    let p = params([("e", Value::Null)]);
+    for query in [
+        "MERGE (u:User {email: $e}) RETURN u",
+        "MATCH (a:A) MERGE (a)-[:R {k: $e}]->(:B)",
+    ] {
+        assert!(
+            g.cypher_mut_params(query, &p).is_err(),
+            "{query} should fail"
+        );
+    }
+    assert_eq!((g.node_count(), g.edge_count()), (1, 0));
+}
+
+#[test]
+fn query_count_distinct_dedupes_equivalent_values() {
+    let g = Graph::<NodeData, EdgeData>::new();
+    let r = g
+        .cypher(
+            "UNWIND [1, 1.0, 2, null, 2, 3] AS x \
+             RETURN count(DISTINCT x) AS c, collect(DISTINCT x) AS l",
+        )
+        .unwrap();
+    assert_eq!(column(&r, "c"), vec![Value::from(3)]);
+    assert_eq!(column(&r, "l"), vec![Value::from(vec![1, 2, 3])]);
+}
+
+#[test]
+fn query_numeric_functions_handle_edge_values() {
+    let g = Graph::<NodeData, EdgeData>::new();
+    let r = g
+        .cypher(
+            "RETURN round(0.49999999999999994) AS a, round(4503599627370497.0) AS b, \
+             round(2.5) AS c, toInteger(1e30) AS d, toInteger('1e30') AS e, \
+             toInteger(-2.7) AS f",
+        )
+        .unwrap();
+    let row = r.rows().next().unwrap();
+    assert_eq!(row.get("a"), Some(&Value::from(0.0)));
+    assert_eq!(row.get("b"), Some(&Value::from(4503599627370497.0)));
+    assert_eq!(row.get("c"), Some(&Value::from(3.0)));
+    assert_eq!(row.get("d"), Some(&Value::Null));
+    assert_eq!(row.get("e"), Some(&Value::Null));
+    assert_eq!(row.get("f"), Some(&Value::from(-2)));
+}
+
+#[test]
+fn query_percentile_disc_returns_an_input_value() {
+    let g = Graph::<NodeData, EdgeData>::new();
+    let r = g
+        .cypher("UNWIND [9007199254740993, 1] AS x RETURN percentileDisc(x, 1.0) AS p")
+        .unwrap();
+    assert_eq!(column(&r, "p"), vec![Value::from(9007199254740993_i64)]);
+}
+
+#[test]
+fn query_mut_rejects_mixed_type_list_properties() {
+    let mut g = Graph::<NodeData, EdgeData>::new();
+    assert!(matches!(
+        g.cypher_mut("CREATE (:M {x: [1, 'a']})"),
+        Err(CypherError::TypeMismatch(_))
+    ));
+    g.cypher_mut("CREATE (n:M {x: [1, 2]}) SET n.y = ['a', 'b']")
+        .unwrap();
+    assert!(g.cypher_mut("MATCH (n:M) SET n.z = [true, 1]").is_err());
+}
+
+#[test]
+fn query_rand_is_a_float_in_unit_interval() {
+    let g = Graph::<NodeData, EdgeData>::new();
+    let r = g
+        .cypher("UNWIND range(1, 100) AS i RETURN rand() AS r")
+        .unwrap();
+    let values: Vec<f64> = column(&r, "r")
+        .into_iter()
+        .map(|v| match v {
+            Value::Float(f) => f,
+            other => panic!("expected a float, got {other:?}"),
+        })
+        .collect();
+    assert!(values.iter().all(|f| (0.0..1.0).contains(f)));
+    assert!(values.windows(2).any(|w| w[0] != w[1]));
+}

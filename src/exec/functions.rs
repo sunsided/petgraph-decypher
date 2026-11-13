@@ -1,6 +1,9 @@
 //! Scalar and aggregate functions, resolved from their name once when a query
 //! is prepared.
 
+use std::collections::BTreeSet;
+
+use super::Ordered;
 use crate::error::CypherError;
 use crate::value::Value;
 
@@ -227,11 +230,21 @@ fn arity(function: &str, args: &[Value], n: usize) -> Result<(), CypherError> {
     }
 }
 
+/// `x` truncated towards zero; `None` when that does not fit an `i64` (or `x`
+/// is not finite).
+fn to_i64(x: f64) -> Option<i64> {
+    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+    let t = x.trunc();
+    (-TWO_POW_63..TWO_POW_63).contains(&t).then_some(t as i64)
+}
+
 fn int_arg(function: &str, value: &Value) -> Result<Option<i64>, CypherError> {
     match value {
         Value::Null => Ok(None),
         Value::Integer(i) => Ok(Some(*i)),
-        Value::Float(f) if f.fract() == 0.0 => Ok(Some(*f as i64)),
+        Value::Float(f) if f.fract() == 0.0 => to_i64(*f)
+            .map(Some)
+            .ok_or_else(|| CypherError::RuntimeError("integer overflow".into())),
         other => Err(type_error(function, other)),
     }
 }
@@ -351,19 +364,13 @@ pub(crate) fn call(f: Scalar, args: Vec<Value>) -> Result<Value, CypherError> {
             arity(name, &args, 1)?;
             Ok(match &args[0] {
                 Value::Integer(i) => Value::Integer(*i),
-                Value::Float(x) if x.is_finite() => Value::Integer(x.trunc() as i64),
-                Value::Float(_) => Value::Null,
+                Value::Float(x) => to_i64(*x).map_or(Value::Null, Value::Integer),
                 Value::Boolean(b) => Value::Integer(i64::from(*b)),
                 Value::String(s) => {
                     let s = s.trim();
                     s.parse::<i64>()
                         .ok()
-                        .or_else(|| {
-                            s.parse::<f64>()
-                                .ok()
-                                .filter(|x| x.is_finite())
-                                .map(|x| x.trunc() as i64)
-                        })
+                        .or_else(|| s.parse::<f64>().ok().and_then(to_i64))
                         .map_or(Value::Null, Value::Integer)
                 }
                 Value::Null => Value::Null,
@@ -504,8 +511,10 @@ pub(crate) fn call(f: Scalar, args: Vec<Value>) -> Result<Value, CypherError> {
         S::Ceil => float_fn(name, &args, f64::ceil),
         S::Floor => float_fn(name, &args, f64::floor),
         S::Round => float_fn(name, &args, |x| {
-            // Cypher rounds half up (towards positive infinity).
-            (x + 0.5).floor()
+            // Cypher rounds half up (towards positive infinity). `x - floor` is
+            // exact; `(x + 0.5).floor()` would round twice.
+            let f = x.floor();
+            if x - f >= 0.5 { f + 1.0 } else { f }
         }),
         S::Sqrt => float_fn(name, &args, f64::sqrt),
         S::Exp => float_fn(name, &args, f64::exp),
@@ -561,21 +570,12 @@ pub(crate) fn format_float(x: f64) -> String {
     }
 }
 
-#[cfg(feature = "rng-rand")]
+/// A uniform float in `[0, 1)`. Not cryptographic: every `RandomState` gets
+/// fresh SipHash keys, so hashing nothing yields new random bits.
 fn rand() -> Result<Value, CypherError> {
-    Ok(Value::Float(::rand::random::<f64>()))
-}
-
-#[cfg(all(feature = "rng-fastrand", not(feature = "rng-rand")))]
-fn rand() -> Result<Value, CypherError> {
-    Ok(Value::Float(fastrand::f64()))
-}
-
-#[cfg(not(any(feature = "rng-rand", feature = "rng-fastrand")))]
-fn rand() -> Result<Value, CypherError> {
-    Err(CypherError::Unsupported(
-        "rand() needs the `rng-rand` or `rng-fastrand` feature".into(),
-    ))
+    use std::hash::{BuildHasher, Hasher, RandomState};
+    let bits = RandomState::new().build_hasher().finish();
+    Ok(Value::Float((bits >> 11) as f64 / (1u64 << 53) as f64))
 }
 
 /// The running state of one aggregate over one group.
@@ -583,6 +583,8 @@ pub(crate) struct Accumulator {
     function: Aggregate,
     distinct: bool,
     values: Vec<Value>,
+    /// The values seen so far, for `DISTINCT`.
+    seen: BTreeSet<Ordered>,
     count: i64,
     /// The second argument of `percentileCont` / `percentileDisc`.
     percentile: Option<Value>,
@@ -594,6 +596,7 @@ impl Accumulator {
             function,
             distinct,
             values: Vec::new(),
+            seen: BTreeSet::new(),
             count: 0,
             percentile: None,
         }
@@ -614,11 +617,11 @@ impl Accumulator {
         if value.is_null() {
             return;
         }
-        if self.distinct && self.values.iter().any(|v| v.equivalent(&value)) {
+        if self.distinct && !self.seen.insert(Ordered(vec![value.clone()])) {
             return;
         }
         self.count += 1;
-        if self.function != Aggregate::Count || self.distinct {
+        if self.function != Aggregate::Count {
             self.values.push(value);
         }
     }
@@ -693,21 +696,18 @@ impl Accumulator {
                         "percentile must be between 0.0 and 1.0".into(),
                     ));
                 }
-                let all_int = self.values.iter().all(|v| matches!(v, Value::Integer(_)));
                 let mut xs = numbers("percentile")?;
                 if xs.is_empty() {
                     return Ok(Value::Null);
                 }
-                xs.sort_by(|a, b| a.total_cmp(b));
                 if self.function == A::PercentileDisc {
-                    let idx = ((p * xs.len() as f64).ceil() as usize).saturating_sub(1);
-                    let x = xs[idx.min(xs.len() - 1)];
-                    if all_int {
-                        Value::Integer(x as i64)
-                    } else {
-                        Value::Float(x)
-                    }
+                    // Returns one of the inputs, so no float round trip.
+                    let mut values = self.values;
+                    values.sort_by(Value::order);
+                    let idx = ((p * values.len() as f64).ceil() as usize).saturating_sub(1);
+                    values.swap_remove(idx.min(values.len() - 1))
                 } else {
+                    xs.sort_by(|a, b| a.total_cmp(b));
                     let rank = p * (xs.len() - 1) as f64;
                     let (lo, hi) = (rank.floor() as usize, rank.ceil() as usize);
                     Value::Float(xs[lo] + (xs[hi] - xs[lo]) * (rank - lo as f64))

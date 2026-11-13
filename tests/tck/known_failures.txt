@@ -1,8 +1,6 @@
 # Known openCypher TCK execution failures; see tests/tck.rs.
 # Format: <feature>:<scenario line>[#<example row>] # <reason>
 # Regenerate with: TCK_BLESS=1 cargo test --test tck
-clauses/merge/Merge1.feature:300 # expected SemanticError should be raised at runtime: MergeReadOwnWrites, got 0 row(s)
-clauses/merge/Merge5.feature:512 # expected SemanticError should be raised at runtime: MergeReadOwnWrites, got 0 row(s)
 clauses/with-orderBy/WithOrderBy1.feature:1021#1 # setup failed: unsupported clause or feature: function datetime()
 clauses/with-orderBy/WithOrderBy1.feature:1021#2 # setup failed: unsupported clause or feature: function datetime()
 clauses/with-orderBy/WithOrderBy1.feature:1021#3 # setup failed: unsupported clause or feature: function datetime()
