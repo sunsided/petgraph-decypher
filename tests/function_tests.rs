@@ -130,3 +130,84 @@ fn variance_aggregates() {
     let r = g.cypher("UNWIND [1] AS x RETURN var(x) AS s").unwrap();
     assert_eq!(r.column("s").next(), Some(&Value::from(0.0)));
 }
+
+#[test]
+fn element_ids_are_distinct_strings_for_nodes_and_relationships() {
+    let g = petgraph_decypher::build_graph_from_cypher("CREATE (:A)-[:R]->(:B)").unwrap();
+    let r = g
+        .cypher(
+            "MATCH (a:A)-[r]->(b) RETURN elementId(a) AS a, elementId(r) AS r, elementId(b) AS b",
+        )
+        .unwrap();
+    let values: Vec<Value> = r.rows().next().unwrap().values().to_vec();
+    // Node 0 and relationship 0 share an index but not an element id.
+    assert_eq!(
+        values,
+        [
+            Value::from("node:0"),
+            Value::from("relationship:0"),
+            Value::from("node:1")
+        ]
+    );
+    let found = g
+        .cypher_params(
+            "MATCH (n) WHERE elementId(n) = $id RETURN count(n) AS c",
+            &petgraph_decypher::Parameters::from([("id".to_owned(), Value::from("node:1"))]),
+        )
+        .unwrap();
+    assert_eq!(found.column("c").next(), Some(&Value::from(1)));
+    assert_eq!(ok("elementId(null)"), Value::Null);
+}
+
+#[test]
+fn random_uuids_are_version_4_and_differ() {
+    let g = Graph::<NodeData, EdgeData>::new();
+    let r = g
+        .cypher("UNWIND range(1, 50) AS i RETURN randomUUID() AS u")
+        .unwrap();
+    let uuids: Vec<String> = r
+        .column("u")
+        .map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => panic!("not a string: {other:?}"),
+        })
+        .collect();
+    for u in &uuids {
+        let groups: Vec<&str> = u.split('-').collect();
+        assert_eq!(
+            groups.iter().map(|g| g.len()).collect::<Vec<_>>(),
+            [8, 4, 4, 4, 12],
+            "{u}"
+        );
+        assert!(
+            u.chars()
+                .all(|c| c == '-' || matches!(c, '0'..='9' | 'a'..='f')),
+            "{u}"
+        );
+        assert!(groups[2].starts_with('4'), "version: {u}");
+        assert!(
+            matches!(groups[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'),
+            "variant: {u}"
+        );
+    }
+    let unique: std::collections::BTreeSet<_> = uuids.iter().collect();
+    assert_eq!(unique.len(), uuids.len());
+}
+
+#[test]
+fn timestamp_is_fixed_for_the_whole_query() {
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let g = Graph::<NodeData, EdgeData>::new();
+    let r = g
+        .cypher("UNWIND range(1, 2000) AS i RETURN count(DISTINCT timestamp()) AS n, max(timestamp()) AS t")
+        .unwrap();
+    let row = r.rows().next().unwrap();
+    assert_eq!(row.get("n"), Some(&Value::from(1)));
+    let Some(Value::Integer(t)) = row.get("t") else {
+        panic!("no timestamp")
+    };
+    assert!((before..before + 60_000).contains(t), "{t} vs {before}");
+}
