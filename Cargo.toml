@@ -1,6 +1,6 @@
 [package]
 name = "petgraph-decypher"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Run openCypher queries against petgraph graphs"
 license = "EUPL-1.2 OR MIT OR Apache-2.0"
@@ -11,21 +11,12 @@ keywords = ["petgraph", "cypher", "opencypher", "graph"]
 categories = ["data-structures"]
 exclude = ["tests/tck/", "tests/tck.rs"]
 
-[features]
-default = ["rng-rand"]
-rng-rand = ["dep:rand"]
-rng-fastrand = ["dep:fastrand"]
-
 [dependencies]
 petgraph = "0.8"
 decypher = "0.2.0"
 thiserror = "2"
-rand = { version = "0.10", optional = true }
-fastrand = { version = "2", optional = true }
 
 # openCypher TCK execution suite; see tests/tck/README.md.
-# The known failures assume `rand()` is available.
 [[test]]
 name = "tck"
 harness = false
-required-features = ["rng-rand"]

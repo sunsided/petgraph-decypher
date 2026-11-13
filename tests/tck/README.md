@@ -24,7 +24,5 @@ list can only shrink. Regenerate it with:
 TCK_BLESS=1 cargo test --test tck
 ```
 
-The suite needs the default `rng-rand` feature (`rand()` is used by some scenarios).
-
 Filter scenarios with `TCK_FILTER=<substring of the feature path or name>` and
 print every failure with `TCK_VERBOSE=1`.
