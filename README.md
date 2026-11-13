@@ -49,12 +49,13 @@ assert_eq!(row.get("b.age"), Some(&Value::from(42)));
 | Variable-length relationships (`*1..3`), path variables, label expressions (`:A\|B`, `:!A`) and dynamic labels (`:$(expr)`) when matching | ✅ |
 | Parameters (`$name`), dynamic properties (`n[key]`, `SET n[key] = …`), list/pattern comprehensions, quantifiers, `reduce`, `CASE`, map projection, list slices | ✅ |
 | Scalar, string, math, list and graph functions (`labels`, `type`, `nodes`, `keys`, `toUpper`, `substring`, `sqrt`, `range`, …) | ✅ |
+| Newer functions: `to…OrNull`, `to…List`, `isEmpty`, `isNaN`, `nullIf`, `char_length`, `lower` / `upper` / `btrim`, `valueType`, `elementId`, `randomUUID`, `timestamp`, `round(x, precision, mode)`, `var` / `varP` | ✅ |
 | `shortestPath` / `allShortestPaths` / `SHORTEST`, quantified path patterns (`((a)-->(b)){1,3}`), `WHERE` inside node or relationship patterns | ❌ |
 | Label expressions and dynamic labels in `CREATE` / `MERGE` / `SET` / `REMOVE`; `REMOVE n[key]` | ❌ |
-| Temporal types and functions (`date()`, `duration()`, …), `point()` | ❌ |
+| Temporal types and functions (`date()`, `duration()`, …) | ❌ |
 | `EXISTS { … }` / `COUNT { … }` / `COLLECT { … }` subqueries, `CALL`, procedures, `LOAD CSV` | ❌ |
 | `=~`, `\|\|` concatenation, type predicates (`IS ::`), `IS NORMALIZED` | ❌ |
-| Newer functions: `elementId`, `to…OrNull`, `to…List`, `isEmpty`, `isNaN`, `valueType`, `nullIf`, `char_length`, `lower` / `upper` / `btrim`, `normalize`, `randomUUID`, `timestamp`, hyperbolic functions, `round` with a precision | ❌ |
+| Spatial functions (`point`, `distance`), `vector.similarity.*`, `normalize`, hyperbolic functions | ❌ |
 
 Queries using a feature marked ❌ fail with an error (a parse error or
 `CypherError::Unsupported`) instead of running with different semantics.
