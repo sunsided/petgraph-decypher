@@ -211,3 +211,61 @@ fn timestamp_is_fixed_for_the_whole_query() {
     };
     assert!((before..before + 60_000).contains(t), "{t} vs {before}");
 }
+
+#[test]
+#[allow(clippy::approx_constant)] // 3.142 is the manual's expected result, not pi
+fn round_follows_the_manual_examples() {
+    let f = |expr: &str| match ok(expr) {
+        Value::Float(x) => x,
+        other => panic!("{expr}: {other:?}"),
+    };
+    assert_eq!(f("round(3.141592)"), 3.0);
+    assert_eq!(f("round(-1.5)"), -1.0);
+    assert_eq!(f("round(3.141592, 3)"), 3.142);
+    assert_eq!(f("round(-1.5, 0)"), -1.0);
+    assert_eq!(f("round(-1.55, 1)"), -1.6);
+    // Modes on 1.249, -1.251, 1.25, -1.35 with precision 1.
+    for (mode, expected) in [
+        ("UP", [1.3, -1.3, 1.3, -1.4]),
+        ("DOWN", [1.2, -1.2, 1.2, -1.3]),
+        ("CEILING", [1.3, -1.2, 1.3, -1.3]),
+        ("FLOOR", [1.2, -1.3, 1.2, -1.4]),
+        ("HALF_UP", [1.2, -1.3, 1.3, -1.4]),
+        ("HALF_DOWN", [1.2, -1.3, 1.2, -1.3]),
+        ("HALF_EVEN", [1.2, -1.3, 1.2, -1.4]),
+    ] {
+        let got =
+            ["1.249", "-1.251", "1.25", "-1.35"].map(|x| f(&format!("round({x}, 1, '{mode}')")));
+        assert_eq!(got, expected, "{mode}");
+    }
+}
+
+#[test]
+fn round_with_precision_edge_cases() {
+    let f = |expr: &str| match ok(expr) {
+        Value::Float(x) => x,
+        other => panic!("{expr}: {other:?}"),
+    };
+    // Rounds the decimal form, not the slightly smaller double.
+    assert_eq!(f("round(2.675, 2)"), 2.68);
+    // Negative precision rounds to tens, hundreds, …
+    assert_eq!(f("round(1234, -2)"), 1200.0);
+    assert_eq!(f("round(1250, -2, 'HALF_EVEN')"), 1200.0);
+    assert_eq!(f("round(1350, -2, 'HALF_EVEN')"), 1400.0);
+    // Digits far below the precision.
+    assert_eq!(f("round(0.0004, 2, 'UP')"), 0.01);
+    assert_eq!(f("round(0.0004, 2)"), 0.0);
+    assert_eq!(f("round(-0.4, 0, 'DOWN')"), 0.0);
+    assert_eq!(f("round(9.99, 1)"), 10.0);
+    // Nothing to drop.
+    assert_eq!(f("round(1.5, 5)"), 1.5);
+    assert_eq!(f("round(1e300, 2)"), 1e300);
+    assert!(f("round(0.0 / 0.0, 2)").is_nan());
+    assert_eq!(f("round(1, 1)"), 1.0);
+    assert_eq!(ok("round(null, 1)"), Value::Null);
+    assert_eq!(ok("round(1.5, null)"), Value::Null);
+    assert!(matches!(
+        value_of("round(1.5, 1, 'SIDEWAYS')"),
+        Err(CypherError::RuntimeError(_))
+    ));
+}

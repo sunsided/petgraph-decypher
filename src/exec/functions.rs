@@ -395,6 +395,139 @@ fn split_any(s: &str, delimiters: &[&str]) -> Vec<Value> {
     parts
 }
 
+/// How `round(x, precision, mode)` treats the digits it drops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundingMode {
+    /// Away from zero.
+    Up,
+    /// Towards zero.
+    Down,
+    /// Towards positive infinity.
+    Ceiling,
+    /// Towards negative infinity.
+    Floor,
+    /// To the nearest; ties away from zero.
+    HalfUp,
+    /// To the nearest; ties towards zero.
+    HalfDown,
+    /// To the nearest; ties to the even neighbour.
+    HalfEven,
+}
+
+/// `round(x[, precision[, mode]])`.
+fn round(args: &[Value]) -> Result<Value, CypherError> {
+    if !(1..=3).contains(&args.len()) {
+        return Err(CypherError::InvalidQuery(format!(
+            "round() expects 1 to 3 arguments, got {}",
+            args.len()
+        )));
+    }
+    if args.iter().any(Value::is_null) {
+        return Ok(Value::Null);
+    }
+    let x = args[0]
+        .as_f64()
+        .ok_or_else(|| type_error("round", &args[0]))?;
+    let precision = match args.get(1) {
+        Some(p) => int_arg("round", p)?.unwrap_or(0),
+        None => 0,
+    };
+    let mode = match args.get(2) {
+        None => None,
+        Some(Value::String(m)) => Some(match m.as_str() {
+            "UP" => RoundingMode::Up,
+            "DOWN" => RoundingMode::Down,
+            "CEILING" => RoundingMode::Ceiling,
+            "FLOOR" => RoundingMode::Floor,
+            "HALF_UP" => RoundingMode::HalfUp,
+            "HALF_DOWN" => RoundingMode::HalfDown,
+            "HALF_EVEN" => RoundingMode::HalfEven,
+            other => {
+                return Err(CypherError::RuntimeError(format!(
+                    "unknown rounding mode '{other}'"
+                )));
+            }
+        }),
+        Some(v) => return Err(type_error("round", v)),
+    };
+    Ok(Value::Float(match mode {
+        // Without a mode, whole numbers keep Cypher's classic rounding of
+        // ties towards positive infinity (`round(-1.5)` is -1.0), while a
+        // precision rounds ties away from zero (`round(-1.55, 1)` is -1.6).
+        // `x - floor` is exact; `(x + 0.5).floor()` would round twice.
+        None if precision == 0 => {
+            let f = x.floor();
+            if x - f >= 0.5 { f + 1.0 } else { f }
+        }
+        None => round_decimal(x, precision, RoundingMode::HalfUp),
+        Some(mode) => round_decimal(x, precision, mode),
+    }))
+}
+
+/// Rounds `x` to `precision` decimal places (tens, hundreds, … when
+/// negative). It works on the shortest decimal form of `x`, like Java's
+/// `BigDecimal.valueOf(double)`, so `2.675` rounds to `2.68` although the
+/// nearest double is slightly below 2.675.
+fn round_decimal(x: f64, precision: i64, mode: RoundingMode) -> f64 {
+    use std::cmp::Ordering;
+    if !x.is_finite() || x == 0.0 {
+        return x;
+    }
+    let negative = x < 0.0;
+    // `d.ddd…e<exp>`: digit `i` has the place value 10^(exp - i).
+    let formatted = format!("{:e}", x.abs());
+    let (mantissa, exp) = formatted.split_once('e').expect("exponent notation");
+    let exp: i64 = exp.parse().expect("integer exponent");
+    let digits: Vec<u8> = mantissa
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .map(|b| b - b'0')
+        .collect();
+    // How many digits have a place value of at least 10^-precision.
+    let keep = exp.saturating_add(precision).saturating_add(1);
+    if keep >= digits.len() as i64 {
+        return x;
+    }
+    let (kept, dropped) = digits.split_at(usize::try_from(keep).unwrap_or(0));
+    // The first dropped digit sits right below the last kept place; when
+    // `keep` is negative, zeros precede all digits.
+    let (first, rest_nonzero) = if keep < 0 {
+        (0, true)
+    } else {
+        (dropped[0], dropped[1..].iter().any(|&d| d != 0))
+    };
+    // The dropped part compared with half a unit of the last kept place.
+    let half = match first.cmp(&5) {
+        Ordering::Equal if rest_nonzero => Ordering::Greater,
+        other => other,
+    };
+    let inexact = first != 0 || rest_nonzero;
+    // At most 17 significant digits, so this fits.
+    let mut value = kept.iter().fold(0u64, |v, &d| v * 10 + u64::from(d));
+    let up = match mode {
+        RoundingMode::Up => inexact,
+        RoundingMode::Down => false,
+        RoundingMode::Ceiling => inexact && !negative,
+        RoundingMode::Floor => inexact && negative,
+        RoundingMode::HalfUp => half != Ordering::Less,
+        RoundingMode::HalfDown => half == Ordering::Greater,
+        RoundingMode::HalfEven => {
+            half == Ordering::Greater || (half == Ordering::Equal && value % 2 == 1)
+        }
+    };
+    if up {
+        value += 1;
+    }
+    let magnitude: f64 = format!("{value}e{}", precision.saturating_neg())
+        .parse()
+        .expect("decimal literal");
+    if negative && value != 0 {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
 /// Calls a scalar function that only needs its argument values. Functions on
 /// graph elements are evaluated by the executor.
 pub(crate) fn call(f: Scalar, args: Vec<Value>) -> Result<Value, CypherError> {
@@ -645,12 +778,7 @@ pub(crate) fn call(f: Scalar, args: Vec<Value>) -> Result<Value, CypherError> {
         }
         S::Ceil => float_fn(name, &args, f64::ceil),
         S::Floor => float_fn(name, &args, f64::floor),
-        S::Round => float_fn(name, &args, |x| {
-            // Cypher rounds half up (towards positive infinity). `x - floor` is
-            // exact; `(x + 0.5).floor()` would round twice.
-            let f = x.floor();
-            if x - f >= 0.5 { f + 1.0 } else { f }
-        }),
+        S::Round => round(&args),
         S::Sqrt => float_fn(name, &args, f64::sqrt),
         S::Exp => float_fn(name, &args, f64::exp),
         S::Log => float_fn(name, &args, f64::ln),
