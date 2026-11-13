@@ -104,6 +104,7 @@ pub(crate) enum Scalar {
     BTrim,
     ElementId,
     RandomUuid,
+    ValueType,
     // Evaluated by the executor: fixed for the whole query.
     Timestamp,
 }
@@ -184,6 +185,7 @@ const SCALARS: &[(&str, Scalar)] = &[
     ("btrim", Scalar::BTrim),
     ("elementId", Scalar::ElementId),
     ("randomUUID", Scalar::RandomUuid),
+    ("valueType", Scalar::ValueType),
     ("timestamp", Scalar::Timestamp),
 ];
 
@@ -857,6 +859,10 @@ pub(crate) fn call(f: Scalar, args: Vec<Value>) -> Result<Value, CypherError> {
                 Value::Relationship(e) => Ok(Value::String(format!("relationship:{}", e.index()))),
                 v => Err(type_error(name, v)),
             }
+        }
+        S::ValueType => {
+            arity(name, &args, 1)?;
+            Ok(Value::String(super::value_type::value_type(&args[0])))
         }
         S::RandomUuid => {
             arity(name, &args, 0)?;

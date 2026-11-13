@@ -8,6 +8,7 @@ mod eval;
 pub(crate) mod functions;
 mod mutate;
 mod pattern;
+mod value_type;
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashSet};
