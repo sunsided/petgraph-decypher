@@ -92,6 +92,9 @@ assert_eq!(graph[*n].properties["id"], Value::from(2));
   `Node(NodeIndex)`, `Relationship(EdgeIndex)` and `Path`.
 - `PetgraphCypher::cypher_select` (or `Selection::from_result`) collects the
   nodes, relationships and paths a query returns into a `Selection`.
+- `to_cypher_create(&graph)` writes any graph as a script of `CREATE`
+  clauses that `build_graph_from_cypher` reads back, e.g. to save a graph
+  or to load it into another Cypher database.
 
 ### Selections and petgraph algorithms
 
