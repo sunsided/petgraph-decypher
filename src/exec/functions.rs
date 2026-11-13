@@ -24,6 +24,8 @@ pub(crate) enum Aggregate {
     Collect,
     StDev,
     StDevP,
+    Var,
+    VarP,
     PercentileCont,
     PercentileDisc,
 }
@@ -87,6 +89,19 @@ pub(crate) enum Scalar {
     Radians,
     Haversin,
     Rand,
+    ToBooleanOrNull,
+    ToIntegerOrNull,
+    ToFloatOrNull,
+    ToStringOrNull,
+    ToBooleanList,
+    ToIntegerList,
+    ToFloatList,
+    ToStringList,
+    IsEmpty,
+    IsNaN,
+    CharLength,
+    NullIf,
+    BTrim,
 }
 
 /// Scalar functions by their Cypher name.
@@ -147,6 +162,22 @@ const SCALARS: &[(&str, Scalar)] = &[
     ("haversin", Scalar::Haversin),
     ("rand", Scalar::Rand),
     ("toInt", Scalar::ToInteger),
+    ("toBooleanOrNull", Scalar::ToBooleanOrNull),
+    ("toIntegerOrNull", Scalar::ToIntegerOrNull),
+    ("toFloatOrNull", Scalar::ToFloatOrNull),
+    ("toStringOrNull", Scalar::ToStringOrNull),
+    ("toBooleanList", Scalar::ToBooleanList),
+    ("toIntegerList", Scalar::ToIntegerList),
+    ("toFloatList", Scalar::ToFloatList),
+    ("toStringList", Scalar::ToStringList),
+    ("isEmpty", Scalar::IsEmpty),
+    ("isNaN", Scalar::IsNaN),
+    ("char_length", Scalar::CharLength),
+    ("character_length", Scalar::CharLength),
+    ("nullIf", Scalar::NullIf),
+    ("lower", Scalar::ToLower),
+    ("upper", Scalar::ToUpper),
+    ("btrim", Scalar::BTrim),
 ];
 
 const AGGREGATES: &[(&str, Aggregate)] = &[
@@ -158,6 +189,8 @@ const AGGREGATES: &[(&str, Aggregate)] = &[
     ("collect", Aggregate::Collect),
     ("stDev", Aggregate::StDev),
     ("stDevP", Aggregate::StDevP),
+    ("var", Aggregate::Var),
+    ("varP", Aggregate::VarP),
     ("percentileCont", Aggregate::PercentileCont),
     ("percentileDisc", Aggregate::PercentileDisc),
 ];
@@ -267,6 +300,92 @@ fn string_fn(name: &str, args: &[Value], f: impl Fn(&str) -> String) -> Result<V
         Value::String(s) => Ok(Value::String(f(s))),
         v => Err(type_error(name, v)),
     }
+}
+
+/// The plain conversion behind an `…OrNull` or `…List` function.
+fn conversion(f: Scalar) -> Scalar {
+    use Scalar as S;
+    match f {
+        S::ToBooleanOrNull | S::ToBooleanList => S::ToBoolean,
+        S::ToIntegerOrNull | S::ToIntegerList => S::ToInteger,
+        S::ToFloatOrNull | S::ToFloatList => S::ToFloat,
+        _ => S::ToString,
+    }
+}
+
+/// Runs a conversion, giving `null` for a value of a type it cannot convert.
+fn convert_or_null(f: Scalar, value: Value) -> Result<Value, CypherError> {
+    match call(f, vec![value]) {
+        Err(CypherError::TypeMismatch(_)) => Ok(Value::Null),
+        result => result,
+    }
+}
+
+/// `trim`, `ltrim`, `rtrim` and `btrim`: whitespace, or the single character
+/// given as second argument, removed from one or both ends.
+fn trim(f: Scalar, args: &[Value]) -> Result<Value, CypherError> {
+    let name = f.name();
+    if args.is_empty() || args.len() > 2 {
+        return Err(CypherError::InvalidQuery(format!(
+            "{name}() expects 1 or 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    if args.iter().any(Value::is_null) {
+        return Ok(Value::Null);
+    }
+    let Value::String(s) = &args[0] else {
+        return Err(type_error(name, &args[0]));
+    };
+    let trim_char = match args.get(1) {
+        None => None,
+        Some(Value::String(t)) => {
+            let mut chars = t.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => Some(c),
+                _ => {
+                    return Err(CypherError::RuntimeError(format!(
+                        "{name}() expects a single trim character, got '{t}'"
+                    )));
+                }
+            }
+        }
+        Some(v) => return Err(type_error(name, v)),
+    };
+    let strip = |c: char| trim_char.map_or(c.is_whitespace(), |t| c == t);
+    Ok(Value::String(
+        match f {
+            Scalar::LTrim => s.trim_start_matches(strip),
+            Scalar::RTrim => s.trim_end_matches(strip),
+            _ => s.trim_matches(strip),
+        }
+        .to_owned(),
+    ))
+}
+
+/// Splits `s` at every occurrence of any of `delimiters`, preferring the
+/// longest delimiter that matches at a position. Empty delimiters are
+/// ignored.
+fn split_any(s: &str, delimiters: &[&str]) -> Vec<Value> {
+    let mut parts = Vec::new();
+    let (mut start, mut i) = (0, 0);
+    while i < s.len() {
+        let matched = delimiters
+            .iter()
+            .filter(|d| !d.is_empty() && s[i..].starts_with(**d))
+            .map(|d| d.len())
+            .max();
+        match matched {
+            Some(len) => {
+                parts.push(Value::from(&s[start..i]));
+                i += len;
+                start = i;
+            }
+            None => i += s[i..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    parts.push(Value::from(&s[start..]));
+    parts
 }
 
 /// Calls a scalar function that only needs its argument values. Functions on
@@ -400,9 +519,7 @@ pub(crate) fn call(f: Scalar, args: Vec<Value>) -> Result<Value, CypherError> {
         }
         S::ToUpper => string_fn(name, &args, str::to_uppercase),
         S::ToLower => string_fn(name, &args, str::to_lowercase),
-        S::Trim => string_fn(name, &args, |s| s.trim().to_owned()),
-        S::LTrim => string_fn(name, &args, |s| s.trim_start().to_owned()),
-        S::RTrim => string_fn(name, &args, |s| s.trim_end().to_owned()),
+        S::Trim | S::LTrim | S::RTrim | S::BTrim => trim(f, &args),
         S::Substring => {
             if !(2..=3).contains(&args.len()) {
                 return Err(CypherError::InvalidQuery(
@@ -483,6 +600,17 @@ pub(crate) fn call(f: Scalar, args: Vec<Value>) -> Result<Value, CypherError> {
                         .collect(),
                 )),
                 (a, b) if a.is_null() || b.is_null() => Ok(Value::Null),
+                (Value::String(s), Value::List(seps)) => {
+                    let mut delimiters = Vec::with_capacity(seps.len());
+                    for sep in seps {
+                        match sep {
+                            Value::String(d) => delimiters.push(d.as_str()),
+                            Value::Null => return Ok(Value::Null),
+                            v => return Err(type_error("split", v)),
+                        }
+                    }
+                    Ok(Value::List(split_any(s, &delimiters)))
+                }
                 (v, _) => Err(type_error("split", v)),
             }
         }
@@ -541,6 +669,60 @@ pub(crate) fn call(f: Scalar, args: Vec<Value>) -> Result<Value, CypherError> {
         S::E => Ok(Value::Float(std::f64::consts::E)),
         S::Pi => Ok(Value::Float(std::f64::consts::PI)),
         S::Rand => rand(),
+        S::ToBooleanOrNull | S::ToIntegerOrNull | S::ToFloatOrNull | S::ToStringOrNull => {
+            arity(name, &args, 1)?;
+            let value = args.into_iter().next().unwrap_or_default();
+            convert_or_null(conversion(f), value)
+        }
+        S::ToBooleanList | S::ToIntegerList | S::ToFloatList | S::ToStringList => {
+            arity(name, &args, 1)?;
+            match args.into_iter().next().unwrap_or_default() {
+                Value::Null => Ok(Value::Null),
+                Value::List(items) => Ok(Value::List(
+                    items
+                        .into_iter()
+                        .map(|v| convert_or_null(conversion(f), v))
+                        .collect::<Result<_, _>>()?,
+                )),
+                v => Err(type_error(name, &v)),
+            }
+        }
+        S::IsEmpty => {
+            arity(name, &args, 1)?;
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::List(l) => Ok(Value::Boolean(l.is_empty())),
+                Value::Map(m) => Ok(Value::Boolean(m.is_empty())),
+                Value::String(s) => Ok(Value::Boolean(s.is_empty())),
+                v => Err(type_error(name, v)),
+            }
+        }
+        S::IsNaN => {
+            arity(name, &args, 1)?;
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Integer(_) => Ok(Value::Boolean(false)),
+                Value::Float(x) => Ok(Value::Boolean(x.is_nan())),
+                v => Err(type_error(name, v)),
+            }
+        }
+        S::CharLength => {
+            arity(name, &args, 1)?;
+            match &args[0] {
+                Value::Null => Ok(Value::Null),
+                Value::String(s) => Ok(Value::Integer(s.chars().count() as i64)),
+                v => Err(type_error(name, v)),
+            }
+        }
+        S::NullIf => {
+            arity(name, &args, 2)?;
+            let mut args = args.into_iter();
+            let (a, b) = (
+                args.next().unwrap_or_default(),
+                args.next().unwrap_or_default(),
+            );
+            Ok(if a.equivalent(&b) { Value::Null } else { a })
+        }
         S::Exists
         | S::Id
         | S::Labels
@@ -670,21 +852,26 @@ impl Accumulator {
                     Value::Float(xs.iter().sum::<f64>() / xs.len() as f64)
                 }
             }
-            A::StDev | A::StDevP => {
+            A::StDev | A::StDevP | A::Var | A::VarP => {
                 let xs = numbers("stDev")?;
                 let n = xs.len() as f64;
-                let denominator = if self.function == A::StDev {
+                // Sample statistics divide by n - 1, population ones by n.
+                let denominator = if matches!(self.function, A::StDev | A::Var) {
                     n - 1.0
                 } else {
                     n
                 };
-                if denominator <= 0.0 {
-                    Value::Float(0.0)
+                let var = if denominator <= 0.0 {
+                    0.0
                 } else {
                     let mean = xs.iter().sum::<f64>() / n;
-                    let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / denominator;
-                    Value::Float(var.sqrt())
-                }
+                    xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / denominator
+                };
+                Value::Float(if matches!(self.function, A::Var | A::VarP) {
+                    var
+                } else {
+                    var.sqrt()
+                })
             }
             A::PercentileCont | A::PercentileDisc => {
                 let p = match &self.percentile {
