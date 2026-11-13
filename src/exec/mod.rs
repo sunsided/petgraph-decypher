@@ -104,7 +104,7 @@ impl<'q, A: Access> Executor<'q, A> {
                 rows.extend(self.run_branch(branch)?);
             }
             if statement.distinct {
-                rows = dedup(rows, Clone::clone);
+                dedup(&mut rows, Clone::clone);
             }
             let columns = statement
                 .branches
@@ -303,7 +303,7 @@ impl<'q, A: Access> Executor<'q, A> {
             out.push(row);
         }
         if p.distinct {
-            out = dedup(out, |row| {
+            dedup(&mut out, |row| {
                 p.items
                     .iter()
                     .map(|i| row[i.alias.0].clone().unwrap_or_default())
@@ -506,9 +506,7 @@ impl Ord for Ordered {
 }
 
 /// Drops rows whose key is equivalent to an earlier row's, keeping the first.
-fn dedup<T>(rows: Vec<T>, key: impl Fn(&T) -> Vec<Value>) -> Vec<T> {
+fn dedup<T>(rows: &mut Vec<T>, key: impl Fn(&T) -> Vec<Value>) {
     let mut seen = std::collections::BTreeSet::new();
-    rows.into_iter()
-        .filter(|row| seen.insert(Ordered(key(row))))
-        .collect()
+    rows.retain(|row| seen.insert(Ordered(key(row))));
 }
