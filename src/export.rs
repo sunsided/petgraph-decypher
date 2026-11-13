@@ -13,8 +13,12 @@ use crate::value::Value;
 ///
 /// Nodes and relationships keep their order, so reading the script into a
 /// new [`petgraph::Graph`] numbers them `0..n`. An empty graph renders as an
-/// empty string. Fails if a property holds a node, relationship or path,
-/// which have no literal form.
+/// empty string. `null` properties are left out, as `CREATE` drops them.
+///
+/// Fails if a property holds a value `CREATE` cannot store (a map, a node,
+/// a relationship, a path, or a list that is not of one scalar kind; see
+/// [`Value::is_property_value`]), or if `graph` lists a node or relationship
+/// it then cannot return.
 ///
 /// ```
 /// use petgraph_decypher::{build_graph_from_cypher, to_cypher_create};
@@ -36,7 +40,7 @@ pub fn to_cypher_create<G: CypherGraph>(graph: &G) -> Result<String, CypherError
     // Dense variable numbers, so the holes of a `StableGraph` do not show.
     let mut variables = HashMap::new();
     for (i, id) in graph.node_ids().enumerate() {
-        let Some(node) = graph.node(id) else { continue };
+        let node = graph.node(id).ok_or_else(|| missing("node", id.index()))?;
         variables.insert(id, i);
         write!(out, "CREATE (n{i}").unwrap();
         for label in node.labels() {
@@ -47,11 +51,11 @@ pub fn to_cypher_create<G: CypherGraph>(graph: &G) -> Result<String, CypherError
         out.push_str(")\n");
     }
     for id in graph.edge_ids() {
-        let (Some((source, target)), Some(edge)) = (graph.endpoints(id), graph.edge(id)) else {
-            continue;
-        };
+        let missing_edge = || missing("relationship", id.index());
+        let (source, target) = graph.endpoints(id).ok_or_else(missing_edge)?;
+        let edge = graph.edge(id).ok_or_else(missing_edge)?;
         let (Some(s), Some(t)) = (variables.get(&source), variables.get(&target)) else {
-            continue;
+            return Err(missing_edge());
         };
         write!(out, "CREATE (n{s})-[:").unwrap();
         name(edge.rel_type(), &mut out);
@@ -61,8 +65,16 @@ pub fn to_cypher_create<G: CypherGraph>(graph: &G) -> Result<String, CypherError
     Ok(out)
 }
 
+/// `graph` listed an element it cannot return: only a broken `CypherGraph`
+/// implementation does that, and skipping it would lose data silently.
+fn missing(what: &str, index: usize) -> CypherError {
+    CypherError::RuntimeError(format!("{what} {index} is listed but missing"))
+}
+
 /// A label, relationship type or property key: bare if it is a plain
-/// identifier, otherwise quoted in backticks.
+/// identifier, otherwise quoted in backticks. Cypher reads everything
+/// between backticks verbatim (no escapes; a doubled backtick is one
+/// backtick), so any name round-trips, including an empty one.
 fn name(name: &str, out: &mut String) {
     let mut chars = name.chars();
     let plain = chars
@@ -83,11 +95,20 @@ fn properties<'a>(
 ) -> Result<(), CypherError> {
     let mut first = true;
     for (key, value) in props {
+        if value.is_null() {
+            continue;
+        }
+        if !value.is_property_value() {
+            return Err(CypherError::TypeMismatch(format!(
+                "property `{key}` cannot store a {}",
+                value.type_name()
+            )));
+        }
         out.push_str(if first { " {" } else { ", " });
         first = false;
         name(key, out);
         out.push_str(": ");
-        literal(value, out)?;
+        literal(value, out);
     }
     if !first {
         out.push('}');
@@ -95,8 +116,9 @@ fn properties<'a>(
     Ok(())
 }
 
-/// A Cypher expression that evaluates to `value`.
-fn literal(value: &Value, out: &mut String) -> Result<(), CypherError> {
+/// A Cypher expression that evaluates to `value`, a property value (checked
+/// by the caller).
+fn literal(value: &Value, out: &mut String) {
     match value {
         // Neither has a literal; these expressions evaluate to them.
         Value::Float(x) if x.is_nan() => out.push_str("0.0 / 0.0"),
@@ -131,28 +153,12 @@ fn literal(value: &Value, out: &mut String) -> Result<(), CypherError> {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                literal(item, out)?;
+                literal(item, out);
             }
             out.push(']');
         }
-        Value::Map(map) => {
-            out.push('{');
-            for (i, (key, item)) in map.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                name(key, out);
-                out.push_str(": ");
-                literal(item, out)?;
-            }
-            out.push('}');
-        }
-        Value::Node(_) | Value::Relationship(_) | Value::Path(_) => {
-            return Err(CypherError::TypeMismatch(format!(
-                "a {} property has no Cypher literal",
-                value.type_name()
-            )));
+        Value::Map(_) | Value::Node(_) | Value::Relationship(_) | Value::Path(_) => {
+            unreachable!("not a property value")
         }
     }
-    Ok(())
 }
