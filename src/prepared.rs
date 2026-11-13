@@ -127,7 +127,10 @@ impl Unit {
 impl Query {
     /// Parses and analyzes `text`.
     pub fn new(text: &str) -> Result<Self, CypherError> {
-        let ast = decypher::parse(text).map_err(|e| CypherError::ParseError(e.to_string()))?;
+        let cst = decypher::parse_cst(text);
+        let tree = cst.tree.clone();
+        let ast = decypher::parse(cst).map_err(|e| CypherError::ParseError(e.to_string()))?;
+        reject_dropped_syntax(&tree)?;
 
         let mut catalog = decypher::hir::Catalog::default();
         catalog.set_strict(true);
@@ -226,6 +229,28 @@ impl std::str::FromStr for Query {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::new(s)
     }
+}
+
+/// Rejects pattern syntax that decypher parses but drops when lowering to
+/// its IR: running such a query would silently match more than it says.
+fn reject_dropped_syntax(tree: &decypher::syntax::SyntaxNode) -> Result<(), CypherError> {
+    use decypher::syntax::SyntaxKind as K;
+    for node in tree.descendants() {
+        let parent = node.parent().map(|p| p.kind());
+        let feature = match node.kind() {
+            K::QUANTIFIED_PATH_PATTERN => "quantified path patterns",
+            K::WHERE_CLAUSE if matches!(parent, Some(K::NODE_PATTERN | K::RELATIONSHIP_DETAIL)) => {
+                "WHERE inside a node or relationship pattern"
+            }
+            // The wrapper name is the only identifier directly in a pattern part.
+            K::PATTERN_PART if node.children_with_tokens().any(|e| e.kind() == K::IDENT) => {
+                "shortestPath / allShortestPaths"
+            }
+            _ => continue,
+        };
+        return Err(CypherError::Unsupported(feature.into()));
+    }
+    Ok(())
 }
 
 fn mutates(op: &Operation) -> bool {

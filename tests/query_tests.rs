@@ -1348,3 +1348,54 @@ fn query_rand_is_a_float_in_unit_interval() {
     assert!(values.iter().all(|f| (0.0..1.0).contains(f)));
     assert!(values.windows(2).any(|w| w[0] != w[1]));
 }
+
+#[test]
+fn query_rejects_pattern_syntax_the_engine_would_ignore() {
+    let g = build_graph_from_cypher("CREATE (:P {a: 1})-[:K {w: 1}]->(:P {a: 2})").unwrap();
+    for query in [
+        "MATCH (n:P WHERE n.a > 1) RETURN n",
+        "MATCH (a)-[r:K WHERE r.w > 1]->(b) RETURN b",
+        "MATCH p = shortestPath((a)-[*]-(b)) RETURN p",
+        "MATCH p = allShortestPaths((a)-[*]-(b)) RETURN p",
+        "MATCH (a) ((x)-[:K]->(y)){1,2} (b) RETURN b",
+        "RETURN [(a)-[r WHERE r.w > 1]->(b) | b] AS bs",
+    ] {
+        assert!(
+            matches!(g.cypher(query), Err(CypherError::Unsupported(_))),
+            "{query} should be rejected"
+        );
+    }
+    // The same words elsewhere are fine.
+    for query in [
+        "MATCH (shortestPath:P) WHERE shortestPath.a > 1 RETURN shortestPath",
+        "RETURN [(a)-[r]->(b) WHERE r.w > 0 | b.a] AS bs",
+    ] {
+        assert!(g.cypher(query).is_ok(), "{query} should run");
+    }
+}
+
+#[test]
+fn query_mut_rejects_labels_create_would_drop() {
+    let mut g = Graph::<NodeData, EdgeData>::new();
+    let p = params([("l", Value::from("Q"))]);
+    for query in [
+        "CREATE (n:$($l)) RETURN n",
+        "MERGE (n:$($l)) RETURN n",
+        "CREATE (n:A|B) RETURN n",
+    ] {
+        assert!(
+            matches!(
+                g.cypher_mut_params(query, &p),
+                Err(CypherError::Unsupported(_))
+            ),
+            "{query} should be rejected"
+        );
+    }
+    assert_eq!(g.node_count(), 0);
+    // Matching on dynamic labels still works.
+    g.cypher_mut("CREATE (:Q)").unwrap();
+    let r = g
+        .cypher_params("MATCH (n:$($l)) RETURN count(n) AS c", &p)
+        .unwrap();
+    assert_eq!(column(&r, "c"), vec![Value::from(1)]);
+}

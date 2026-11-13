@@ -311,7 +311,14 @@ impl<'q, A: Access> Executor<'q, A> {
     /// `CREATE`: creates every unbound node and every relationship of the
     /// pattern, binding them in `row`.
     pub(super) fn create_pattern(&mut self, pattern: &GraphPattern, row: &mut Row) -> Result<()> {
-        // Reject an invalid relationship before creating anything.
+        // Reject what cannot be created before creating anything. Only plain
+        // labels are created: dropping `:A|B` or `:$(expr)` would silently
+        // create a node without them.
+        if pattern.nodes.iter().any(|n| n.label_expression.is_some()) {
+            return Err(CypherError::Unsupported(
+                "label expressions and dynamic labels in CREATE / MERGE".into(),
+            ));
+        }
         for rel in &pattern.relationships {
             if rel.types.len() != 1 {
                 return Err(CypherError::InvalidQuery(
