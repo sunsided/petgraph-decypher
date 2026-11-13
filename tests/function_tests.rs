@@ -269,3 +269,65 @@ fn round_with_precision_edge_cases() {
         Err(CypherError::RuntimeError(_))
     ));
 }
+
+#[test]
+fn value_type_names_normalized_types() {
+    let t = |expr: &str| match ok(&format!("valueType({expr})")) {
+        Value::String(s) => s,
+        other => panic!("{expr}: {other:?}"),
+    };
+    // The manual's example.
+    assert_eq!(t("'abc'"), "STRING NOT NULL");
+    assert_eq!(t("1"), "INTEGER NOT NULL");
+    assert_eq!(t("2.0"), "FLOAT NOT NULL");
+    assert_eq!(t("true"), "BOOLEAN NOT NULL");
+    assert_eq!(t("null"), "NULL");
+    assert_eq!(t("{a: 1}"), "MAP NOT NULL");
+    // Lists: the inner type is the union of the element types, in type
+    // order, nullable when an element is null.
+    assert_eq!(t("[1]"), "LIST<INTEGER NOT NULL> NOT NULL");
+    assert_eq!(
+        t("[1, 'a']"),
+        "LIST<STRING NOT NULL | INTEGER NOT NULL> NOT NULL"
+    );
+    assert_eq!(
+        t("[2.0, 1, 'a', true]"),
+        "LIST<BOOLEAN NOT NULL | STRING NOT NULL | INTEGER NOT NULL | FLOAT NOT NULL> NOT NULL"
+    );
+    assert_eq!(t("[1, null]"), "LIST<INTEGER> NOT NULL");
+    assert_eq!(t("[1, 'a', null]"), "LIST<STRING | INTEGER> NOT NULL");
+    assert_eq!(t("[]"), "LIST<NOTHING> NOT NULL");
+    assert_eq!(t("[null]"), "LIST<NULL> NOT NULL");
+    // Nested lists: ordered by inner type, contained types absorbed.
+    assert_eq!(
+        t("[[2.0], [1]]"),
+        "LIST<LIST<INTEGER NOT NULL> NOT NULL | LIST<FLOAT NOT NULL> NOT NULL> NOT NULL"
+    );
+    assert_eq!(
+        t("[[1], [1, 'a']]"),
+        "LIST<LIST<STRING NOT NULL | INTEGER NOT NULL> NOT NULL> NOT NULL"
+    );
+    assert_eq!(
+        t("[[1], [1, null]]"),
+        "LIST<LIST<INTEGER> NOT NULL> NOT NULL"
+    );
+    assert_eq!(
+        t("[[1.0, 'a'], [1]]"),
+        "LIST<LIST<INTEGER NOT NULL> NOT NULL | LIST<STRING NOT NULL | FLOAT NOT NULL> NOT NULL> NOT NULL"
+    );
+
+    let g = petgraph_decypher::build_graph_from_cypher("CREATE (:A)-[:R]->(:B)").unwrap();
+    let r = g
+        .cypher(
+            "MATCH p = (a)-[r]->(b) RETURN valueType(a) AS a, valueType(r) AS r, valueType(p) AS p",
+        )
+        .unwrap();
+    assert_eq!(
+        r.rows().next().unwrap().values(),
+        [
+            Value::from("NODE NOT NULL"),
+            Value::from("RELATIONSHIP NOT NULL"),
+            Value::from("PATH NOT NULL")
+        ]
+    );
+}
