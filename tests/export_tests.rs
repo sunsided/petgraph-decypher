@@ -1,10 +1,12 @@
 //! `to_cypher_create`: writing a graph as Cypher and reading it back.
 
+use petgraph::Direction;
 use petgraph::Graph;
+use petgraph::graph::{EdgeIndex, NodeIndex};
 use petgraph::stable_graph::StableGraph;
 use petgraph_decypher::{
-    CypherError, EdgeData, NodeData, PetgraphCypherMut, Properties, Value, build_graph_from_cypher,
-    to_cypher_create,
+    CypherError, CypherGraph, EdgeData, NodeData, PetgraphCypherMut, Properties, Value,
+    build_graph_from_cypher, to_cypher_create,
 };
 
 fn props<const N: usize>(entries: [(&str, Value); N]) -> Properties {
@@ -143,12 +145,100 @@ fn export_of_an_empty_graph_is_empty() {
 }
 
 #[test]
-fn export_rejects_properties_without_a_literal() {
+fn export_rejects_values_create_cannot_store() {
+    for value in [
+        Value::Node(NodeIndex::new(0)),
+        Value::Map(props([("k", Value::from(1))])),
+        Value::List(vec![Value::from(vec![1])]),
+        Value::List(vec![Value::from(1), Value::from("a")]),
+    ] {
+        let mut g = Graph::<NodeData, EdgeData>::new();
+        g.add_node(node(&[], props([("p", value.clone())])));
+        assert!(
+            matches!(to_cypher_create(&g), Err(CypherError::TypeMismatch(_))),
+            "{value:?} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn export_leaves_out_null_properties() {
     let mut g = Graph::<NodeData, EdgeData>::new();
-    let a = g.add_node(node(&[], Properties::new()));
-    g[a].properties.insert("self".into(), Value::Node(a));
+    g.add_node(node(
+        &["A"],
+        props([("gone", Value::Null), ("kept", Value::from(1))]),
+    ));
+    assert_eq!(to_cypher_create(&g).unwrap(), "CREATE (n0:A {kept: 1})\n");
+}
+
+#[test]
+fn export_round_trips_names_cypher_reads_verbatim() {
+    // Text between backticks has no escapes, so these need nothing but
+    // backtick doubling to read back unchanged.
+    let names = [
+        "",
+        "C:\\users",
+        "a\nb",
+        "tab\there",
+        "nul\u{0}",
+        "\\u0041",
+        "`",
+    ];
+    let mut g = Graph::<NodeData, EdgeData>::new();
+    for name in names {
+        let n = g.add_node(node(&[name], props([(name, Value::from(1))])));
+        g.add_edge(n, n, edge(name, Properties::new()));
+    }
+    let script = to_cypher_create(&g).unwrap();
+    let copy = build_graph_from_cypher(&script)
+        .unwrap_or_else(|e| panic!("cannot read back:\n{script}\n{e}"));
+    for (n, name) in copy.node_indices().zip(names) {
+        assert_eq!(copy[n].labels, [name]);
+        assert_eq!(copy[n].properties.keys().collect::<Vec<_>>(), [name]);
+    }
+    for (e, name) in copy.edge_indices().zip(names) {
+        assert_eq!(copy[e].rel_type, name);
+    }
+}
+
+/// A `Graph` whose node listing names one node more than it has.
+struct Broken(Graph<NodeData, EdgeData>);
+
+impl CypherGraph for Broken {
+    type Node = NodeData;
+    type Edge = EdgeData;
+
+    fn node_ids(&self) -> impl Iterator<Item = NodeIndex> {
+        self.0
+            .node_indices()
+            .chain([NodeIndex::new(self.0.node_count())])
+    }
+    fn edge_ids(&self) -> impl Iterator<Item = EdgeIndex> {
+        self.0.edge_indices()
+    }
+    fn node(&self, id: NodeIndex) -> Option<&NodeData> {
+        self.0.node_weight(id)
+    }
+    fn edge(&self, id: EdgeIndex) -> Option<&EdgeData> {
+        self.0.edge_weight(id)
+    }
+    fn endpoints(&self, id: EdgeIndex) -> Option<(NodeIndex, NodeIndex)> {
+        self.0.edge_endpoints(id)
+    }
+    fn edges_of(
+        &self,
+        node: NodeIndex,
+        direction: Direction,
+    ) -> impl Iterator<Item = (EdgeIndex, NodeIndex)> {
+        CypherGraph::edges_of(&self.0, node, direction)
+    }
+}
+
+#[test]
+fn export_fails_on_elements_a_graph_lists_but_lacks() {
+    let g = Broken(build_graph_from_cypher("CREATE (:A)").unwrap());
     assert!(matches!(
         to_cypher_create(&g),
-        Err(CypherError::TypeMismatch(_))
+        Err(CypherError::RuntimeError(_))
     ));
 }
