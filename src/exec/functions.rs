@@ -696,17 +696,20 @@ impl Accumulator {
                         "percentile must be between 0.0 and 1.0".into(),
                     ));
                 }
-                let mut xs = numbers("percentile")?;
-                if xs.is_empty() {
+                if self.values.is_empty() {
                     return Ok(Value::Null);
                 }
                 if self.function == A::PercentileDisc {
                     // Returns one of the inputs, so no float round trip.
+                    if let Some(v) = self.values.iter().find(|v| v.as_f64().is_none()) {
+                        return Err(type_error("percentile", v));
+                    }
                     let mut values = self.values;
                     values.sort_by(Value::order);
                     let idx = ((p * values.len() as f64).ceil() as usize).saturating_sub(1);
                     values.swap_remove(idx.min(values.len() - 1))
                 } else {
+                    let mut xs = numbers("percentile")?;
                     xs.sort_by(|a, b| a.total_cmp(b));
                     let rank = p * (xs.len() - 1) as f64;
                     let (lo, hi) = (rank.floor() as usize, rank.ceil() as usize);

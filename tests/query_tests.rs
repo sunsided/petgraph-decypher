@@ -1327,7 +1327,7 @@ fn query_mut_rejects_mixed_type_list_properties() {
         g.cypher_mut("CREATE (:M {x: [1, 'a']})"),
         Err(CypherError::TypeMismatch(_))
     ));
-    g.cypher_mut("CREATE (n:M {x: [1, 2]}) SET n.y = ['a', 'b']")
+    g.cypher_mut("CREATE (n:M {x: [1, 2.5]}) SET n.y = ['a', 'b'], n.e = []")
         .unwrap();
     assert!(g.cypher_mut("MATCH (n:M) SET n.z = [true, 1]").is_err());
 }
